@@ -1,8 +1,17 @@
 import { useMemo, useRef, useState } from 'react'
 import type { FieldMeta } from '../../lib/data-source'
 import type { TemplateDoc, TemplateKind } from '../../lib/types'
-import { parseDocx, rebuildWithMatches, formatReportText, ignorePlaceholder, unignorePlaceholder } from '../../import'
-import type { IRDoc, MatchResult } from '../../import'
+import {
+  parseDocx,
+  rebuildWithMatches,
+  formatReportText,
+  ignorePlaceholder,
+  unignorePlaceholder,
+  /* ⚠️ F3-12b：手动圈定循环区（2026-10-02 接线）—— 这两个此前**全项目零调用** */
+  makeManualLoop,
+} from '../../import'
+import type { IRDoc, IRLoopRange, MatchResult } from '../../import'
+import { LoopRangeEditor } from './LoopRangeEditor'
 
 /**
  * Word(.docx) 模板导入向导（PRD P4 / F3）。
@@ -63,6 +72,14 @@ export function WordImportPanel({ fields, kind, onDone, onCancel }: Props) {
    */
   const [tagStart, setTagStart] = useState('')
   const [tagEnd, setTagEnd] = useState('')
+  /**
+   * 用户手动圈定的循环区（PRD **F3-12b**，2026-10-02 接线），null = 用自动识别的结果。
+   *
+   * ⚠️ 为什么只留**一个**区间：`to-template.ts:364` 明确写"v1 只处理一层循环：
+   * 取第一个区间"（嵌套循环在官方模板里是否存在尚未实测）。UI 若允许圈多个，
+   * 用户会以为它们都生效 —— 那比"只能圈一个"更坏。等 v1 的多层循环做出来再放宽。
+   */
+  const [manualRange, setManualRange] = useState<IRLoopRange | null>(null)
   /** 记住用户选的文件：改了上面的开关要能**就地重解析**，不用让他重新选一遍文件 */
   const [pickedFile, setPickedFile] = useState<File | null>(null)
   const [name, setName] = useState('')
@@ -94,6 +111,13 @@ export function WordImportPanel({ fields, kind, onDone, onCancel }: Props) {
   ): Promise<void> => {
     setError(null)
     setStage({ label: '准备中', progress: 0.05 })
+    /*
+     * ⚠️ **重解析必须清掉手动圈定的区间**（F3-12b）：
+     * 块索引是**按本次解析结果**编的 —— 换了标签/占位符设置之后，块的数量与顺序都可能变
+     * ⇒ 留着旧索引会圈到**错误的段落**上，而且**不报错**（只是结果不对）。
+     * 宁可让用户重圈一次，也不能让他带着一个错的区间去生成模板。
+     */
+    setManualRange(null)
     try {
       /*
        * ⚠️ **E-2**：把用户填的自定义标签传下去。空串不传 ——
@@ -145,7 +169,17 @@ export function WordImportPanel({ fields, kind, onDone, onCancel }: Props) {
     if (!ir) return
     setStage({ label: '生成模板', progress: 0.9 })
     try {
-      const template = rebuildWithMatches(ir, match, fields)
+      /*
+       * ⚠️ **F3-12b**：手动圈定的区间要**显式传下去**。
+       * `to-template.ts:363` 是 `opts.loopRanges ?? ir.loop?.ranges` ⇒ 传了就优先于自动识别。
+       *
+       * ⚠️ 用户没圈过时**绝不能传 `[]`** —— `nullish` 只对 `undefined` 生效，
+       *    `[] ?? 自动结果` 得到的是 `[]` ⇒ **循环区静默消失**（模板整片错位，
+       *    而且看不出是"没传对"还是"识别不出"）。所以这里用条件展开。
+       */
+      const template = rebuildWithMatches(ir, match, fields, {
+        ...(manualRange ? { loopRanges: [manualRange] } : {}),
+      })
       await onDone(template, name.trim() || 'Word 模板')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -286,6 +320,42 @@ export function WordImportPanel({ fields, kind, onDone, onCancel }: Props) {
           <h3 className="app-section-title">字段匹配 · {fileName}</h3>
         </div>
         <div className="app-section-body">
+          {/*
+            ⚠️ **F3-12b 的入口**（2026-10-02 接线）：手动圈定循环区。
+            放在字段匹配**之前** —— 循环区决定的是"版式怎么切"（表头/循环/表尾），
+            它错了整份模板会整片错位；而字段绑定错了只是某几个格子空着。
+            **严重程度排在前面的放前面。**
+            ⚠️ 用 `<details>` 折叠：自动识别多数情况下是对的，常显会让人以为"每次都要手动圈"。
+            ⚠️ `ir` 为 null 时不渲染（理论上走不到这一屏，但不给组件一个可能为空的入参）。
+          */}
+          {ir ? (
+            <details className="wiz-loop-wrap">
+              <summary>
+                循环区不对？手动圈定
+                {ir.loop?.ranges?.length ? (
+                  <span className="wiz-loop-summary-note">
+                    （已自动识别 {ir.loop.ranges.length} 处）
+                  </span>
+                ) : (
+                  <span className="wiz-loop-summary-note">（未自动识别到）</span>
+                )}
+              </summary>
+              <LoopRangeEditor
+                ir={ir}
+                onApply={(range) => {
+                  setManualRange(makeManualLoop(range))
+                  setError(null)
+                }}
+              />
+              {manualRange ? (
+                <p className="wiz-note ok">
+                  已手动指定循环区：块 <strong>#{manualRange.startBlock}</strong> 到{' '}
+                  <strong>#{manualRange.endBlock}</strong>
+                  {manualRange.name ? `（集合名「${manualRange.name}」）` : ''}。生成模板时优先生效。
+                </p>
+              ) : null}
+            </details>
+          ) : null}
           <p className="wiz-hint">
             识别到 {summary.total} 个占位符：
             <span className="wiz-tag ok">{summary.matched} 已匹配</span>

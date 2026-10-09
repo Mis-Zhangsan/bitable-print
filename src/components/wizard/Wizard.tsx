@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import type {
   DataSource,
   FieldMeta,
@@ -935,12 +936,20 @@ function StepTemplate({
   const tplKindHint: { tone: string; text: string } | null = (() => {
     if (!selKind) return null
     const n = w.scopedRecords.length
-    if (selKind === 'record' && n >= RECORD_BULK_WARN) {
-      return {
-        tone: 'warn',
-        text: `已选 ${n} 条记录，用记录模板会打出约 ${n} 页纸。想省纸可以改用视图模板（一份多页）—— 在下面换一张即可。`,
-      }
-    }
+    /*
+     * ⛔ **「已选 N 条记录会打出 N 页纸」这条黄条已移除**（2026-10-09 用户要求）。
+     *
+     * 用户原话：「顶部的黄色提示字体直接移除，因为**下一步预览界面也有类似的提示**」。
+     * ⇒ 预览页那条橙色警告（"N 条记录按「一条一份」排出了 N 页" + 「回去改范围」按钮）
+     *   说的是**同一件事**，而且**带可操作的按钮** ⇒ 两边都提的话，选模板页这条纯属噪音。
+     *
+     * ⚠️ 这与更早的一条口径**相反**（当时特意把数据量提示收拢到选模板页）——
+     *    但那次的前提是"预览页没有对应提示"。现在有了，就该只留一处，
+     *    而且**留带按钮的那一处**（能直接解决问题，而不是只告诉你"有这回事"）。
+     * ⚠️ 下面的 `view + n === 1` 分支**保留**：它说的是**另一件事**
+     *    （"视图模板省纸的优势用不上，这种情况该用记录模板"），不是数据量警告，
+     *    预览页也没有对应提示 ⇒ 删了就没地方说了。
+     */
     if (selKind === 'view' && n === 1) {
       return {
         tone: '',
@@ -1111,6 +1120,39 @@ function TemplateCard({ t, w, onNotice }: { t: TemplateListItem; w: W; onNotice:
   const menuBtnRef = useRef<HTMLButtonElement | null>(null)
 
   /**
+   * **标题的「自动循环滚动」**（2026-10-09 用户第 3 次提到）：
+   * 「我说的滚动是**自动循环滚动**，而不是放一个很丑的滚动条在那里」。
+   *
+   * ⚠️ **必须用 JS 测量，纯 CSS 做不到**：
+   *    CSS 无法表达"**只在内容溢出时才滚**"。直接用 `animation` 的话，
+   *    短名字（"A4 模板"）也会永远在动 —— 那比滚动条更让人分心。
+   *    ⇒ 用 `scrollWidth > clientWidth` 判溢出，只给溢出的那个加 `data-overflow="1"`，
+   *      由 CSS 按这个属性启动动画。
+   * ⚠️ 用 `ResizeObserver` 而不是只在挂载时测一次：卡片是**两列网格**，
+   *    窗口/侧栏宽度变化时可用宽度会变 —— 不重测就会出现"变窄了却没开始滚"
+   *    或"变宽了还在滚"。
+   * ⚠️ 依赖数组里放 `t.name`：重命名之后必须重新量。
+   * ⚠️ 测量发生在**第二份文字渲染之前**（那时 `nameOverflow` 还是 false）⇒
+   *    量到的是"单份是否溢出"，正是我们要判的东西；
+   *    之后渲染出第二份 ⇒ `scrollWidth` 翻倍但仍 > `clientWidth` ⇒ 状态稳定，不会抖。
+   */
+  const nameRef = useRef<HTMLSpanElement | null>(null)
+  const [nameOverflow, setNameOverflow] = useState(false)
+  useEffect(() => {
+    const el = nameRef.current
+    if (!el) return
+    const measure = (): void => {
+      /* +1 是给亚像素留余量：浮点宽度常差 0.3px，不留会把"刚好放下"误判成溢出 */
+      setNameOverflow(el.scrollWidth > el.clientWidth + 1)
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [t.name])
+
+  /**
    * ⚠️ **点任意空白处就收起菜单**（2026-09-19 用户反馈）。
    *
    * 用户原话："点击「…」展开菜单后，需要再次点击「…」才会收纳起菜单，
@@ -1168,20 +1210,17 @@ function TemplateCard({ t, w, onNotice }: { t: TemplateListItem; w: W; onNotice:
      */
     <div className={`wiz-tpl ${active ? 'on' : ''} is-${t.kind}`} onClick={() => w.selectTemplate(t.recordId)}>
       {/*
-        选中徽标（UI 重设计）：16px 蓝圆 + 白对勾，钉在**卡内右上角**。
-        ⚠️ 只有选中时**渲染**（`active &&`），而不是"渲染了但 CSS 隐藏"：
-           它是纯装饰（`aria-hidden`），状态已经由卡片的 `aria-pressed` 承担 ——
-           给读屏软件多播一个"✓"没有任何信息增量。
-        ⚠️ 位置：`right: 8px`（见 wizard.css）。设计稿把对勾与「・・・」画在同一格，
-           选中时会盖住菜单 ⇒ 菜单点不到。所以徽标贴右、菜单让到它左边（right:30）。
+        ⛔ **右上角的对勾徽标已移除**（2026-10-09 用户要求："右上角的 ☑️ 可以取消或者放在其他位置"）。
+
+        ⚠️ 移除它的理由不只是"用户不喜欢"，而是它**本来就在添乱**：
+        旧注释自己写着"设计稿把对勾与「・・・」画在同一格，选中时会盖住菜单 ⇒ 菜单让到 right:30"——
+        也就是说，为了让一个**纯装饰**（`aria-hidden`）的元素不挡住真正的操作，
+        我们被迫把菜单按钮从它该在的位置挪开。装饰让功能让路，这个主次本来就是反的。
+
+        ⚠️ 选中状态**不会因此丢失**：卡片本身有 `aria-pressed`（读屏可用），
+        视觉侧由 `.wiz-tpl.is-on` 的边框 + 底色 + 阴影承担 —— 而且本轮把这三样都加强了，
+        比一个 16px 的小对勾更清楚。
       */}
-      {active && (
-        <span className="wiz-tpl-check" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M5 13l4 4L19 7" />
-          </svg>
-        </span>
-      )}
       {/*
         ⚠️ 这里必须是 `<div role="button">` 而**不能**再是 `<button>`：
         卡片根节点已经是可点区域，里面再套一个按钮就是**嵌套交互元素**，
@@ -1218,8 +1257,32 @@ function TemplateCard({ t, w, onNotice }: { t: TemplateListItem; w: W; onNotice:
             再长的名字也放不下（`.wiz-tpl-name` 限两行）。悬停能看到全名，
             总比"截断了又没法看全"强。
           */}
-          <span className="wiz-tpl-name" title={t.name}>
-            {t.name}
+          <span className="wiz-tpl-name" title={t.name} ref={nameRef} data-overflow={nameOverflow ? '1' : undefined}>
+            {/*
+              ⚠️ **必须再包一层 `track`**（2026-10-09 修正）。
+              上一版把动画直接加在**两份 `.wiz-tpl-name-txt` 各自**身上 —— 那是错的：
+              `translateX(-50%)` 是"**相对元素自身宽度**"的百分比，
+              作用在两个子元素上等于各自位移自身一半，**整体并没有平移"一份 + 间隙"**
+              ⇒ 循环到接缝处会跳一下，与"无缝"的目标不符。
+              ⇒ 正确做法是让**一个宽度 = 两份文字 + 间隙的容器**整体平移
+                （位移量见 CSS 的 `calc(-50% - 1em)`）。
+            */}
+            <span className="wiz-tpl-name-track">
+              <span className="wiz-tpl-name-txt">{t.name}</span>
+              {/*
+                ⚠️ **溢出时才渲染第二份**（无缝循环需要）。
+                单份文字滚出去之后容器就空了 ⇒ 必须有第二份接着顶上。
+                ⚠️ 只在溢出时渲染（而不是"渲染了用 CSS 藏起来"）：
+                  短名字渲染两份会让 `scrollWidth` 翻倍，反而**把本来不溢出的判成溢出** ——
+                  那就永远在动了（用户要的是"超出才滚"）。
+                ⚠️ 第二份 `aria-hidden`：读屏软件不需要听两遍同一个名字。
+              */}
+              {nameOverflow ? (
+                <span className="wiz-tpl-name-txt" aria-hidden="true">
+                  {t.name}
+                </span>
+              ) : null}
+            </span>
           </span>
           <span className="wiz-tpl-meta">
             {/*
@@ -1233,7 +1296,37 @@ function TemplateCard({ t, w, onNotice }: { t: TemplateListItem; w: W; onNotice:
                 配置异常
               </span>
             ) : (
-              <span className="wiz-tpl-paper">{t.paperLabel}</span>
+              /*
+               * ⚠️ **拆成两个胶囊：尺寸 + 方向**（2026-10-09 用户要求：
+               * "纸张尺寸和纸张方向用胶囊显示"、"拆分成两个不同颜色的胶囊样式"）。
+               *
+               * ⚠️ `buildPaperLabel` 产出的是**一个字符串**（`label100x150 纵向` /
+               *    `自定义 100×150mm 纵向`），格式固定为"尺寸 + 空格 + 方向" ⇒
+               *    按**最后一个空格**拆即可（`lastIndexOf`，不是 `indexOf` ——
+               *    自定义尺寸那串里本身含空格："自定义 100×150mm 纵向"）。
+               * ⚠️ 只为展示而拆、**不改 `paperLabel` 本身**：那个串是模板表里"纸张"字段的值，
+               *    改它要动存储层与导入导出（而这里只需要"看起来是两个"）。
+               *    要统一的话应该另开一个接口，不该顺手改一个已被持久化的字段。
+               */
+              (() => {
+                const i = t.paperLabel.lastIndexOf(' ')
+                const size = i > 0 ? t.paperLabel.slice(0, i) : t.paperLabel
+                const dir = i > 0 ? t.paperLabel.slice(i + 1) : ''
+                return (
+                  <>
+                    <span className="wiz-tpl-paper">{size}</span>
+                    {dir ? (
+                      /*
+                       * ⚠️ **横向 / 纵向用不同颜色的胶囊**（用户两次提到：
+                       * "纸张方向用胶囊显示"、"横向和纵向用不同颜色的胶囊显示"）。
+                       * 用 `is-landscape` 这个**语义类名**而不是内联颜色 ——
+                       * 颜色归 CSS 管，这里只说"它是什么"。
+                       */
+                      <span className={`wiz-tpl-dir${dir === '横向' ? ' is-landscape' : ''}`}>{dir}</span>
+                    ) : null}
+                  </>
+                )
+              })()
             )}
             {/*
               时间与纸张**同一行**（UI 重设计）：设计稿的 meta 行就是「纸张胶囊 + 时间」。
@@ -1244,12 +1337,24 @@ function TemplateCard({ t, w, onNotice }: { t: TemplateListItem; w: W; onNotice:
                  秒数永远是 :00，显示出来只是看起来更精确。完整时间挂在 title 上。
               `updatedAt` 取不到就不显示（宁可没有，也不要显示一个假时间）。
             */}
-            {t.updatedAt ? (
-              <span className="wiz-tpl-time" title={`最后编辑：${formatDateTime(t.updatedAt, 'YYYY-MM-DD HH:mm')}`}>
-                {formatDateTime(t.updatedAt, 'MM-DD HH:mm')}
-              </span>
-            ) : null}
           </span>
+          {/*
+            ⚠️ **时间从 meta 行拆出来、单独占第三行**（2026-10-09 用户要求"固定三行显示"）。
+            用户原话：「两个模板卡片，第一个是三行，第二个是两行，是那个时间和纸张尺寸、
+            纸张方向的问题，**可以固定三行显示**」。
+            根因：纸张串长短不一（`label100x150 纵向` vs `A4 纵向`）⇒ meta 行有时折、有时不折
+            ⇒ **行数在 2~3 之间浮动**，两张卡就对不齐。
+            ⇒ 拆成独立行之后三行位置固定：① 名字 ② 纸张胶囊 ③ 时间。
+            ⚠️ 代价是卡片高一点，换来"高度永远一致" —— 而"参差"正是用户连着两轮反馈的问题。
+          */}
+          {t.updatedAt ? (
+            <span className="wiz-tpl-time" title={`最后编辑：${formatDateTime(t.updatedAt, 'YYYY-MM-DD HH:mm')}`}>
+              {formatDateTime(t.updatedAt, 'MM-DD HH:mm')}
+            </span>
+          ) : (
+            /* 没有时间也要占位：否则"三行"的承诺当场失效（这张卡矮一行、又参差了） */
+            <span className="wiz-tpl-time" aria-hidden="true" />
+          )}
           {/*
             类型水印：卡内右下角（CSS 绝对定位，见 wizard.css 的 `.wiz-tpl .wiz-kind`）。
             放在 body 里只是为了跟文字同源 —— 定位基准是 `.wiz-tpl`。
@@ -1273,7 +1378,28 @@ function TemplateCard({ t, w, onNotice }: { t: TemplateListItem; w: W; onNotice:
           aria-haspopup="menu"
           aria-label="更多操作"
         >
-          ···
+          {/*
+            ⚠️ 从文本 `···` 换成**齿轮 SVG**（2026-10-09 用户反馈："不够醒目，可以改为一个齿轮"）。
+            文本三点的问题不是不好看，而是它**看起来像省略号**（"这里有内容被截断了"），
+            不像一个可以点的入口。齿轮的语义是"设置 / 更多操作"，无歧义。
+            ⚠️ 用**内联 SVG** 而不是图标库：项目现有图标全是内联的（见 editor/Icons.tsx），
+               为一个图标引依赖不划算，还会造成"两套图标来源"（团队 P0 规则也要求锁定一套）。
+            ⚠️ `currentColor` + `strokeWidth 1.75` 与项目其它描边图标一致 —— 统一描边才能随字号缩放。
+          */}
+          <svg
+            viewBox="0 0 24 24"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
         </button>
       </div>
 
@@ -1373,6 +1499,41 @@ function StepPreview({ w }: { w: W }) {
   const r = w.render.doc
   const pages = r?.pages.length ?? 0
   const tooMany = w.kind === 'record' && pages > RECORD_BULK_WARN
+
+  /**
+   * 「共 N 页」旁边那个红点的**提示内容**。
+   *
+   * ⚠️ **2026-10-09 第 2 次调整**（用户："这个红色感叹号不是一直显示，而是**动态的**，
+   * 和之前的黄色提示框一个逻辑"）：
+   *   ① 上一轮我把"默认模式下为什么没有每页条数"也塞了进来 ⇒ 红点在**任何**记录模板下
+   *      都亮着 ⇒ 用户说"不是一直显示"。**现在只在"页数偏多"时亮**（= 原橙框的判据）。
+   *   ② 文案按用户要求重写成"**让用户自查**"的口径：
+   *      告诉他这次会打多少张，然后提示可能是**范围选错**或**排版方式选错** ——
+   *      比原来那句"现在回去改还来得及"多给了两条具体的排查方向。
+   *   ③ **「回去改范围」按钮已移除**（用户明确要求）⇒ 气泡里只有文字。
+   *      ⚠️ 所以文案必须**自带足够的行动信息**（说清去查哪两处），
+   *         不能依赖一个已经删掉的按钮去承载"接下来做什么"。
+   */
+  const tipLines: ReactNode[] = []
+  if (tooMany) {
+    tipLines.push(
+      /*
+       * ⚠️ **这里原来写的是 markdown 的 `**记录范围**`，结果 `**` 被原样打在了屏幕上**
+       * （2026-10-09 用户截图指出）。
+       *
+       * 根因：**JSX 不解析 markdown** —— `**` 在 JSX 里就是两个普通星号字符。
+       * markdown 语法只在被 markdown 渲染器处理时才有意义，React 不做这件事。
+       * ⇒ 要加粗就用 `<b>`，要上色就加类名。
+       * ⚠️ 这条很容易犯，因为**我们在写注释和文档时天天用 `**`**，
+       *    写着写着就顺手写进了 JSX 的字符串里。写完带 `**` 的文案要扫一眼。
+       */
+      <>
+        本次预计打印 <b>{pages}</b> 页（{w.scopedRecords.length} 条记录 × 一条一份）。
+        如果比预期多得多，请检查<b className="wiz-info-key">记录范围</b>是否勾多了，或
+        <b className="wiz-info-key">排版方式</b>是否该用「连续模式」。
+      </>,
+    )
+  }
   /**
    * 「每 N 条」控制项该不该出现（2026-09-21 用户要求恢复）。
    *
@@ -1462,12 +1623,15 @@ function StepPreview({ w }: { w: W }) {
           所以控件收起、原因写在这一句里。默认模式下 `perPageN` 在渲染里永远不会被触发
           （每条记录前都 breakPage），摆出来就是个点了没反应的骗人控件。
         */}
-        {w.kind === 'record' && w.batchLayout === 'default' ? (
-          <p className="wiz-hint">
-            默认模式是「一条记录一份」，每条都从新页开始，所以这里没有「每页条数」。
-            想让多张单据<b>共用一张纸</b>，把上面的排版方式切到「连续模式」。
-          </p>
-        ) : null}
+        {/*
+          ⛔ **这里是原来那段常显的灰色说明**（"默认模式是「一条记录一份」…"），
+          2026-10-09 按用户要求**移到了「共 N 页」后面的红色 `!` 上，改成 hover 才显示**。
+          用户原话：「顶部的灰色提示字体**默认隐藏**，在"共11页"后面增加一个**红色感叹号**，
+          鼠标移动上去才会有此提示」。
+          ⇒ 从"每次都占三行"改成"一个图标 + 气泡"：那段话是**解释性**的
+            （说明为什么这里没有「每页条数」），不是每次都要读的操作提示。
+          ⚠️ 移动后的实现在下面 `.wiz-sum-title` 那一处（见 `wiz-info` 的注释）。
+        */}
         {/*
           自定义「每页 N 条」（2026-09-19 用户要求；2026-09-21 起记录模板的连续模式也能用）。
           档位只有 自动/1/5/10，实际排版常需要 3/6/8 这种数 ⇒ 给一个输入框。
@@ -1544,6 +1708,36 @@ function StepPreview({ w }: { w: W }) {
           <div className="wiz-sum">
             <p className="wiz-sum-title">
               共 <b>{pages}</b> 页
+              {/*
+                ⚠️ **红色感叹号 = 提示的唯一入口**（2026-10-09 用户要求）：
+                「把这个提示内容，**移动到红色感叹号里**，**如果没有，就不显示红色感叹号**」。
+                ⇒ 原来这里的内容（"默认模式是「一条记录一份」…"）与下面那个橙色框
+                  （"N 条记录按「一条一份」排出了 N 页" + 「回去改范围」）**合并成一段**，
+                  只在这一个气泡里说；那块占三行的橙色框整个删掉了。
+                ⚠️ **没有可说的内容时整个红点不渲染**（下面的条件）——
+                  一个空的红点比没有红点更糟（用户 hover 上去发现什么都没有）。
+                ⚠️ 气泡里**保留了「回去改范围」按钮**：那条提示的价值就在"能直接跳回去改"，
+                  只把文字搬进来、把按钮丢掉，等于把一句操作指引变成了纯抱怨。
+              */}
+              {tipLines.length > 0 ? (
+                <span className="wiz-info" tabIndex={0} aria-label="打印份数与范围的提示">
+                  <span className="wiz-info-mark" aria-hidden="true">
+                    !
+                  </span>
+                  <span className="wiz-info-pop" role="tooltip">
+                    {tipLines.map((t, i) => (
+                      <span className="wiz-info-line" key={i}>
+                        {t}
+                      </span>
+                    ))}
+                    {/*
+                      ⛔ 「回去改范围」按钮已按用户要求**移除**（2026-10-09）。
+                      ⇒ 所以上面的文案必须自带行动信息（"检查记录范围 / 排版方式"），
+                        不能指望一个按钮去承载"接下来做什么"。
+                    */}
+                  </span>
+                </span>
+              ) : null}
             </p>
             <p className="wiz-sum-meta">
               {w.scopedRecords.length} 条记录 · 纸张{' '}
@@ -1555,31 +1749,15 @@ function StepPreview({ w }: { w: W }) {
             </p>
           </div>
 
-          {tooMany && (
-            <div className="wiz-alert warn" role="status">
-              <span className="wiz-alert-icon" aria-hidden="true">
-                !
-              </span>
-              <div className="wiz-alert-body">
-                <p className="wiz-alert-title">
-                  {w.scopedRecords.length} 条记录按「一条一份」排出了 {pages} 页
-                </p>
-                <p className="wiz-alert-text">如果本来只想打几张，现在回去把范围改成手动勾选还来得及。</p>
-                <div className="wiz-alert-actions">
-                  <button
-                    type="button"
-                    className="app-btn sm"
-                    onClick={() => {
-                      w.setRangeMode('manual')
-                      w.setStep(0)
-                    }}
-                  >
-                    回去改范围
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+          {/*
+            ⛔ **橙色警告框已删除**（2026-10-09）：它的内容搬进了「共 N 页」旁边的红点气泡
+            （见上面 `tipLines` 的第二段）。用户原话：
+            「这个页面下面的**黄色提醒框还在**，提示用户去改范围，我的意思是，
+             **把这个提示内容，移动到红色感叹号里**」。
+            ⇒ 连同「回去改范围」按钮一起搬走（按钮现在在气泡里，功能没丢）。
+            ⚠️ 留这条注释，是为了让下一个来找"那个橙色框去哪了"的人有线索 ——
+               这类"整块搬走"的改动最容易让人以为是被误删了。
+          */}
 
           <PreviewFrame
             html={r.html}

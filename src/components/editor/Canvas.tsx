@@ -3088,7 +3088,23 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
             // y 还要过一遍版式区起点（循环区会被页级重复区顶下去，见 bandTopMm）。
             left: pxOf(nz(margin.left, 0) + nz(el.x, 0)),
             top: pxOf(nz(margin.top, 0) + bandTopMm(band, el)),
-            width: pxOf(Math.max(el.w, 0.5)),
+            /*
+             * ⚠️ **宽度必须夹到版心内**（2026-10-09 修复：画布与预览"换行不一致"）。
+             *
+             * 打印端是把每个元素塞进"版心宽"的父容器里（`render/html.ts:1593` 的 `contentW`），
+             * 元素自己声明得再宽也**会被收进去** ⇒ 文本在那里就换行了。
+             * 而画布原来照 `el.w` 原样画 ⇒ **只要元素一超出纸张，画布就比打印多显示内容**。
+             * 真机反馈原话：「同样的文字，在画布中是没有换行的，但在预览界面这个元素换行了」。
+             *
+             * ⇒ 口径统一成"**可见宽度 = min(声明宽, 版心宽)**"。
+             *
+             * ⚠️ 这里**只夹渲染宽度，一个字节都不改 `el.w`** ——
+             *    用户要的是"所见即所得"，不是"被自动改窄"。
+             * ⚠️ 夹的基准是**版心宽**（`content.w`）而不是纸宽：打印端的父容器就是版心。
+             * ⚠️ 所有 kind 一起夹（不只是文本）：打印端对它们用的是同一个父容器，
+             *    分开夹等于又制造一处"两端不同口径" —— 那正是本项目反复栽的坑。
+             */
+            width: pxOf(Math.min(Math.max(el.w, 0.5), Math.max(content.w, 0.5))),
             /**
              * 高度**只有下限、不写硬高** —— 与打印侧**同一条口径**
              * （`render/html.ts` 里非表格块一律 `min-height:...`）。

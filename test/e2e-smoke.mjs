@@ -485,6 +485,40 @@ async function main() {
   rmSync(profileDir, { recursive: true, force: true })
   mkdirSync(profileDir, { recursive: true })
 
+  /*
+   * ⚠️ **启动前先确认 9333 没被占**（2026-10-09 加，代价是连崩三次）。
+   *
+   * 症状：e2e 连着崩三次，报 `CDP 超时: Runtime.enable`（后一次是 `Input.dispatchMouseEvent`），
+   *      而**每次崩的位置都不一样** ⇒ 看着像"环境不稳"，实际是**确定性的**：
+   *      第一次崩溃后浏览器进程没退干净、**仍占着 9333** ⇒ 第二次启动时
+   *      新实例的调试端口起不来 ⇒ 又崩 ⇒ 再留一个残留 ⇒ **自我叠罗汉**。
+   *
+   * ⚠️ 所以要**主动检测并清理**，而不是等下一次崩。
+   *    `netstat` 找出监听 9333 的 PID ⇒ **只杀那一个**。
+   *    ⛔ **绝不能用 `taskkill /IM msedge.exe`** —— 那会连带杀掉用户自己开着的 Edge 窗口。
+   */
+  try {
+    const { execSync } = await import('node:child_process')
+    const out = execSync('netstat -ano', { encoding: 'utf8' })
+    const pids = new Set(
+      out
+        .split('\n')
+        .filter((l) => l.includes(`:${PORT}`) && /LISTENING/i.test(l))
+        .map((l) => l.trim().split(/\s+/).pop())
+        .filter((p) => /^\d+$/.test(String(p))),
+    )
+    for (const pid of pids) {
+      console.log(`⚠️ 端口 ${PORT} 被 PID ${pid} 占用（多半是上次 e2e 的残留浏览器）⇒ 清理`)
+      try {
+        execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' })
+      } catch {
+        /* 进程可能刚好自己退了，忽略 */
+      }
+    }
+  } catch {
+    /* 拿不到 netstat 就跳过，不影响主流程（这条只是"提前清理"，不是必需品） */
+  }
+
   console.log(`启动浏览器：${edge}`)
   const child = spawn(
     edge,
@@ -2905,23 +2939,43 @@ async function main() {
         checkSize: cr ? Math.round(cr.width) + 'x' + Math.round(cr.height) : null,
         menuVisible: !!dots,
         overlap,
+        /*
+         * ⚠️ **标题右边缘 vs 齿轮左边缘**（2026-10-09 新增，替掉已失效的对勾断言）。
+         * 判"标题有没有盖住齿轮"必须用几何：标题盒子在滚动时是会被裁的，
+         * 而"裁在哪里"只有真实 rect 说了算。
+         */
+        nameRight: (() => {
+          const el = on.querySelector('.wiz-tpl-name');
+          return el ? el.getBoundingClientRect().right : null;
+        })(),
+        gearLeft: dr ? dr.left : null,
         // 卡内右上角：对勾的右边缘不应越出卡片
         checkInside: (() => { const r = on.getBoundingClientRect(); return cr ? cr.right <= r.right + 0.5 && cr.top >= r.top - 0.5 : null })(),
       };
     })()`)
     ok(
-      '⑤m 选中态 = 蓝描边 + 3px 光环 + 卡内右上角对勾徽标（16px）',
-      selState?.border === 'rgb(51, 112, 255)' &&
-        /0px 0px 0px 3px/.test(String(selState?.shadow)) &&
-        selState?.hasCheck === true &&
-        selState?.checkSize === '16x16' &&
-        selState?.checkInside === true,
+      /* ⚠️ 原断言还要求「对勾徽标 16px」—— 徽标已按用户要求移除（2026-10-09），
+         所以这里只剩描边与光环。删掉那三个字段而不是留着让它长期红。 */
+      '⑤m 选中态 = 蓝描边 + 3px 光环',
+      selState?.border === 'rgb(51, 112, 255)' && /0px 0px 0px 3px/.test(String(selState?.shadow)),
       JSON.stringify(selState),
     )
     ok(
-      '⑤m 对勾徽标**不压住**「・・・」菜单（选中是最常见状态，压住等于菜单点不到）',
-      selState?.menuVisible === true && selState?.overlap === false,
-      JSON.stringify({ menu: selState?.menuVisible, overlap: selState?.overlap }),
+      /*
+       * ⚠️ **新断言：标题不能盖住齿轮**（2026-10-09 用户报的真机 bug）。
+       *
+       * 这条替换掉了原来的「对勾徽标不压住菜单」—— 徽标没了，那个断言的被测对象
+       * 整个消失（原来它会…… 因为 `check` 是 null 而恒假）。
+       * ⇒ 换成**同一位置上真正的风险**：**滚动的标题**会不会压到齿轮。
+       *   判据是几何：标题盒子的右边缘 **不得越过** 齿轮的左边缘。
+       * ⚠️ 这条必须读 `getBoundingClientRect` 而不是看 class ——
+       *    "看得见"的问题只有几何/计算样式说了算（本项目在这条上栽过多次）。
+       */
+      '⑤m 标题**不压住**齿轮按钮（滚动的长标题也不能越界）',
+      selState?.nameRight !== null &&
+        selState?.gearLeft !== null &&
+        Number(selState.nameRight) <= Number(selState.gearLeft) + 0.5,
+      JSON.stringify({ nameRight: selState?.nameRight, gearLeft: selState?.gearLeft }),
     )
     ok(
       '⑤m 选中时**保留类型底色**（设计稿：选中只改描边与光环，不把类型色洗掉）',

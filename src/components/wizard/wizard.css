@@ -459,11 +459,6 @@ nav.wiz-steps {
   min-width: 0;
 }
 
-.wiz-alert.warn {
-  border-left-color: var(--warning);
-  background: var(--warning-soft);
-}
-
 .wiz-alert.danger {
   border-left-color: var(--danger);
   background: var(--danger-soft);
@@ -488,10 +483,6 @@ nav.wiz-steps {
   font-size: 11px;
   font-weight: var(--fw-semibold);
   line-height: 1;
-}
-
-.wiz-alert.warn .wiz-alert-icon {
-  background: var(--warning);
 }
 
 .wiz-alert.danger .wiz-alert-icon {
@@ -932,20 +923,82 @@ nav.wiz-steps {
   gap: var(--sp-2);
   align-items: center;
   padding: var(--sp-3);
+  /*
+   * ⚠️ 给右上角的齿轮留出位置（2026-10-09：齿轮从右下挪到右上之后，
+   * 长名字会顶到它下面）。齿轮约 22px 宽 + 两侧间距 ⇒ 右边留 30px。
+   */
+  padding-right: 30px;
+  /*
+   * ⚠️ **与「新建模板」虚线卡（`.wiz-tpl-add` 的 `min-height: 76px`）对齐**
+   * （用户要求："好歹和'新建模板'那个预设卡片大小一样，现在风格都不统一"）。
+   * 普通卡原来是"内容撑多高就多高"，而虚线卡固定 76px ⇒ 两者并排时参差不齐。
+   */
+  min-height: 76px;
+  box-sizing: border-box;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--surface);
   min-width: 0;
-  transition: border-color var(--t-fast), background var(--t-fast);
+  transition:
+    border-color var(--t-fast),
+    background var(--t-fast),
+    box-shadow var(--t-fast),
+    transform var(--t-fast);
 }
 
 .wiz-tpl:hover {
   background: var(--surface-hover);
 }
 
+/*
+ * 选中态（2026-10-09 用户反馈："被选中的效果更醒目立体些"）。
+ *
+ * ⚠️ 原来只有"边框变蓝 + 淡蓝底"两样 —— 在浅色背景上，这跟**悬停**几乎分不出来
+ *    （悬停也是变底色）。⇒ 靠三层叠加把它和悬停明确拉开：
+ *      ① 边框**加粗**（1px → 2px）；
+ *      ② 外发光（accent 色低透明阴影）⇒ "浮起来"；
+ *      ③ 轻微上移 1px —— 阴影 + 位移一起，才是"立体"而不是"贴一张纸"。
+ *
+ * ⚠️ **不能用 `border-width` 加粗**：那会让卡片实际尺寸变 2px，
+ *    同排其它卡片不动，网格会"跳一下"（拖拽/缩放的教训同源：改尺寸的样式要避开布局属性）。
+ *    所以用 `box-shadow` 的 **inset** 画那圈粗边框 —— 不参与布局。
+ */
 .wiz-tpl.on {
-  border-color: var(--accent);
+  border-color: transparent;
   background: var(--accent-soft);
+  box-shadow:
+    inset 0 0 0 2px var(--accent),
+    0 2px 6px rgba(31, 35, 41, 0.1),
+    0 8px 20px var(--accent-shadow, rgba(51, 112, 255, 0.2));
+  /*
+   * ⛔ **这里原来有 `transform: translateY(-1px)`，已删除**（2026-10-09）。
+   *
+   * 它就是用户报的那个"奇怪的 BUG"的元凶：
+   *   「选择了第一行的两张卡片，点击第一行卡片的齿轮后，展开的菜单**会被第二行的卡片遮挡**；
+   *     但如果先选第二行、再点第一行的齿轮，就**不会被遮挡**。」
+   *
+   * 原因：**`transform` 非 `none` 的元素会创建新的层叠上下文**（CSS 规范）。
+   * ⇒ 菜单的 `z-index: 200` 被"困"在这个上下文里 —— 它在卡片**内部**最高，
+   *   而**整张卡片**在页面上的层级仍是"自动" ⇒ DOM 靠后的卡片照样盖住菜单。
+   * ⇒ 于是"选中的卡片"反而更盖不住菜单，而"未选中"的（没有 transform）正常 ——
+   *   用户看到的"选第二行就不遮挡"正是这个不对称的产物。
+   *
+   * ⇒ 去掉 transform。"浮起来"完全交给阴影（阴影本来就够，不需要位移）。
+   * ⚠️ 教训：**给会承载弹层的元素加 `transform` / `filter` / `will-change` 要极其小心** ——
+   *    它们都会新建层叠上下文，把内部的高 z-index 弹层关起来。
+   */
+}
+
+/* ⚠️ 悬停**不能盖掉**选中态：否则鼠标一放上去，"选中"就看不见了 */
+.wiz-tpl.on:hover {
+  background: var(--accent-soft);
+}
+
+/* 齿轮按钮：图标要真正居中，否则 16px 的 SVG 在按钮里会偏（基线/行高都会影响） */
+.wiz-tpl-actions > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .wiz-tpl-main {
@@ -1017,18 +1070,89 @@ nav.wiz-steps {
 .wiz-tpl-meta {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
+  /* ⚠️ 从 `var(--sp-2)` 收到 4px：卡片只有 ~150px 宽，每一点横向空间都要省 */
+  gap: 4px;
   font-size: var(--fs-xs);
-  /* 纸张比时间重要一档（时间只是参考，纸张决定能不能用） */
   color: var(--text-2);
   min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
+  /*
+   * ⚠️ **不换行**（2026-10-09 用户报："那个纸张方向单独占据了以后，
+   * 但其实**尺寸和后面是有空间的**"）。
+   *
+   * 原来这里是 `flex-wrap: wrap` —— 那是"时间还挤在 meta 里"的旧结构遗留。
+   * 现在时间已独立成第三行，meta 里只剩"尺寸 + 方向"两个胶囊 ⇒
+   * **它们必须待在同一行**（换行会让卡片变高，而且视觉上像"方向是另一类信息"）。
+   * ⚠️ 保证不溢出的分工是：**尺寸胶囊可收缩 + 方向胶囊固定不收缩**（见下面两条规则）。
+   */
+  flex-wrap: nowrap;
 }
 
+/*
+ * ⚠️ 时间**不参与收缩**（`flex: none`）：它是最短的、也是用户最关心的，
+ * 让一个 11 字符的时间去和 20 字符的纸张串抢空间，永远抢不过。
+ */
+.wiz-tpl-time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 纸张**方向**的胶囊（2026-10-09）—— 与尺寸胶囊**刻意用不同的颜色**。
+ *
+ * 用户要求："卡片上的纸张尺寸和纸张方向**没有拆分成两个不同颜色的胶囊**样式"。
+ * ⚠️ 为什么值得分成两色：**尺寸是"哪张纸"（标识），方向是"怎么放"（姿态）** ——
+ *    两类不同性质的信息。同一个颜色会让它们糊成一整段"标签串"，
+ *    而两个颜色一眼就能分出"这张卡是 A4、而且是纵向"。
+ * ⚠️ 都用低饱和淡底：胶囊是**标签**不是按钮，抢眼就错了（本项目在
+ *    "角标颜色对比度"上栽过，见 `.wiz-kind` 那段注释）。
+ */
+.wiz-tpl-dir {
+  display: inline-block;
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-soft, rgba(51, 112, 255, 0.1));
+  color: var(--accent, #3370ff);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+/*
+ * ⚠️ **横向用另一种颜色**（用户两次提到："横向和纵向用不同颜色的胶囊显示"）。
+ * 纵向保留蓝（默认），横向用**琥珀/橙**系 —— 两者色相间隔足够远，
+ * 小字也能一眼分开。⚠️ 橙用的是**压暗过的 ink**（不是 `--warning` 的
+ * `#ff8800`）：后者在 12px 小字上对比度只有约 2.6:1，本项目为此栽过一次
+ * （见 `.wiz-kind` 那段注释）。
+ */
+.wiz-tpl-dir.is-landscape {
+  background: var(--warning-soft, rgba(212, 132, 0, 0.12));
+  color: var(--warning-ink, #9a5b00);
+}
+
+/*
+ * 纸张串做成**胶囊**（2026-10-09 用户要求："纸张尺寸和纸张方向用胶囊显示"）。
+ *
+ * ⚠️ 为什么值得做成胶囊：它是个**分类标签**（"A4 纵向"/"label100x150 纵向"），
+ *    和旁边的自由文本（时间）不是一类东西。用底色把它圈起来，一眼就能分出
+ *    "哪段是系统给的、哪段是数据" —— 这也是 UI 上"胶囊"这个形态的通用语义。
+ * ⚠️ 现在**独占一行**（从 meta 里拆出来了），所以不必再考虑"和时间抢宽度"，
+ *    可以给足内边距、让它好认。
+ */
 .wiz-tpl-paper {
+  display: inline-block;
+  max-width: 100%;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--surface-3, rgba(31, 35, 41, 0.06));
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  vertical-align: middle;
 }
 
 /*
@@ -1046,10 +1170,22 @@ nav.wiz-steps {
 }
 
 /* 弹出菜单：必须不透明 + 足额 z-index，否则会和下面卡片文字透叠 */
+/*
+ * 菜单**从齿轮正下方展开**（2026-10-09 用户反馈："点击齿轮后，展开的编辑菜单是从
+ * 模板卡片底部出现的，而不是从齿轮处展开，不协调"）。
+ *
+ * ⚠️ 原来挂在 `top: calc(100% - 4px)`（= 卡片底边），那是"卡片菜单"的常见做法 ——
+ * 但它成立的前提是**菜单按钮和文字同宽**（整行都是热区）。而本项目的齿轮是
+ * **右上角一个 22px 的小图标**，菜单却从卡片底部弹 ⇒ 视觉上两者**对不上**，
+ * 用户会怀疑"我点的是这个吗"。
+ * ⇒ 对齐到齿轮：`top: 26px`（齿轮 top 8 + 高 20 - 2）、`right: 8px`（与齿轮同右边界）。
+ * ⚠️ 前提是卡片**没有被裁剪**（`.wiz-tpl` 上没有任何 `overflow: hidden`，见 2760 附近
+ *    那条"将来若要再裁剪，别挂到 .wiz-tpl 上"的注释）—— 这个前提成立才敢这么改。
+ */
 .wiz-tpl-menu {
   position: absolute;
-  right: var(--sp-2);
-  top: calc(100% - 4px);
+  right: 8px;
+  top: 26px;
   z-index: var(--z-popover);
   display: grid;
   grid-template-columns: 1fr;
@@ -1082,6 +1218,112 @@ nav.wiz-steps {
   color: var(--danger);
 }
 
+/*
+ * 「共 N 页」后面的红色感叹号 + hover 气泡（2026-10-09 用户要求）。
+ *
+ * 用户原话："顶部的灰色提示字体默认隐藏，在「共11页」后面增加一个红色感叹号，
+ * 鼠标移动上去才会有此提示"。
+ *
+ * ⚠️ 气泡用 **CSS `:hover` / `:focus-visible`** 而不是 JS 状态：
+ *    这个交互**没有任何需要 JS 的逻辑**（不异步、不依赖数据、不改状态）
+ *    ⇒ 能用 CSS 表达的交互就别上 JS，少一个 state 就少一次"状态不同步"的机会。
+ * ⚠️ **`focus-visible` 也要展开**：只做 hover 等于把这段信息对键盘用户藏起来
+ *    （`.wiz-info` 上给了 `tabIndex={0}`，见 Wizard.tsx）。
+ * ⚠️ `.wiz-info` 必须 `position: relative`、气泡 `absolute` + 高 `z-index`：
+ *    它在 `.wiz-sum` 里，而下面是预览区 ⇒ 不抬层会被盖住（同一个坑刚在模板菜单上踩过）。
+ */
+.wiz-info {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  cursor: help;
+  vertical-align: middle;
+}
+
+.wiz-info-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--danger, #d54941);
+  color: #fff;
+  font-size: 11px;
+  font-weight: var(--fw-bold);
+  line-height: 1;
+}
+
+.wiz-info-pop {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  z-index: var(--z-popover);
+  display: none;
+  width: max-content;
+  max-width: 260px;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-lg);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  white-space: normal;
+}
+
+.wiz-info:hover .wiz-info-pop,
+.wiz-info:focus-visible .wiz-info-pop {
+  display: block;
+}
+
+/* 气泡里的多段文字（原来是分散在两处的说明，2026-10-09 合并进来） */
+.wiz-info-line {
+  display: block;
+}
+
+.wiz-info-line + .wiz-info-line {
+  margin-top: 6px;
+}
+
+/*
+ * ⚠️ 气泡里**需要强调的关键词**（用户："感觉被 `*` 包裹的部分可以用**蓝色加粗**字体显示"）。
+ *
+ * ⚠️ 这两个词原本在 JSX 里写成了 markdown 的 `**记录范围**` —— 而 **JSX 不解析 markdown**，
+ *    结果 `**` 被原样打在了屏幕上。⇒ 改用 `<b className="wiz-info-key">`。
+ *
+ * ⚠️⚠️ **必须显式写 `font-size` 和 `font-weight`**（2026-10-09 用户报"加粗放大的字体太大了"）：
+ *    `<b>` 的 UA 默认样式是 `font-weight: bolder` —— 它会**盖过**继承来的字重，
+ *    而在中文粗体字体缺失时浏览器还会用**合成粗体**，观感就是"又大又粗"。
+ *    ⇒ 这里显式声明：
+ *      · `font-size: 1.05em` —— 只比正文**大一丁点**（用户："只用比正常的字体稍微大一点就行了"）；
+ *      · `font-weight: 600`   —— 固定字重，不让 `bolder` 的"相对加粗"链式放大。
+ * ⚠️ 用**蓝色**而不是只加粗：气泡正文本来就小（12px），
+ *    单靠字重在中文字体里区分度不够；蓝色是"这是个关键词"的通用语义。
+ */
+.wiz-info-key {
+  color: var(--accent, #3370ff);
+  font-size: 1.05em;
+  font-weight: 600;
+}
+
+/*
+ * ⚠️ **气泡里所有 `<b>` 统一约束**（2026-10-09）。
+ *
+ * 用户截图里"**11**"（页数）也被撑成了又大又粗 —— 它和"记录范围"是**同一个根因**
+ * （`<b>` 的 UA 默认 `font-weight: bolder`）。
+ * ⇒ 在**气泡**这一层统一收口，而不是给每个 `<b>` 各自加类名：
+ *    后者漏一个就又不一致，而这类"某处忘了加"正是本项目反复吃亏的地方。
+ */
+.wiz-info-pop b {
+  font-size: 1.05em;
+  font-weight: 600;
+}
+
 /* ---------------- 预览容器 ---------------- */
 
 .wiz-prev {
@@ -1091,16 +1333,53 @@ nav.wiz-steps {
   min-width: 0;
 }
 
+/*
+ * 纸张的「是纸感」（2026-10-09 **去掉工作台灰底**）。
+ *
+ * ⚠️ 上一轮我加了一层灰底（`--paper-desk-bg`）来衬托纸张，用户看到的是
+ * "一大块灰里嵌着一张白纸" —— 那更像**图片查看器的占位色**，
+ * 而打印预览的本意是"**你看到的就是纸**"，不是"纸放在灰色桌面上"。
+ * ⇒ 去掉底色。纸的存在感**只靠阴影**表达（纸的白 + 阴影的边界已经够了）。
+ *
+ * ⚠️ `padding` 与 `PreviewFrame` 的 `availW = clientWidth - 18` 是**配对**的
+ *    （8×2 + 边框 2）—— 改 padding 必须同步改那个常数，否则"适应宽度"会算宽、纸横向溢出。
+ * ⚠️ 不再裁剪（`overflow: visible`）：裁掉的话阴影会被切一半，反而更不像纸。
+ */
+/*
+ * 承载"缩放后尺寸"的盒子（2026-10-09）。
+ *
+ * ⚠️ 它存在的唯一理由：`transform: scale()` **不改变布局占位**。
+ * iframe 的布局宽是**未缩放**的 `logicalW`，直接当 flex 子项会**比容器宽** ⇒ 溢出 ⇒
+ * 外层 `.wiz-prev-inner` 的 `justify-content: center` 居中不了（看起来"纸贴左边"）。
+ * ⇒ 由这一层承担布局尺寸（缩放后的宽高），iframe 绝对定位卧在里面。
+ * ⚠️ `flex: none` 很重要：否则它会被 flex 压缩，纸又变形了。
+ */
+.wiz-prev-scaler {
+  position: relative;
+  flex: none;
+}
+
 .wiz-prev-inner {
   position: relative;
-  overflow: hidden;
-  border-radius: var(--r-sm);
-  background: var(--paper-canvas-bg);
+  background: transparent;
+  padding: 8px;
+  /* 缩放后横向可能留白 ⇒ 纸居中（顶端对齐：多页时从第一页开始看） */
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: visible;
 }
 
 .wiz-prev-frame {
   border: 0;
   display: block;
+  /* 纸的白底 */
+  background: #fff;
+  /* 两层阴影：贴边细 + 远处扩散。⚠️ 去掉灰底之后，阴影是"纸"唯一的边界，要够明显 */
+  box-shadow:
+    0 1px 3px rgba(31, 35, 41, 0.18),
+    0 8px 24px rgba(31, 35, 41, 0.16),
+    0 2px 8px rgba(31, 35, 41, 0.1);
 }
 
 .wiz-prev-note {
@@ -1181,6 +1460,142 @@ nav.wiz-steps {
 .wiz-custom-tags-row > input {
   flex: 1 1 auto;
   min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--border-1, rgba(31, 35, 41, 0.16));
+  border-radius: var(--r-sm, 4px);
+  background: var(--bg-1, #fff);
+  color: var(--text-1);
+  font: inherit;
+}
+
+/*
+ * 手动圈定循环区（F3-12b，2026-10-02 接线）。
+ *
+ * ⚠️ **列表必须限高可滚动**：一份几十页的 Word 会有上千个块，
+ *    不限高会把整个面板撑到无法操作（用户在找"生成模板"按钮时得滚半天）。
+ * ⚠️ **起点 / 终点 / 中间段三者要能一眼分辨**：用户是"点起点 → 再点终点"两步操作，
+ *    中间态必须看得见，否则他会不确定自己刚才点中了哪一行。
+ */
+.wiz-loop-wrap {
+  margin: 0 0 12px;
+  font-size: var(--fs-sm, 12px);
+}
+
+.wiz-loop-wrap > summary {
+  padding: 4px 0;
+  color: var(--text-2, var(--text-1));
+  cursor: pointer;
+  user-select: none;
+}
+
+.wiz-loop-summary-note {
+  color: var(--text-3, var(--text-2, var(--text-1)));
+  font-weight: 400;
+}
+
+.wiz-loop {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0 0 16px;
+}
+
+.wiz-loop-list {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border-1, rgba(31, 35, 41, 0.16));
+  border-radius: var(--r-sm, 4px);
+  background: var(--bg-1, #fff);
+}
+
+.wiz-loop-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--border-2, rgba(31, 35, 41, 0.06));
+  background: transparent;
+  color: var(--text-1);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.wiz-loop-row:last-child {
+  border-bottom: 0;
+}
+
+.wiz-loop-row:hover {
+  background: var(--surface-3, rgba(31, 35, 41, 0.04));
+}
+
+/* 起点 / 终点：用左侧色条 + 底色区分，不靠文字提示（扫一眼就能认出来） */
+.wiz-loop-row.is-start,
+.wiz-loop-row.is-end {
+  background: var(--accent-weak, rgba(51, 112, 255, 0.1));
+  box-shadow: inset 3px 0 0 var(--accent, #3370ff);
+}
+
+/* 中间段：淡淡一层，让用户看到"我圈的是一整段" */
+.wiz-loop-row.is-in {
+  background: var(--accent-weaker, rgba(51, 112, 255, 0.05));
+}
+
+.wiz-loop-idx {
+  flex: 0 0 auto;
+  min-width: 28px;
+  color: var(--text-3, var(--text-2, var(--text-1)));
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.wiz-loop-kind {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: var(--r-sm, 4px);
+  background: var(--surface-3, rgba(31, 35, 41, 0.06));
+  color: var(--text-3, var(--text-2, var(--text-1)));
+  font-size: 0.9em;
+}
+
+.wiz-loop-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wiz-loop-auto {
+  flex: 0 0 auto;
+  color: var(--accent, #3370ff);
+  font-size: 0.9em;
+}
+
+.wiz-loop-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wiz-loop-picked {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-2, var(--text-1));
+}
+
+.wiz-loop-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-2, var(--text-1));
+}
+
+.wiz-loop-name > input {
+  width: 100px;
   padding: 3px 6px;
   border: 1px solid var(--border-1, rgba(31, 35, 41, 0.16));
   border-radius: var(--r-sm, 4px);
@@ -1999,7 +2414,17 @@ nav.wiz-steps {
 
 /* 菜单：点空白即收起（逻辑在 JS，这里只保证它盖在卡片内容之上） */
 .wiz-tpl-menu {
-  z-index: 2;
+  /*
+   * ⚠️ **必须是 `--z-popover`（200），不能是 2**（2026-10-09 用户报"点齿轮展开的菜单
+   * 会被下面的卡片覆盖"）。
+   *
+   * 根因：卡片 `.wiz-tpl` 是 `position: relative`（会形成层叠上下文），
+   * 而**后面的卡片在 DOM 里靠后** ⇒ 同级 `z-index` 时"后面的赢"。
+   * 菜单 `z-index: 2` 和卡片同级 ⇒ 下一行那张卡片盖住菜单的下半截。
+   * （1145 处本来写的就是 `var(--z-popover)`，是**这一处**把它压回 2 的 ——
+   *   又是"同选择器多处定义、后面覆盖前面"，本次第 4 次栽在同一个坑上。）
+   */
+  z-index: var(--z-popover);
 }
 
 /*
@@ -2010,7 +2435,13 @@ nav.wiz-steps {
  */
 .wiz-tpl-menu.is-up {
   top: auto;
-  bottom: calc(100% - 4px);
+  /*
+   * ⚠️ 从 `calc(100% - 4px)` 改成 `26px`（2026-10-09）：
+   * 菜单基准已从"卡片底边"改成"齿轮正下方"（见 1145 处的注释），
+   * 朝上开时应当对称地取"距卡片底边 26px"，而不是贴卡片底边 —— 否则两种朝向不对称，
+   * 用户会以为"朝上开的时候位置又乱了"。
+   */
+  bottom: 26px;
 }
 
 /* ============================================================
@@ -2038,12 +2469,47 @@ nav.wiz-steps {
 
 /*
  * 卡片本体：收紧内边距；`align-items: start` 让两列各自按内容高，不被拉平。
+ *
+ * ⚠️ **2026-10-09 口径变更**（用户："好歹和'新建模板'那个预设卡片大小一样，现在风格都不统一"）：
+ *    这里原来是 `min-height: 0`（"让两列各自按内容高"），但那只解决了**列内**对齐，
+ *    没解决"**普通卡 vs 虚线卡**"两套尺寸 —— 虚线卡 `.wiz-tpl-add` 是固定 `76px`，
+ *    普通卡随内容 ⇒ 并排时参差不齐。
+ *    ⇒ 统一到 `76px`（与虚线卡同一个数，改的时候两处一起改）。
+ * ⚠️ `padding-right` 要给右上角的齿轮让出位置（原来没留，长名字会顶到它下面）。
  */
 .wiz-tpl {
   padding: var(--sp-2);
+  padding-right: 30px;
+  /*
+   * ⚠️ **上内边距 8px：让第一行文字与右上角齿轮对齐**
+   * （用户反馈："卡片的标题和右上角的尺寸似乎不在一个水平线上，标题靠下了一些"）。
+   * 根因：名字是文档流里的第一行，而齿轮是 `top: 8px` 的**绝对定位** ——
+   * 两者基准不同 ⇒ 文字看起来"沉"在齿轮下面。
+   * 齿轮 `top:8` + 高 20 ⇒ 中心在 18px；文字行高约 20px ⇒ 上边距取 8px 时中心也对齐。
+   */
+  padding-top: 8px;
   align-items: start;
   gap: 4px;
-  min-height: 0;
+  min-height: 76px;
+  box-sizing: border-box;
+  /*
+   * ⚠️ **默认态也带一点立体**（用户："卡片可以更立体一些吗"）。
+   * 原来只有选中态才有阴影 ⇒ 未选中的卡片是一块纯平的色块，"贴"在背景上。
+   * ⇒ 一层很浅的两级阴影（近处细 + 稍远扩散），让它轻轻浮起；
+   *   选中态在此基础上**加强**（见 `.wiz-tpl.on`），两者形成清晰层级。
+   */
+  box-shadow:
+    0 1px 3px rgba(31, 35, 41, 0.09),
+    0 1px 2px rgba(31, 35, 41, 0.06);
+  transition:
+    border-color var(--t-fast),
+    background var(--t-fast),
+    box-shadow var(--t-fast),
+    transform var(--t-fast);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  min-width: 0;
 }
 
 /*
@@ -2055,7 +2521,12 @@ nav.wiz-steps {
 .wiz-tpl-actions {
   position: absolute;
   right: var(--sp-1);
-  bottom: var(--sp-1);
+  /*
+   * ⚠️ **右上角**（2026-10-09 用户要求："右上角那个齿轮，没有靠近右上角"）。
+   * 原来挂在 `bottom`（右下角），和左边的时间挤在一行 —— 齿轮是个"设置"入口，
+   * 按惯例该在右上；放右下还会让人误以为它只作用于那一行文字。
+   */
+  top: var(--sp-1);
 }
 
 .wiz-tpl-actions .app-btn.sm {
@@ -2065,28 +2536,50 @@ nav.wiz-steps {
 }
 
 /* 左下角的"最后编辑时间"（用户要求精确到秒）。右侧留出「…」的位置，避免压住 */
+/*
+ * ⚠️ 时间**独占第三行**（已从 `.wiz-tpl-meta` 里拆出来，见 `Wizard.tsx` 的注释）。
+ *
+ * ⚠️ 原来它有 `padding-right: 30px` —— 那是为了避让**右下角**的「…」按钮。
+ *    齿轮已挪到右上角 ⇒ 这个避让不再需要，去掉（否则时间右侧凭空空一块、看着像没对齐）。
+ */
 .wiz-tpl-time {
   display: block;
   margin-top: 2px;
-  padding-right: 30px;
   color: var(--text-3);
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* ⚠️ 空占位（模板没有 updatedAt）时也要占住一行 ⇒ "固定三行"才成立 */
+  min-height: 1.2em;
 }
 
 /*
- * 两列时模板名允许换行。
- * 原来 `nowrap + ellipsis` 在 180px 里会把名字截掉一半 —— 那比换行更让人认不出是哪张。
+ * 模板名 **不换行、超出横向滚动**
+ * （2026-10-09 用户要求："可以把标题改为不换行，超出的部分滚动显示"）。
+ *
+ * ⚠️ 这块**改过三次**，三次的取舍都记下来，别再翻回去：
+ *   ① 最初 `nowrap + ellipsis` ⇒ 名字被截一半，"认不出是哪张模板"；
+ *   ② 改成自由换行 ⇒ 名字长短不同 ⇒ **卡片行数不同**（用户报"有的三行有的两行"）；
+ *   ③ **现在**：不换行 + 横向滚动 ⇒ 高度恒定一行，长名字**能滚出来看全**。
+ * ⇒ 三次都在"看得全"和"高度齐"之间找平衡，这一版把两个都要到了。
+ *
+ * ⚠️ `overflow-x: auto`（不是 `hidden`）：长名字要能滚出来看；
+ *    而 `auto` 只在真的超出时才出滚动条，短名字不会平白多一条。
+ * ⚠️ **`-webkit-line-clamp` 那套（限两行）必须去掉** —— 它和 `nowrap` 是互斥的，
+ *    留着会让"限行"规则和"不换行"打架。
  */
 .wiz-tpl-name {
-  white-space: normal;
-  overflow: visible;
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
   text-overflow: clip;
-  word-break: break-all;
+  word-break: normal;
   line-height: 1.3;
+  min-width: 0;
+  /* 滚动条做细一点，别喧宾夺主 */
+  scrollbar-width: thin;
 }
 
 
@@ -2506,6 +2999,19 @@ nav.wiz-steps {
 .wiz-tpl {
   position: relative;
   /*
+   * ⚠️ **上内边距 10px：让第一行文字与右上角齿轮在视觉上齐平**
+   * （用户："卡片的标题和齿轮中心还是不在一个水平线上"，这是第 2 次反馈）。
+   *
+   * 算法：齿轮是 `top: 8px` + `min-height: 20px` ⇒ **中心在 18px**；
+   *      标题 `font-size: var(--fs-md)` + `line-height: 1.3` ⇒ **行框约 18.2px**；
+   *      行框中心 = `padding-top + 9.1`。要等于 18 ⇒ `padding-top ≈ 8.9`。
+   * ⚠️ 但**算出来的 8px 在真机上仍然是偏低的**（用户第 2 次反馈）——
+   *    因为行框里文字的实际视觉中心比行框中心**低一点点**（中文字形的基线偏下）。
+   * ⇒ 取 **10px**（比计算值多 1px，把那个字形偏差补掉）。
+   * ⚠️ 这是个**视觉对齐**，不是几何对齐 —— 纯靠算容易差这一点，得看图校准。
+   */
+  padding-top: 10px;
+  /*
    * ⚠️⚠️ **故意不写 `overflow: hidden`** —— 虽然水印（下面 `.wiz-tpl .wiz-kind`）看起来需要它。
    *
    * 设计稿的卡片是 `overflow: hidden`，但那是因为它的「・・・」菜单在卡片内；
@@ -2522,7 +3028,25 @@ nav.wiz-steps {
    */
   display: block;
   min-height: 76px;
+  /*
+   * ⚠️⚠️ **`padding` 简写必须写在 `padding-right` 之前**（2026-10-09 真正的根因）。
+   *
+   * 这里原来是 `padding: 10px 12px` 且**后面没有 `padding-right`** ——
+   * 而 `padding` 是**简写**，它会**重置它涵盖的全部四个长属性**（上/右/下/左）。
+   * ⇒ 卡片右侧只剩 `12px`，而齿轮是 `right: 8px` + 宽 22 ⇒
+   * **文字一直排到齿轮底下**（`.wiz-tpl-name` 的 `max-width:100%` 算的就是这个宽度）
+   * ⇒ 用户看到的"标题滚动时盖住齿轮"。
+   *
+   * ⚠️ **我连着两轮在别的选择器上找原因**（先怀疑 `box-sizing`、再怀疑层叠上下文），
+   *    实际根因在这里 —— 而且它比"同名规则多处定义"更隐蔽：
+   *    **同一条规则内部的顺序**同样会互相覆盖。
+   *
+   * ⇒ **CSS 简写（`padding` / `margin` / `background` / `border` / `font`）一律写在长属性之前。**
+   *    这条要当成硬规则：**先简写、后个体**，反过来写必然被重置。
+   */
   padding: 10px 12px;
+  /* ⚠️ 给右上角的齿轮让位（`right:8` + 宽 22 ⇒ 右边至少留 30px） */
+  padding-right: 30px;
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background: var(--surface);
@@ -2613,11 +3137,35 @@ nav.wiz-steps {
   font-weight: var(--fw-semibold);
   line-height: 1.3;
   margin-bottom: 8px;
-  padding-right: 46px;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  overflow: hidden;
+  /*
+   * ⚠️ 从 46px 收到 24px（2026-10-09）：46px 是为了避让**对勾徽标 + 齿轮**两个，
+   * 而徽标已按用户要求移除 ⇒ 只需给右上角的齿轮留位（`right:8` + 宽 22）。
+   */
+  padding-right: 24px;
+  /*
+   * ⚠️ **不换行 + 横向滚动**（用户要求："标题改为不换行，超出的部分滚动显示"）。
+   * 这里原来（文件末尾那处同名规则）是 `-webkit-line-clamp: 2` —— 限两行。
+   * 它当年是**刻意偏离设计稿**的（设计稿名字都很短，真实名字常是
+   * "产品验收记录表（含抽检结果与附件）"，一行会被截成"产品验收记录…"）。
+   * 但两行带来新问题：**名字长短不同 ⇒ 卡片行数不同**（用户报"有的三行有的两行"）。
+   * ⇒ 改成不换行 + 滚动：高度恒定一行，长名字滚一下能看全，两个诉求都要到了。
+   */
+  /*
+   * ⚠️ **`display: block` 是"横向滚动"的前提**（2026-10-09 用户报"名称超出卡片后不会滚动"）。
+   * `.wiz-tpl-name` 是 `<span>`，**inline 元素的 `overflow` 根本不生效**
+   * （inline 盒子没有独立的内容区可滚）⇒ 写了 `overflow-x: auto` 也白写，
+   * 文字直接溢出卡片、甚至盖到齿轮上。
+   * ⇒ 改成块级盒子，`overflow-x` 才会真正生效。
+   * ⚠️ 同理需要 `max-width: 100%`：块级盒子默认撑满 `padding-right` 之后的空间，
+   *    这已经够用；但显式写一遍可以防住"将来父级改成 flex/grid"时的隐式 `min-width: auto`。
+   */
+  display: block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-overflow: clip;
+  scrollbar-width: thin;
 }
 
 /* 元信息一行：纸张胶囊 + 时间 */
@@ -2641,9 +3189,17 @@ nav.wiz-steps {
 }
 
 /* 时间：跟随 meta 行（覆盖旧的"独占一行 + 右侧避开菜单"） */
+/*
+ * ⚠️⚠️ **这个选择器在文件里有 3 处定义（1089 / 2383 / 2989），这一处是最后的 ⇒ 它生效。**
+ * 想改时间行的样式，**改这里**，别去改前面那两处（改了不生效，我这次就绕了一圈）。
+ */
 .wiz-tpl-time {
-  display: inline;
-  margin: 0;
+  /*
+   * ⚠️ 从 `inline` 改成 `block`：**时间要独占一行**（用户要求"固定三行显示"）。
+   * 原来它和纸张挤在 `.wiz-tpl-meta` 同一行 ⇒ 纸张串长短不一时行数在 2~3 之间浮动。
+   */
+  display: block;
+  margin: 2px 0 0;
   padding: 0;
   color: var(--text-3);
   font-size: var(--fs-xs);
@@ -2699,17 +3255,31 @@ nav.wiz-steps {
 }
 
 /*
- * 「・・・」菜单移到**右上角**（设计稿），并左移 22px 给对勾徽标让位。
+ * 菜单按钮在**右上角**（设计稿位置）。
  *
- * ⚠️ 这是**刻意偏离设计稿**的一处：参考稿把对勾（top:7/right:7）和「・・・」（top:8/right:8）
- *    画在同一格上，选中时对勾会把菜单**盖住**。而"选中"恰恰是最常见的状态 ⇒
- *    菜单就点不到了，那是**功能损失**（卡片菜单里有 编辑/重命名/复制/删除/导出）。
- *    所以：对勾贴右（right:8），菜单让到它左边（right:30），两个都点得到。
+ * ⚠️ 这里曾经**刻意偏离设计稿**：参考稿把对勾（top:7/right:7）和「・・・」（top:8/right:8）
+ *    画在同一格上，选中时对勾会把菜单盖住 —— 而"选中"是最常见的状态 ⇒ 菜单点不到，
+ *    那是**功能损失**（菜单里是 编辑/重命名/复制/删除/导出）。
+ *    当时的对策是"对勾贴右、菜单让到 right:30"。
+ *
+ * ⚠️ **2026-10-09 更新**：对勾徽标已按用户要求移除 ⇒ **让位的前提消失了**，
+ *    于是把 `right` 收回 `8px`（用户反馈："右上角那个齿轮，没有靠近右上角"）。
+ *    这也算"装饰让功能让路"那个反向主次的收尾 —— 装饰走了，功能回到原位。
  */
 .wiz-tpl-actions {
   top: 8px;
-  right: 30px;
+  right: 8px;
   bottom: auto;
+  /*
+   * ⚠️ 从 `2` 抬到 `3`（2026-10-09 用户报"标题滚动时覆盖着齿轮"）。
+   *
+   * ⚠️ **真正解决问题的是 `.wiz-tpl-name` 那处的 `box-sizing: border-box`**
+   *    （标题盒子让出 24px，文字滚到齿轮前就被裁掉，见那里的注释）。
+   *    这里抬一档是**第二道保险**：万一将来有人改了标题的盒模型，
+   *    齿轮仍然压在文字之上 —— 宁可"文字被齿轮切断"（一眼看出有问题），
+   *    也不要"齿轮被文字盖住"（**齿轮会点不到**，那是功能损失）。
+   */
+  z-index: 3;
 }
 
 .wiz-tpl-actions .app-btn.sm {
@@ -2724,28 +3294,6 @@ nav.wiz-steps {
 .wiz-tpl-actions .app-btn.sm:hover:not(:disabled) {
   background: var(--surface-hover);
   color: var(--text-1);
-}
-
-/* 选中徽标：16px 蓝色小圆 + 白对勾（卡内右上角，因为卡片 overflow:hidden） */
-.wiz-tpl-check {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 2;
-  pointer-events: none;
-}
-
-.wiz-tpl-check svg {
-  width: 10px;
-  height: 10px;
 }
 
 /* 网格最后一格：虚线「＋ 新建模板」占位卡 */
@@ -3185,4 +3733,93 @@ nav.wiz-steps {
   line-height: var(--lh-base);
   color: var(--text-3);
   overflow-wrap: anywhere;
+}
+
+/* ============================================================
+   标题的「自动循环滚动」（2026-10-09 用户第 3 次提到）
+   ⚠️ 这段**刻意放在文件末尾**：同选择器在文件里有多处定义，
+      放最后才能确保生效（本项目为此栽过 4 次）。
+   ============================================================ */
+
+.wiz-tpl-name {
+  /* ⚠️ 用 hidden 而不是 auto：**不要滚动条**，滚动交给下面的动画 */
+  display: block;
+  /*
+   * ⚠️ **必须 `border-box`**（2026-10-09 修"标题滚动时盖住齿轮"）。
+   *
+   * `max-width: 100%` 里的 100% 是**父容器的内容宽**，**不含 `padding-right`** ——
+   * 所以标题盒子会一直延伸到齿轮底下，`overflow: hidden` 也就裁不到那里
+   * （文字确实没超出**这个盒子**，只是这个盒子本来就比可见区宽）。
+   * ⇒ `border-box` 让 `max-width` **包含 padding** ⇒ 内容区自动让出 24px ⇒
+   *   文字滚到齿轮前面就被裁掉，不会再压上去。
+   * ⚠️ 只提高齿轮的 `z-index` 是不够的：那样文字会**从齿轮底下穿过**，
+   *    虽然齿轮仍可见，但"文字被齿轮切断"看着更乱。
+   */
+  box-sizing: border-box;
+  max-width: 100%;
+  /*
+   * ⚠️⚠️ **`padding-right` 必须写在这一处**（2026-10-09 第 2 次修"盖住齿轮"）。
+   *
+   * 上一轮我加了 `box-sizing: border-box` 却**没加 `padding-right`** ——
+   * 而"给齿轮留位的那 24px"写在**上一处定义**里，被这一处**整个覆盖**掉了。
+   * ⇒ 文字可用宽 = 卡片全宽 ⇒ 照样滚到齿轮上。
+   *
+   * ⚠️ 这就是"同选择器多处定义"最阴的地方：**它不是覆盖掉全部，而是"只留最后那处写过的属性"**。
+   *    所以现象看起来像"我改的那个属性生效了（border-box 确实生效），但问题还在" ——
+   *    因为另一个**前提**被悄悄丢掉了。
+   * ⇒ 结论：**合并同名规则时，要把它前一处写过的属性全部搬过来**，
+   *    不能只补自己关心的那一个。
+   */
+  padding-right: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+  min-width: 0;
+}
+
+/*
+ * 标题文字本体。**溢出时**（父级带 data-overflow='1'）才启动滚动。
+ * ⚠️ 判溢出靠 JS 测量（scrollWidth > clientWidth），见 Wizard.tsx 的注释 ——
+ *    纯 CSS 做不到「只在溢出时才滚」，硬做会让短名字也永远在动。
+ */
+.wiz-tpl-name-txt {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+/* ⚠️ **无缝滚动的容器**（2026-10-09 修正）。
+   宽度 = 两份文字 + 间隙 ⇒ 整体平移才能让第一份移出左边界的**同一瞬**第二份接上。
+   ⚠️ 动画必须作用在**这一层**，不能作用在两个 .wiz-tpl-name-txt 上 ——
+      那样是各自位移自身一半，整体没有平移'一份+间隙'，接缝会跳。 */
+.wiz-tpl-name-track {
+  display: inline-block;
+  white-space: nowrap;
+  will-change: transform;
+}
+.wiz-tpl-name[data-overflow='1'] .wiz-tpl-name-track {
+  animation: wiz-name-marquee 8s linear infinite;
+}
+
+/* ⚠️ hover 时暂停：滚动中读长名字很累，用户会想定住看 */
+.wiz-tpl-name[data-overflow='1']:hover .wiz-tpl-name-track {
+  animation-play-state: paused;
+}
+
+/* 两份文字之间留间隙，循环的接缝才不粘连 */
+.wiz-tpl-name[data-overflow='1'] .wiz-tpl-name-txt + .wiz-tpl-name-txt {
+  margin-left: 2em;
+}
+
+@keyframes wiz-name-marquee {
+  from { transform: translateX(0); }
+  /* ⚠️ 位移是**两份总宽的一半**（-50%），不是 -100%：
+       第一份移出左边界的同一瞬，第二份正好接上 ⇒ 无缝 */
+  /* ⚠️ 位移 = **一份文字宽 + 一个间隙(2em)**：
+     track 总宽 = 2×文字 + 2em ⇒ -50% = 文字 + 1em，还差 1em 才等于第二份的起点 */
+  to { transform: translateX(calc(-50% - 1em)); }
+}
+
+/* ⚠️ 尊重系统「减少动态效果」设置：持续动画会让前庭功能障碍用户不适 */
+@media (prefers-reduced-motion: reduce) {
+  .wiz-tpl-name[data-overflow='1'] .wiz-tpl-name-txt { animation: none; }
 }

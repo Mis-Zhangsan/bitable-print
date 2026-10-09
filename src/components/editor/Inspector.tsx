@@ -615,7 +615,7 @@ export function PagePanel({ doc, layout, defaultTextStyle, onPageSetup, onDefaul
             </>
           ) : null}
           <p className="bp-hint">
-            循环区自动从表头区下面开始（高度自动）；**表头区与表尾区都每页重复**（相当于 Word 的页眉 / 页脚）。
+            循环区自动从表头区下面开始（高度自动）；<b>表头区与表尾区都每页重复</b>（相当于 Word 的页眉 / 页脚）。
             三个分区的范围在画布上都有虚线框；表头区里的元素出不了这个高度，所以拖它不会推动别的分区。
           </p>
         </Section>
@@ -795,7 +795,7 @@ function ElementPanel(props: InspectorProps & { element: AnyElement; band: BandK
           {element.kind === 'qrcode' || element.kind === 'barcode' ? (
             /* 「填充方式」这一项**故意不给码**：变形的二维码扫不出来（见 qrCodeSvg 的注释）。
                与其给一个会让产物不可用的档位，不如把"它只能等比缩放"写清楚。 */
-            <p className="bp-hint">码会**等比缩放**到你给的这个框里，不会拉伸或裁剪 —— 变形的二维码是扫不出来的。</p>
+            <p className="bp-hint">码会<b>等比缩放</b>到你给的这个框里，不会拉伸或裁剪 —— 变形的二维码是扫不出来的。</p>
           ) : null}
         </Section>
       ) : (
@@ -1396,7 +1396,7 @@ function CellPanel(props: InspectorProps & { element: TableElement; band: BandKe
           </button>
         </div>
         <p className="bp-hint">
-          单格不能"合并"（那是 Excel 里先框选两格才解锁的动作）；这里给的是**与相邻格合并**，
+          单格不能"合并"（那是 Excel 里先框选两格才解锁的动作）；这里给的是<b>与相邻格合并</b>，
           一步到位，不必先框选。框线属于整张表格，不在这一层 —— 点下面「返回整表」去改。
         </p>
         <Field label="内边距" hint="单元格内边距；留空则用表格的默认内边距">

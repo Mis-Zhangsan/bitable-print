@@ -17,7 +17,7 @@
  *    前两者文案与处理完全不同，混成一句"模板损坏"会被用户投诉。
  */
 
-import { DEFAULT_PAGE_SETUP, SCHEMA_VERSION, emptyTemplate } from './types'
+import { DEFAULT_PAGE_SETUP, PAPER_MM, PAPER_PRESETS, SCHEMA_VERSION, emptyTemplate } from './types'
 import type { AnyElement, InlineNode, MarginMm, PageSetup, PaperKey, TemplateDoc, TemplateKind } from './types'
 import type { DataSource, FieldMeta, TemplateRow, TemplateWritePayload } from './data-source'
 // `round1` 的规范实现在 `components/editor/round.ts`（B 批收口：此前全项目 5 份副本、
@@ -74,13 +74,50 @@ function nodesOf(el: AnyElement): InlineNode[][] {
 // ============================================================
 
 /** 生成"纸张"字段的展示串：A4 纵向 / A5 横向 / 自定义 210×297mm 纵向 */
+/**
+ * 生成"纸张"字段的展示串：`A4（210×297） 纵向` / `热敏面单（100×180） 横向` / `自定义（180×100） 纵向`。
+ *
+ * ⚠️ **2026-10-09 第 3 次调整**，三个版本的取舍都记下来：
+ *   ① 最初 `` `${pageSetup.paper} ${dir}` `` ⇒ 直接吐内部 key：**卡片显示 `label100x180`**，
+ *      而画布上选的是"100×180 热敏面单" ⇒ 两处不是同一件事（用户报的 bug）；
+ *   ② 改成用 `PAPER_PRESETS` 的中文名 ⇒ 但 `A4（210×297）` 把尺寸也带上了，
+ *      而用户要求"A4 这种常见尺寸不显示长乘宽"⇒ 去括号 ⇒ 又变成 `A4`，**尺寸信息丢了**；
+ *   ③ **现在**：**统一成"名称（尺寸）"** ——
+ *      名称取中文名里**去掉尺寸后的部分**（`100×150 热敏面单` → `热敏面单`），
+ *      尺寸取 `PAPER_MM` 的实际毫米数（自定义则取用户填的值）。
+ *      ⇒ 三种纸张格式完全一致，读起来也是同一个句式。
+ *
+ * ⚠️ **不带 `mm` 单位**（用户："不用显示单位了"）：括号里的数字默认就是毫米，
+ *    这是打印行业里的默认口径，写单位反而多占宽度 —— 而卡片只有 ~150px，
+ *    多几个字符就可能让方向那一段被挤到下一行（本轮用户报的另一个问题）。
+ */
 export function buildPaperLabel(pageSetup: PageSetup): string {
   const dir = pageSetup.orientation === 'landscape' ? '横向' : '纵向'
-  // 自定义尺寸必须带上实际毫米数，否则列表里两张"自定义 纵向"完全分不出来
-  if (pageSetup.paper === 'custom') {
-    return `自定义 ${round1(pageSetup.widthMm)}×${round1(pageSetup.heightMm)}mm ${dir}`
-  }
-  return `${pageSetup.paper} ${dir}`
+  const opt = PAPER_PRESETS.find((o) => o.key === pageSetup.paper)
+  const isCustom = pageSetup.paper === 'custom'
+  /* 尺寸：自定义取用户填的值，预设取标准毫米数 */
+  const w = isCustom ? pageSetup.widthMm : PAPER_MM[pageSetup.paper as Exclude<PaperKey, 'custom'>].w
+  const h = isCustom ? pageSetup.heightMm : PAPER_MM[pageSetup.paper as Exclude<PaperKey, 'custom'>].h
+  /*
+   * 名称：自定义固定叫"自定义"；预设取中文名**去掉尺寸后**的部分。
+   * ⚠️ 两道 replace 缺一不可：
+   *   · `（[^）]*）` 去掉 A4 那种**括号里的**尺寸；
+   *   · `^\d+×\d+\s*` 去掉标签纸那种**开头的**尺寸（`100×150 热敏面单` → `热敏面单`）。
+   *   只做前一道的话，标签纸会变成 `100×150 热敏面单（100×150）`（尺寸出现两次）。
+   */
+  const name = isCustom
+    ? '自定义'
+    : (opt?.label ?? pageSetup.paper).replace(/（[^）]*）/g, '').replace(/^\d+×\d+\s*/, '')
+  /*
+   * ⚠️ **不要括号，用空格分隔**（2026-10-09 用户第 4 次调整）：
+   * 「纸张方向超出卡片了，实在不行**不要括号了**，统一显示为
+   *   **"热敏面单 100×180 横向"**」。
+   *
+   * 卡片只有 ~150px，`热敏面单（100×150）` 再加一个方向胶囊就溢出了。
+   * 去掉全角括号（`（）` 比半角空格宽很多）能省下约 2 个字符的宽度 ——
+   * 这是"挤不下"时最先该砍的东西：**括号只是装饰，信息量是零**。
+   */
+  return `${name} ${round1(w)}×${round1(h)} ${dir}`
 }
 
 // ============================================================
@@ -190,7 +227,26 @@ export function migrate(doc: TemplateDoc, from: number, to: number): TemplateDoc
 function coerceDoc(raw: Record<string, unknown>): TemplateDoc {
   const ps = isPlainObject(raw.pageSetup) ? raw.pageSetup : {}
   const margin = isPlainObject(ps.margin) ? (ps.margin as unknown as Partial<MarginMm>) : {}
+  /**
+   * ⚠️ **必须以 `...ps` 打底**（2026-10-09 修复："网格间距改成 2mm，保存后下次进来又变 5mm"）。
+   *
+   * 原来是**白名单式重建** —— 只挑出 paper / widthMm / heightMm / orientation / margin /
+   * headerMm / footerMm 这 8 个字段，**其余全部丢弃**。于是 `gridMm`、`showGrid`、
+   * `snapToGrid`、`allowOutOfPage` 在**反序列化时被静默清掉**，用户每次进来看到的都是默认值。
+   *
+   * ⚠️ 关键在于：**存是存了的**（`serializeDoc` 是整份 `JSON.stringify`）——
+   *    丢在**读取**这一侧。所以这个 bug 从"保存"那头完全看不出来，
+   *    只能靠"改了设置、离开、再回来"这条路径复现。
+   *
+   * ⇒ 改成「**原值打底 + 覆盖需要校验的字段**」：
+   *    · 需要约束取值范围的（paper / orientation / margin 里的四个数）逐字段校验；
+   *    · 其余（gridMm / showGrid / snapToGrid / allowOutOfPage …）**原样保留** ——
+   *      它们的消费处各自都有 `finite()` / `?? 默认值` 兜底，这里不必再拦一道。
+   * ⚠️ **以后给 PageSetup 加字段就不用再改这里了** —— 这才是这次改动的重点：
+   *    白名单每加一个字段就多一次"忘了同步"的机会，而这次已经漏了 4 个。
+   */
   const pageSetup: PageSetup = {
+    ...(ps as Partial<PageSetup>),
     paper: (typeof ps.paper === 'string' ? ps.paper : DEFAULT_PAGE_SETUP.paper) as PaperKey,
     widthMm: numOr(ps.widthMm, DEFAULT_PAGE_SETUP.widthMm),
     heightMm: numOr(ps.heightMm, DEFAULT_PAGE_SETUP.heightMm),

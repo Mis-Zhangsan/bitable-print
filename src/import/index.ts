@@ -162,20 +162,20 @@ function finish(
   return { ir: built.ir, template, report: built.report, match, media: built.media }
 }
 
-/**
- * 用户手动圈定循环区后重算模板（F3-12b 的兜底路径）。
- * 不重新解析文档，只重跑"切版式区 + 映射"，所以必须保证 IR 已被复用。
+/*
+ * ⛔ **`rebuildWithLoop()` 已删除**（2026-10-09）。
  *
- * ⚠️ **2026-09-21 查证：全项目没有任何调用方**（连同下面的 `makeManualLoop` / `redetectLoops`）。
- *    ⇒ 这不是"可以删的死代码"，而是 **F3-12b「手动圈定循环区」这条需求没接线**：
- *      实现是齐的，UI 侧一直没做那个入口（`WordImportPanel` 只走自动检测 + 改绑）。
- *      清死导出时**特意留下它们**，就是为了不让这条缺口消失得无影无踪 ——
- *      删掉的话，将来没人会知道"这里本来还差一个入口"。
- *    ⇒ 要做这个功能：从这里接，别再写一套（`toTemplate` 的 loopRanges 通道已经铺好了）。
+ * 它曾是 F3-12b「手动圈定循环区」的兜底出口，但从 2026-09 上架起一直**没有调用方**。
+ * 现在 F3-12b **已经接线**，走的是另一条路：
+ *   `WordImportPanel` → `makeManualLoop()` 造出区间 → 存进 `manualRange` state →
+ *   生成模板时把 `loopRanges` 交给 **`rebuildWithMatches()`**（它本来就有这个参数）。
+ * ⇒ 也就是说 `rebuildWithMatches(ir, match, fields, { loopRanges })` 已经覆盖了
+ *    `rebuildWithLoop(ir, loopRanges)` 的全部能力，两个函数是同一件事的两条入口。
+ *
+ * ⚠️ 之所以现在才敢删：**它当年被特意留下当"缺口的路标"**（注释写着"删了就再没人知道
+ *    这里差一个入口"）。现在缺口已经补上，路标的使命结束了 ——
+ *    留着反而会让下一个人以为还有一条没接的路。
  */
-export function rebuildWithLoop(ir: IRDoc, loopRanges: readonly IRLoopRange[], opts: ToTemplateOptions = {}): TemplateDoc {
-  return toTemplate(ir, { ...opts, loopRanges })
-}
 
 /** 用新的字段绑定关系重算模板（用户在匹配页改绑后调用） */
 export function rebuildWithMatches(
@@ -227,20 +227,26 @@ export function unignorePlaceholder(results: readonly MatchResult[], placeholder
 
 /**
  * 手动圈定循环区（纯函数，供 UI 直接生成区间对象）。
- * ⚠️ 同 `rebuildWithLoop`：**没有任何调用方** —— F3-12b 的 UI 入口未做。见那里的说明。
+ *
+ * ✅ **2026-10-09 已接线**：`WordImportPanel` 的「循环区不对？手动圈定」入口用它把
+ *    用户点选的块区间转成 `IRLoopRange`，再交给 `rebuildWithMatches({ loopRanges })`。
+ *
+ * ⚠️ 这条注释原来写的是「**没有任何调用方** —— F3-12b 的 UI 入口未做」，
+ *    那是缺口补上**之前**的状态。留着会让下一个人以为它还没被用上。
  */
 export function makeManualLoop(range: { startBlock: number; endBlock: number; name?: string }): IRLoopRange {
   return manualLoop(range)
 }
 
-/**
- * 对已解析的 IR 重新做一次循环检测（用户改了自定义标签后）。
- * ⚠️ 同 `rebuildWithLoop`：**没有任何调用方** —— F3-12b 的 UI 入口未做。见那里的说明。
+/*
+ * ⛔ **`redetectLoops()` 已删除**（2026-10-09）。
+ *
+ * 它曾是"用户改了自定义标签后重新做一次循环检测"的出口，同样从未被调用。
+ * 现在 E-2（自定义循环标签）走的是另一条路：
+ *   `WordImportPanel` 把标签交给 `parseDocx({ loopTags })`，
+ *   **在解析时就完成检测**（`docx-read.ts` 的 `detectLoops(blocks, opts.loopTags)`）。
+ * ⇒ 不需要"解析后重来一次"这个动作 —— 用户改标签时本来就是**整个重新解析**的。
  */
-export function redetectLoops(ir: IRDoc, opts: LoopScanOptions = {}) {
-  const detection = detectLoops(ir.blocks, opts)
-  return { ...ir, loop: detection }
-}
 
 // ============================================================
 // 重导出：调用方只需要 `from './import'` 一处入口
