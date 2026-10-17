@@ -92,3 +92,6 @@ test/fixtures/
 !.stylelintrc*
 !.env.example
 !.env.sample
+
+# 交互验证探针（内部工具，不进仓库）
+test/*-probe.mjs

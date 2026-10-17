@@ -33,6 +33,7 @@ import { createDataSource } from '../../lib/bootstrap'
 import { resolveAttachmentImages } from '../../lib/attachment'
 /* ⚠️ 与向导的打印/预览**共用同一份预取实现** —— 两条链各写一套就会"这边好了那边没变" */
 import { fillCellStrings } from '../../lib/cell-strings'
+import { publishRenderStats } from './render-stats'
 import type { ResolvedImage } from '../../render/context'
 import { DEFAULT_ATTACH_CONFIG } from '../../lib/types'
 import { emptyRenderContext } from '../../render/context'
@@ -279,6 +280,14 @@ export async function renderEditorPreview(input: EditorPreviewInput): Promise<Ed
     perPageN: null,
   })
 
+  /*
+   * ⚠️ **记一次真实渲染耗时**（2026-10-17）。
+   *
+   * 检查页那个"预计渲染"只能按系数粗估 —— 它没有真实记录值，长文本换行、图片解码的代价
+   * 估不出来。这里在**真跑过一次之后**把实测值记下来（模块级 + 订阅），检查页读它显示
+   * "上次预览实测 X 秒 / N 条"，比一个系数可信得多，而且**零额外成本**（本来就要渲染）。
+   */
+  const renderT0 = typeof performance !== 'undefined' ? performance.now() : Date.now()
   const rendered = await renderDocument({
     doc,
     records,
@@ -286,6 +295,11 @@ export async function renderEditorPreview(input: EditorPreviewInput): Promise<Ed
     forPreview: true,
     title: '打印效果预览',
     signal: input.signal,
+  })
+  publishRenderStats({
+    ms: Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - renderT0),
+    records: records.length,
+    pages: rendered.pages.length,
   })
 
   return {
@@ -300,3 +314,4 @@ export async function renderEditorPreview(input: EditorPreviewInput): Promise<Ed
     previewLimit: PREVIEW_MAX_RECORDS,
   }
 }
+

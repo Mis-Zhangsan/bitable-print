@@ -173,14 +173,24 @@ eq(C.cellChildId('tbl_1', 'c_0_0'), 'child:tbl_1:c_0_0', '拼装：child:<tableI
 eq(C.parseCellChildId('child:tbl_1:c_0_0')?.tableId, 'tbl_1', '解析：取回 tableId')
 eq(C.parseCellChildId('child:tbl_1:c_0_0')?.cellId, 'c_0_0', '解析：取回 cellId')
 /*
- * id 里带冒号时**用最后一个冒号切**（tableId 与 cellId 都是 `newId()` 生成的，本不含冒号；
- * 这条钉的是"将来万一允许"也不至于错位 —— 而不是"带冒号就解析失败"）。
- * 别把这条写成 `=== null`：那是把"更稳的实现"判成错的。
+ * ⚠️ **2026-10-16：解析口径从"从最右冒号切一刀"改成"按段切"**。
+ *   原因：加了可选的第三段 `childId`（一格可放多个子元素）之后，
+ *   "从右切"会把 `child:<t>:<c>:<x>` 切成 `tableId = t:c`、`cellId = x` —— **错位**。
+ *   而 `tableId` / `cellId` 都是 `newId()` 生成的（**不含冒号**）⇒ 按段切是安全的。
+ * ⚠️ 老形式（2 段）的行为**逐字不变**，下面覆盖了。
  */
 {
-  const weird = C.parseCellChildId(C.cellChildId('a b', 'c:d'))
-  eq(weird?.tableId, 'a b:c', '解析：id 含冒号时按最后一个冒号切（tableId 吃掉前面的冒号）')
-  eq(weird?.cellId, 'd', '解析：id 含冒号时 cellId = 最后一段')
+  const two = C.parseCellChildId(C.cellChildId('t1', 'c1'))
+  eq(two?.tableId, 't1', '老形式（2 段）：tableId')
+  eq(two?.cellId, 'c1', '老形式（2 段）：cellId')
+  eq(two?.childId, undefined, '老形式（2 段）：没有 childId（向后兼容）')
+  const three = C.parseCellChildId(C.cellChildId('t1', 'c1', 'x1'))
+  eq(three?.tableId, 't1', '新形式（3 段）：tableId')
+  eq(three?.cellId, 'c1', '新形式（3 段）：cellId')
+  eq(three?.childId, 'x1', '新形式（3 段）：childId —— 这一条是一格多个能选对的前提')
+  /* ⚠️ `childId` 自带冒号也要吃得下（取剩下的**全部**） */
+  const weird = C.parseCellChildId(C.cellChildId('t1', 'c1', 'a:b'))
+  eq(weird?.childId, 'a:b', 'childId 含冒号 ⇒ 取剩下的全部（不截断）')
 }
 
 /*

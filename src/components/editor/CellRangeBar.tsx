@@ -43,6 +43,14 @@ export type RangeOp =
 export interface CellRangeBarProps {
   /** 选区涵盖的格数（用来决定"合并"能不能点） */
   cellCount: number
+  /**
+   * 合并**为什么不能点**（`null` = 可以）。
+   *
+   * 由 `mergeRangeBlockReason()` 给出 —— 与动作层同一份判据。
+   * 有值时按钮置灰，并把原因写进 title：矩形合并原来只有"静默返回 null"，
+   * 用户拖选跨过表头边界点"合并"时界面一点反应都没有（2026-10-17）。
+   */
+  mergeBlockReason: string | null
   /** 选区里是否有跨行/跨列的合并格（决定"拆分"能不能点） */
   canSplit: boolean
   /** 当前选区是否已经是表头行（按钮显示"取消表头行"） */
@@ -89,6 +97,7 @@ const FILLS: { label: string; value: string | undefined }[] = [
 
 export function CellRangeBar({
   cellCount,
+  mergeBlockReason,
   canSplit,
   allHeader,
   canDeleteRow,
@@ -116,7 +125,14 @@ export function CellRangeBar({
 
   return (
     <div className="bp-rbar" style={style} role="toolbar" aria-label="单元格选区操作" onPointerDown={(e) => e.stopPropagation()}>
-      {btn('merge', '合并', `把选中的 ${cellCount} 格合并成一格`, () => onOp({ kind: 'merge' }), cellCount < 2)}
+      {btn(
+        'merge',
+        '合并',
+        /* 有"不能点的原因"时优先说原因，否则说这一下会发生什么 */
+        mergeBlockReason ?? `把选中的 ${cellCount} 格合并成一格`,
+        () => onOp({ kind: 'merge' }),
+        cellCount < 2 || !!mergeBlockReason,
+      )}
       {btn('split', '拆分', '把这个合并格拆回原来的行列结构', () => onOp({ kind: 'split' }), !canSplit)}
       <span className="bp-rbar__sep" aria-hidden />
 

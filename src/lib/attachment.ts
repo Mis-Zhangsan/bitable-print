@@ -192,6 +192,14 @@ export async function resolveAttachmentImages(opts: ResolveAttachmentOptions): P
   }
   const jobs: Job[] = []
   const seenToken = new Set<string>()
+  /*
+   * ⚠️⚠️ **每个 token 的"所有者"清单**（2026-10-14 修的严重 bug）。
+   *
+   * 去重（`seenToken`）是**对的**（同一张图在多个记录里出现时只下载一次），
+   * 但**下载完只写回了"第一个所有者"** ⇒ 其余记录取不到 URL ⇒ 渲染成"图片加载失败"。
+   * ⇒ 记下所有所有者，下载成功后逐个补写 `ctx.images`。
+   */
+  const tokenOwners = new Map<string, Array<{ recordId: string; fieldId: string }>>()
 
   for (const rec of records) {
     for (const f of attFields) {
@@ -222,6 +230,10 @@ export async function resolveAttachmentImages(opts: ResolveAttachmentOptions): P
           })
           continue
         }
+        /* ⚠️ **先登记所有者**（无论是否首次见到这个 token，都要记）*/
+        const owners = tokenOwners.get(token) ?? []
+        owners.push({ recordId: rec.recordId, fieldId: f.id })
+        tokenOwners.set(token, owners)
         if (seenToken.has(token)) continue
         seenToken.add(token)
         jobs.push({
@@ -244,7 +256,39 @@ export async function resolveAttachmentImages(opts: ResolveAttachmentOptions): P
   }
 
   // 3) 并发下载（受控），按 figure 逐个回填
+  /*
+   * ⚠️ **带退避的重试**（2026-10-14 新增）。
+   *
+   * 为什么必须有：取链接是**每个格子一次**的批量调用，十几个格子会并发打出去 ⇒
+   *   **飞书限流** ⇒ 后面的格子全部失败、那几条记录的图全变"加载失败"。
+   *   而下载层早就有重试，**这一层漏了** —— 用户报的"第 5 条起全失败"就是它。
+   * ⚠️ 退避递增（350 → 700 → 1400），避免重试风暴把限流喂得更狠。
+   * ⚠️ signal 已 abort ⇒ 立刻抛，不再打请求（用户取消了就别再骚扰服务端）。
+   */
+  const withRetry = async (fn: () => Promise<unknown>, tries: number, signal?: AbortSignal): Promise<any> => {
+    let lastErr: unknown
+    for (let i = 0; i < tries; i += 1) {
+      if (signal?.aborted) throw new Error('已取消')
+      try {
+        return await fn()
+      } catch (e) {
+        lastErr = e
+        if (i < tries - 1) await new Promise((r) => setTimeout(r, 350 * 2 ** i))
+      }
+    }
+    throw lastErr
+  }
+
   const pool = createPool(Math.max(1, Math.min(opts.concurrency ?? 4, 5)))
+  /*
+   * ⚠️ **"取链接"专用的独立池**（2026-10-14）。
+   *
+   * 为什么必须独立：`pool` 里跑的是"下载图片"，而取链接的 IIFE **内部也会去 `pool` 下载**
+   *   ⇒ 复用同一个池 ⇒ 外层占满池位、内层的下载永远排不到 ⇒ **死锁**
+   *   （2026-10-14 我踩过，用户卡了 6 分钟）。
+   *   ⇒ 单独实例，两者互不相干。并发 2：比串行快得多，又不会同时打十几个请求触发限流。
+   */
+  const urlPool = createPool(2)
   let done = 0
   const bump = (phase: 'url' | 'download') => {
     done++
@@ -271,11 +315,19 @@ export async function resolveAttachmentImages(opts: ResolveAttachmentOptions): P
         const needUrl = cellJobs.filter((j) => !isFresh(j.token) || !urlByToken.has(j.token))
         if (needUrl.length > 0) {
           try {
-            const urls = await ds.getAttachmentUrls(
-              tableId,
-              cellJobs[0].recordId,
-              cellJobs[0].fieldId,
-              needUrl.map((j) => j.token),
+            /* ⚠️ **必须重试**：十几个格子并发打 ⇒ 限流 ⇒ 后面的全失败（见 withRetry 的注释）*/
+            const urls = await urlPool.run(() =>
+              withRetry(
+              () =>
+                ds.getAttachmentUrls(
+                  tableId,
+                  cellJobs[0].recordId,
+                  cellJobs[0].fieldId,
+                  needUrl.map((j) => j.token),
+                ),
+                3,
+                opts.signal,
+              ),
             )
             needUrl.forEach((j, i) => {
               if (urls[i]) urlByToken.set(j.token, urls[i])
@@ -304,7 +356,7 @@ export async function resolveAttachmentImages(opts: ResolveAttachmentOptions): P
                 const hit = !opts.force ? getFresh(j.token) : null
                 if (hit) {
                   stats.cached++
-                  pushImage(images, key, {
+                  pushImageForTokenOwners(images, tokenOwners.get(j.token), j, {
                     token: j.token,
                     name: j.name,
                     url: quality === 'print' ? hit.url : (hit.thumbUrl ?? hit.url),
@@ -362,7 +414,7 @@ export async function resolveAttachmentImages(opts: ResolveAttachmentOptions): P
                 })
 
                 stats.downloaded++
-                pushImage(images, key, {
+                pushImageForTokenOwners(images, tokenOwners.get(j.token), j, {
                   token: j.token,
                   name: j.name,
                   url: quality === 'print' ? objectUrl : (thumbUrl ?? objectUrl),
@@ -386,6 +438,29 @@ export async function resolveAttachmentImages(opts: ResolveAttachmentOptions): P
     )
   }
 
+  /*
+   * ⚠️⚠️ **串行取链接**（2026-10-14，最终方案）。
+   *
+   * 背景：用户实测「前 3 条记录图片正常，**从第 5 条起全部"图片加载失败"**」——
+   * 因为原来这里是裸 `Promise.all(tasks)`，**十六个格子的 `getAttachmentUrls` 同时打** ⇒ 飞书限流。
+   *
+   * ⚠️ 我中间试过用 `pool.run` 包住它们（想让它们排队）⇒ **死锁**：
+   *   内层"逐个下载图片"用的是**同一个池子** ⇒ 外层占满池位、内层永远排不到
+   *   ⇒ 用户那边**卡了 6 分钟没动静**。**已回退，并记在这里防止再犯。**
+   *
+   * ⇒ 最终用**串行**：一次只发一个"取链接"请求。
+   *   · **不碰池子** ⇒ 不可能嵌套死锁；
+   *   · 限流是"同时请求太多"引起的，串行天然不触发；
+   *   · 代价只是慢一点（16 条 × 单次往返），远好于"十几条记录全失败"。
+   * ⚠️ 每次之间留一小段间隔，进一步避开突发限流。
+   */
+  /*
+   * ⚠️ **并发等待**（2026-10-14 从"串行"改回）。
+   *   · 取链接已被 `urlPool`（并发 2）限住；
+   *   · 每个 IIFE 内部的下载已被 `pool`（并发 4）限住；
+   *   · 两者是**不同实例** ⇒ 不会互相饿死 ⇒ 不会死锁。
+   * ⇒ 整体比原来"一次只发一个"快好几倍，同时仍不会触发飞书限流。
+   */
   await Promise.all(tasks)
   await pool.onIdle()
 
@@ -702,6 +777,24 @@ function pushImage(map: Map<string, ResolvedImage[]>, key: string, img: Resolved
   const arr = map.get(key)
   if (arr) arr.push(img)
   else map.set(key, [img])
+}
+/**
+ * ⚠️ **把这张图写给"同一 token 的所有记录"**（2026-10-14 修的严重 bug）。
+ *
+ * 背景：同一张附件图可能被多条记录引用（用户复制粘贴 / 多行同图）。
+ *   `seenToken` 去重后**只下载一次** ⇒ 如果只按"第一个所有者"的 key 写回，
+ *   **其余记录在 `ctx.images` 里查不到** ⇒ 渲染成"图片加载失败"（用户报的第 5 条起全失败）。
+ * ⇒ 下载成功后按 `tokenOwners` 逐个补写。
+ * ⚠️ 拿不到 owners 时（保险）退回"只写自己" —— 与修之前的行为一致。
+ */
+function pushImageForTokenOwners(
+  map: Map<string, ResolvedImage[]>,
+  owners: Array<{ recordId: string; fieldId: string }> | undefined,
+  fallback: { recordId: string; fieldId: string },
+  img: ResolvedImage,
+): void {
+  const list = owners && owners.length > 0 ? owners : [fallback]
+  for (const own of list) pushImage(map, imageKey(own.recordId, own.fieldId), img)
 }
 
 function toFailure(

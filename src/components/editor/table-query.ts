@@ -10,7 +10,13 @@
  *      而那一层要能被 Node 直接加载（`__selftest.mts` 就是跑在 Node 下的）；
  *   b. 自己再扫一遍 `rows` —— 同一套查找逻辑两份，**会静默分叉**。
  *
- * 两条都不能接受，所以走第三条：**把原语下沉到这里**（只依赖类型，运行时零依赖）。
+ * 两条都不能接受，所以走第三条：**把原语下沉到这里**（只依赖 `src/lib/types.ts` 的纯函数，不碰 React）。
+ *
+ * 2026-10-17 又下沉了一次：`GridCell` / `tableGrid` 从 `table-actions.ts` 搬到这里。
+ * 原因同上 —— `findCell` 也要算**网格列号**（`colIdx` 是数组下标，有合并时会偏，
+ * 面包屑「第 N 行第 M 列」会显示错），而摊平算法只能有一份。
+ * `table-actions.ts` 改成 re-export，老引用一行都不用改。
+ *
  * 之后 `useEditorState.ts` 改成从这里 re-export，全项目**只剩一份实现**。
  *
  * 在那次 re-export 落地之前，`__selftest.mts` 里有一条**交叉断言**钉着
@@ -18,13 +24,37 @@
  * 所以这段共存期不会悄悄分叉。
  */
 
-import type { TableCell, TableRow } from '../../lib/types'
+import { finite, type TableCell, type TableRow } from '../../lib/types'
 
 export interface CellLocation {
   rowIdx: number
   colIdx: number
   cell: TableCell
   row: TableRow
+  /**
+   * 这一格在**网格**里的列起点（0-based）。
+   *
+   * ⚠️ 与 `colIdx`（`row.cells` 里的**数组下标**）不是一回事：span 模型下被上方
+   * `rowspan` 覆盖的列在这一行**没有元素**，数组下标会整体左移。
+   * 面包屑「第 N 行 第 M 列」必须用这个，否则"合并过的表"会显示成错误的列号。
+   * 可选是为了不破坏手写 `CellLocation` 的用例（缺省回退到 `colIdx`）。
+   */
+  gridCol?: number
+}
+
+/* 摊平实现已下沉到 `src/lib/table-grid.ts`（渲染端也要用），这里只转出 */
+import { tableGrid } from '../../lib/table-grid'
+export { tableGrid, type GridCell } from '../../lib/table-grid'
+
+/** 每行 Σcolspan 的最大值 = 列数（合法结构下各行相等） */
+function maxCols(rows: readonly TableRow[]): number {
+  let n = 0
+  for (const row of rows) {
+    let s = 0
+    for (const c of row.cells) s += Math.max(1, finite(c.colspan, 1))
+    if (s > n) n = s
+  }
+  return n
 }
 
 /**
@@ -41,7 +71,17 @@ export function findCell(rows: TableRow[], cellId: string | null | undefined): C
     const colIdx = row.cells.findIndex((c) => c.id === cellId)
     if (colIdx < 0) continue
     const cell = row.cells[colIdx]
-    if (cell) return { rowIdx: r, colIdx, cell, row }
+    if (!cell) continue
+    /* 网格列起点：数组下标在有合并时会偏，这里按摊平网格算一次（表格很小，开销可忽略） */
+    let gridCol = colIdx
+    for (const grow of tableGrid(rows, maxCols(rows))) {
+      const hit = grow.find((g) => g && g.cell.id === cellId)
+      if (hit) {
+        gridCol = hit.colStart
+        break
+      }
+    }
+    return { rowIdx: r, colIdx, cell, row, gridCol }
   }
   return null
 }

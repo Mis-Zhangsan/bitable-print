@@ -8,7 +8,8 @@
  * 2) 所有弹出层走 Popover（fixed + 视口收边 + 不透明背景 + z-index ≥ 200）。
  */
 
-import { Fragment, useEffect, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react'
+import type { TextStyle } from '../../lib/types'
 import { Popover } from './Popover'
 import { IconCaret } from './Icons'
 
@@ -42,10 +43,18 @@ export function Section({
   title,
   children,
   defaultOpen = true,
+  action,
 }: {
   title: string
   children: ReactNode
   defaultOpen?: boolean
+  /**
+   * ⚠️ **标题右侧的操作区**（2026-10-17 用户要求："插入字段改成右上角 + 图标"）。
+   *
+   * ⚠️ 必须放在 `<button>` **外面** —— 标题本身是 `<button>`，里面再塞 `<button>` 是非法 HTML
+   *   （浏览器会把内层按钮"提"出来、行为也诡异）。
+   */
+  action?: ReactNode
 }) {
   const [open, setOpen] = useState(defaultOpen)
   return (
@@ -56,6 +65,7 @@ export function Section({
         </span>
         <span className="bp-sec__title">{title}</span>
       </button>
+      {action ? <div className="bp-sec__action">{action}</div> : null}
       {open ? <div className="bp-sec__body">{children}</div> : null}
     </section>
   )
@@ -123,6 +133,8 @@ export function Num({
   ariaLabel,
   /** 输入过程中的合并 key，让连续敲数字只产生一步撤销 */
   onLiveChange,
+  /** ⚠️ 禁用（如"原图"模式下尺寸由图片本身决定，这个框不参与渲染）*/
+  disabled = false,
 }: {
   value: number
   onChange(v: number): void
@@ -133,11 +145,27 @@ export function Num({
   ariaLabel: string
   /** 存在时每次按键都回调（用于即时预览），onChange 仍只在确认时触发 */
   onLiveChange?(v: number): void
+  disabled?: boolean
 }) {
   const [text, setText] = useState(() => String(normalize(value)))
+  /*
+   * ⚠️ **"正在输入"标记**（2026-10-15）。
+   *
+   * 用户报：「填写内边距时，**填完后必须要点击右侧属性的空白区才会保存**，
+   *   如果此时点击画布，那么更改就会撤销；改为**只要输入了数字，点击任意区域都保存**」。
+   *
+   * 根因：提交只在 `onBlur` 里做 ⇒ 点画布时 `blur` 的场景不稳定（画布会 preventDefault），
+   *   而重渲染又把 `text` 同步回**旧值** ⇒ 用户看到"更改被撤销"。
+   * ⇒ 改成 **onChange 即时提交**（见下面）。
+   * ⚠️ 但"即时提交"会踩另一个坑：用户输入 `1.` 时，`value` 变成 1 ⇒
+   *   下面的 `useEffect` 会把 `text` 回写成 `"1"` ⇒ **小数点被打断、`1.5` 根本输不进去**。
+   * ⇒ 用这个 ref：**聚焦期间不回写**（只有"外部值变化"才需要同步）。
+   */
+  const focusedRef = useRef(false)
 
   // 外部值变化（拖动改尺寸等）要同步回输入框
   useEffect(() => {
+    if (focusedRef.current) return // ⚠️ 用户正在输入 ⇒ 不回写，否则打断 "1." 这种中间态
     setText(String(normalize(value)))
   }, [value])
 
@@ -159,31 +187,93 @@ export function Num({
   }
 
   return (
-    <div className="bp-num">
-      {/* 用 text + inputMode 而不是 type=number：number 输入框会把 "1." 这种中间态
-          判为非法值并清空，用户根本没法输入 0.25 / 10.5 这类小数 */}
-      <input
-        className="bp-num__input"
-        type="text"
-        inputMode="decimal"
-        value={text}
-        aria-label={ariaLabel}
-        onChange={(e) => {
-          setText(e.target.value)
-          const n = Number(e.target.value)
-          if (onLiveChange && e.target.value.trim() !== '' && Number.isFinite(n)) onLiveChange(clamp(n))
-        }}
-        onBlur={(e) => commit(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') commit((e.target as HTMLInputElement).value)
-          if (e.key === 'Escape') setText(String(normalize(value)))
-          if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-            const dir = e.key === 'ArrowUp' ? 1 : -1
-            e.preventDefault()
-            commit(String(normalize(clamp(value + dir * step))))
-          }
-        }}
-      />
+    /*
+     * ⚠️⚠️ **单位（suffix）必须画在输入框「外面」**（2026-10-15 用户要求，原话：
+     *   「**左偏移、上偏移为什么两个的单位不一样，有点奇怪，建议把单位放在框外，
+     *    不然看不清输入框内的数字**」）。
+     *
+     * 原来 suffix 在 `.bp-num` 这个**带边框的盒子内部** ⇒ 挤占输入区、数字看不清。
+     * ⇒ 外面再包一层 `bp-num-wrap`：内层仍是原来的"带框输入区"，suffix 挂在外层右侧。
+     * ⚠️ **在组件内部改** ⇒ 全部调用点（几十处 `suffix="mm"` / `suffix="%"` …）**一个字都不用动**。
+     */
+    <div className={`bp-num-wrap${disabled ? ' is-disabled' : ''}`}>
+      <div className="bp-num">
+        {/* 用 text + inputMode 而不是 type=number：number 输入框会把 "1." 这种中间态
+            判为非法值并清空，用户根本没法输入 0.25 / 10.5 这类小数 */}
+        <input
+          className="bp-num__input"
+          type="text"
+          inputMode="decimal"
+          value={text}
+          aria-label={ariaLabel}
+          disabled={disabled}
+          onFocus={() => {
+            focusedRef.current = true
+          }}
+          onChange={(e) => {
+            const raw = e.target.value
+            setText(raw)
+            const n = Number(raw)
+            if (raw.trim() === '' || !Number.isFinite(n)) return
+            /*
+             * ⚠️⚠️ **即时提交**（2026-10-15 用户要求："只要输入了数字，点击任意区域都保存"）。
+             *
+             * 原来只更新本地 `text`、靠 `onBlur` 提交 ⇒ 点画布时不一定触发 blur、
+             *   而且重渲染会把 `text` 拉回旧值 ⇒ 用户看到"更改被撤销"。
+             * ⇒ 现在**每次键入就把合法值提交上去**（配合上面的 `focusedRef`：聚焦期间不回写）。
+             * ⚠️ 提交失败（非法/空）时**不动 value**，用户继续输入即可。
+             */
+            const c = clamp(n)
+            if (c !== value) onChange(c)
+            if (onLiveChange) onLiveChange(c)
+          }}
+          onBlur={(e) => {
+            focusedRef.current = false
+            commit(e.target.value)
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commit((e.target as HTMLInputElement).value)
+            if (e.key === 'Escape') setText(String(normalize(value)))
+            if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+              const dir = e.key === 'ArrowUp' ? 1 : -1
+              e.preventDefault()
+              commit(String(normalize(clamp(value + dir * step))))
+            }
+          }}
+        />
+        {/*
+          ⚠️ **上下调节按钮**（2026-10-15 用户要求："数字输入框增加上下调节的按钮"）。
+          ⚠️ 不用 `type="number"` 的原生 spinner —— 它会把 `1.` 这种中间态判为非法并清空
+             （见上面注释），所以自己画两个小三角。
+          ⚠️ `tabIndex={-1}`：不要抢走键盘焦点（否则用户按 ↑↓ 会跑到按钮上）。
+        */}
+        <span className="bp-num__spin">
+          <button
+            type="button"
+            className="bp-num__btn"
+            tabIndex={-1}
+            aria-label={`增大${ariaLabel}`}
+            onPointerDown={(e) => {
+              e.preventDefault()
+              commit(String(normalize(clamp(value + step))))
+            }}
+          >
+            ▲
+          </button>
+          <button
+            type="button"
+            className="bp-num__btn"
+            tabIndex={-1}
+            aria-label={`减小${ariaLabel}`}
+            onPointerDown={(e) => {
+              e.preventDefault()
+              commit(String(normalize(clamp(value - step))))
+            }}
+          >
+            ▼
+          </button>
+        </span>
+      </div>
       {suffix ? <span className="bp-num__suffix">{suffix}</span> : null}
     </div>
   )
@@ -229,8 +319,18 @@ export function Switch({
 // ============================================================
 
 /** 主题色板：这些是"内容色"（会打印出来），不属于插件 UI 主题，因此允许写死 */
-const SWATCHES = ['#1f2329', '#646a73', '#8f959e', '#f54a45', '#ff8800', '#ffc60a', '#34c724', '#1d9e75', '#3370ff', '#7f77dd']
-const TEXT_SWATCHES = ['#1f2329', '#646a73', '#8f959e', '#f54a45', '#ff8800', '#3370ff', '#1d9e75']
+/**
+ * ⚠️ **全项目唯一的色板**（2026-10-17 统一）。
+ *
+ * 用户要求：「颜色**参考二维码中的排列方式，横向一排** …… **不要重复造轮子，能复用的就复用**」。
+ * 原来这里有 `SWATCHES`（10 色）和 `TEXT_SWATCHES`（7 色）两份，文字类都在用后者
+ * ⇒ 同一个面板里「字体颜色」和「二维码前景」长得不一样，用户看着乱。
+ * ⇒ 现在**只留这一份**，文字 / 单元格 / 字段块 / 码全部引用它。
+ * ⚠️ 顺序照二维码那排：黑 → 灰阶 → 红橙黄 → 绿 → 蓝 → 紫。
+ */
+export const SWATCHES = ['#1f2329', '#646a73', '#8f959e', '#f54a45', '#ff8800', '#ffc60a', '#34c724', '#1d9e75', '#3370ff', '#7f77dd']
+/** ⚠️ 兼容旧引用（2026-10-17）：**指向同一份 SWATCHES** —— 不要再各写一份。 */
+const TEXT_SWATCHES = SWATCHES
 
 export function ColorInput({
   value,
@@ -465,4 +565,70 @@ export function FieldPicker({ value, fallbackName, options, onChange, ariaLabel,
       )}
     </Popover>
   )
+}
+
+// ============================================================
+// 字形：下划虚线
+// ============================================================
+
+/**
+ * 「下划虚线」的开关值（各面板共用，保证四处口径一致）。
+ *
+ * 已经是虚线 ⇒ 关掉（`underline` 与 `underlineStyle` 一起清，不留半截状态）；
+ * 否则 ⇒ 开成虚线。
+ */
+export function underlineDashToggle(
+  s: TextStyle | undefined,
+): { underline?: boolean; underlineStyle?: 'dashed' } {
+  const on = s?.underline === true && s?.underlineStyle === 'dashed'
+  return on ? { underline: undefined, underlineStyle: undefined } : { underline: true, underlineStyle: 'dashed' }
+}
+
+/**
+ * 「下划虚线」按钮（2026-10-17 用户要求：所有字形区域都要有这个样式）。
+ *
+ * 为什么**单独一个按钮**、而不是把 U 做成"无 → 实线 → 虚线"三态循环：
+ * U 回答的是"**要不要**下划线"，这个按钮回答的是"下划线**长什么样**"。
+ * 点 U 仍然得到实线（老习惯一个字都不变），想要填空线（`经办人：_ _ _ _`）再点这个。
+ *
+ * 按钮里的 `U` 自己带一条虚线（CSS `.bp-deco-dash`），和旁边那条实线的 U 一眼能分开。
+ */
+export function UnderlineDashBtn({
+  style,
+  onToggle,
+  hint,
+}: {
+  style?: TextStyle
+  onToggle: () => void
+  /** 追加在 title 末尾的说明（各面板语汇不同，例如「只作用这一处」） */
+  hint?: string
+}) {
+  const on = style?.underline === true && style?.underlineStyle === 'dashed'
+  return (
+    <button
+      type="button"
+      className={`bp-tgl bp-tgl--underdash${on ? ' is-on' : ''}`}
+      aria-label="下划虚线"
+      aria-pressed={on}
+      title={`下划虚线${hint ? `（${hint}）` : ''} —— 拼填空线用，例如「经办人：_ _ _ _」`}
+      onClick={onToggle}
+    >
+      <span className="bp-deco-dash">U</span>
+    </button>
+  )
+}
+
+/**
+ * 「下划线（实线）」的开关值。
+ *
+ * ⚠️ 开的时候要**显式**写 `underlineStyle: undefined`：用户上次可能开的是虚线，
+ * 只写 `underline: true` 会沿用上次的线型 ⇒ "点 U 得到虚线"，非常费解。
+ * 想用虚线请走 `underlineDashToggle`。
+ */
+export function underlineSolidToggle(
+  s: TextStyle | undefined,
+): { underline?: boolean; underlineStyle?: undefined } {
+  return s?.underline
+    ? { underline: undefined, underlineStyle: undefined }
+    : { underline: true, underlineStyle: undefined }
 }

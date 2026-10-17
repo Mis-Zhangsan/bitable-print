@@ -43,25 +43,54 @@ import { childWidthPct, CELL_CHILD_DEFAULT_H_MM, MIN_CELL_CHILD_PCT } from '../.
 
 const PREFIX = 'child:'
 
-/** 复合 id：`child:<tableId>:<cellId>` */
-export function cellChildId(tableId: string, cellId: string): string {
-  return `${PREFIX}${tableId}:${cellId}`
+/**
+ * 复合 id：`child:<tableId>:<cellId>[:<childId>]`。
+ *
+ * ⚠️ **第三段是可选的**（2026-10-16 放宽 `MAX_CELL_CHILDREN` 后新增）：
+ *   · 不传 ⇒ `child:<tableId>:<cellId>` —— **与旧代码逐字相同**，表示"这一格"；
+ *   · 传了 ⇒ `child:<tableId>:<cellId>:<childId>` —— 指向**具体某一个**子元素。
+ * ⚠️ 老形式仍然合法（"这一格"的语义没变）⇒ 老模板/老调用点不受影响。
+ */
+export function cellChildId(tableId: string, cellId: string, childId?: string): string {
+  return childId ? `${PREFIX}${tableId}:${cellId}:${childId}` : `${PREFIX}${tableId}:${cellId}`
 }
 
 /**
- * 解回 `{tableId, cellId}`；不是子元素 id 就返回 null。
+ * 解回 `{tableId, cellId, childId?}`；不是子元素 id 就返回 null。
  *
- * 用**第一个冒号**切一刀、再用**最后一个冒号**切第二刀：
- * tableId 与 cellId 都是 `newId()` 生成的（无冒号），但万一将来 id 里允许冒号，
- * 这样切也比 `split(':')` 稳（后者会因为多出来的段而错位）。
+ * ⚠️ **2026-10-16 改成"按段切"**：原来用 `lastIndexOf(':')` 从右边切一刀 ——
+ *   那是为**两段**设计的；加了可选的第三段之后，那个切法会把 `cellId` 切错位。
+ *   · 2 段 ⇒ `{tableId, cellId}`（老形式，**行为逐字不变**）
+ *   · ≥3 段 ⇒ `{tableId, cellId, childId}`（`childId` 取剩下的全部，含冒号也不怕）
+ * ⚠️ `tableId` / `cellId` 都是 `newId()` 生成的（不含冒号）⇒ 按段切是安全的。
  */
-export function parseCellChildId(id: string | null | undefined): { tableId: string; cellId: string } | null {
+export function parseCellChildId(
+  id: string | null | undefined,
+): { tableId: string; cellId: string; childId?: string } | null {
   if (!id || !id.startsWith(PREFIX)) return null
   const rest = id.slice(PREFIX.length)
-  const cut = rest.lastIndexOf(':')
-  if (cut <= 0 || cut >= rest.length - 1) return null
-  return { tableId: rest.slice(0, cut), cellId: rest.slice(cut + 1) }
+  const parts = rest.split(':')
+  if (parts.length < 2 || !parts[0] || !parts[1]) return null
+  if (parts.length === 2) return { tableId: parts[0], cellId: parts[1] }
+  return { tableId: parts[0], cellId: parts[1], childId: parts.slice(2).join(':') }
 }
+
+/**
+ * ⚠️ **格内子元素里"可自由缩放"的种类**（2026-10-16 用户要求 —— 
+ *   "所有的字段、元素都可自由拖动，但**不像附件/图片/码那样可自由缩放**"）。
+ *
+ * 列的这 4 种都有"框"的概念（宽 × 高都能调）；
+ * 没列的两种（`hline` 水平线 / `text` 文本块）**只能拖位置**，不该出现缩放手柄 ——
+ * 它们"拉高"没有意义（文本高度由字号/行数决定，水平线只有长度）。
+ *
+ * ⚠️ **单一来源**：锚点的显示条件、以及以后的任何"是否可缩放"判断，都从这里取。
+ */
+export const SCALABLE_CELL_KINDS: ReadonlyArray<AnyElement['kind']> = [
+  'image',
+  'qrcode',
+  'barcode',
+  'attach',
+]
 
 export interface FoundCellChild {
   tableId: string
@@ -82,7 +111,17 @@ export function findCellChild(doc: TemplateDoc, id: string | null | undefined): 
   if (!found || found.el.kind !== 'table') return null
   const row = found.el.rows.find((r) => r.cells.some((c) => c.id === parsed.cellId))
   const cell = row?.cells.find((c) => c.id === parsed.cellId)
-  const child = cell?.children?.[0]
+  /*
+   * ⚠️⚠️ **按 `childId` 找，而不是永远 `[0]`**（2026-10-16 用户报：
+   *   「点击**格内任意元素**，右侧面板**显示第一个增加的元素**」）。
+   *
+   * 原来写死 `cell?.children?.[0]` —— 一格一个时没问题；
+   *   放宽 `MAX_CELL_CHILDREN` 之后，**点哪个都解析成第一个** ✅
+   * ⇒ 有 `childId` 就按 id 找；没有（老形式 2 段 id）才退回第 0 个（**行为逐字不变**）。
+   */
+  const child = parsed.childId
+    ? cell?.children?.find((c) => c.id === parsed.childId)
+    : cell?.children?.[0]
   if (!cell || !child) return null
   return { tableId: parsed.tableId, cellId: parsed.cellId, band: found.band, table: found.el, child }
 }
@@ -189,7 +228,22 @@ export const CELL_CHILD_CODE_H_MM = 18
  * 现在按 `18 / 格宽` 反算百分比：**框贴着码走**。
  * 没传 `cellWidthMm` 时仍退回 100（老调用与单测不受影响）。
  */
-export function normalizeChildInCell<T extends AnyElement>(child: T, cellWidthMm?: number): T {
+export function normalizeChildInCell<T extends AnyElement>(
+  child: T,
+  cellWidthMm?: number,
+  /**
+   * 这一格的**行高**（mm，可选）。
+   *
+   * ⚠️ 2026-10-13 用户口径：「**两者取小**（既不超过格宽、也不超过行高）」——
+   *   从画布拖进格子的元素要按这个规则自动缩放。
+   * ⚠️ **为什么是可选的**：行高可能是**自适应**的（`TableRow.heightMm` 缺席 ⇒ 由内容撑开）
+   *   ⇒ 那种格子**没有分母**，只能退回"按格宽"那一档。这不是偷懒，
+   *   而是"自适应行高"与"元素不超出格子"在语义上**循环依赖**（元素多高 → 行多高 → 元素该多高）。
+   * ⚠️ 留 `2mm` 余量给单元格的上下内边距（`y` 会往里推）——
+   *   否则元素顶着行高算出来的尺寸，加上内边距就又溢出了。
+   */
+  cellHeightMm?: number,
+): T {
   /*
    * ⚠️ **四种元素一视同仁**（2026-09-24 第四批 ④）。
    *
@@ -202,11 +256,37 @@ export function normalizeChildInCell<T extends AnyElement>(child: T, cellWidthMm
    *   · `w` = 按 `默认高 / 格宽` 反算的百分比（方形元素框贴着内容；非方形由 `contain` 兜）
    *   · `fit` 保持元素自己的取值（默认 `contain` = 等比、不拉伸）
    */
+  /*
+   * ⚠️ **两者取小**（用户口径）：高度上限 = `min(默认 18mm, 单元格内容区高)`；
+   * 宽度则由"这个高度 / 格宽"反算成百分比。内容区高不可知（自适应行）时只有默认值这一档。
+   *
+   * ⚠️ **这里收的是"内容区高"，不是行高**（2026-10-17 修正）：
+   *   `row.heightMm` 是 **border box 总高**（含上下内边距），而格内元素画在**内容区**里。
+   *   原来传行高再 `− 2mm` 当余量，只是"差不多"；内边距一改（1.5 / 3 / 0）就不准，
+   *   元素会**压在单元格边框上**（用户原话："不会根据单元格当前的高度自动压缩嵌入，
+   *   反而是压在单元格之上"）。现在由调用方用 `cellContentHeightMm()` 算好再传。
+   */
+  const boxH =
+    typeof cellHeightMm === 'number' && cellHeightMm > 0
+      ? Math.max(4, Math.min(CELL_CHILD_DEFAULT_H_MM, cellHeightMm))
+      : CELL_CHILD_DEFAULT_H_MM
   const pct =
     typeof cellWidthMm === 'number' && cellWidthMm > 0
-      ? Math.max(MIN_CELL_CHILD_PCT, Math.min(100, (CELL_CHILD_DEFAULT_H_MM / cellWidthMm) * 100))
+      ? Math.max(MIN_CELL_CHILD_PCT, Math.min(100, (boxH / cellWidthMm) * 100))
       : 100
-  return { ...child, w: round1(pct), h: CELL_CHILD_DEFAULT_H_MM }
+  /*
+   * ⚠️ **必须清掉 `cellPos`**（2026-10-13 用户报的 bug）：
+   *   「将该元素从画布中拖回单元格内后，该元素**不会出现在单元格内，而是出现在画布中**，
+   *    但**样式依旧是单元格内元素的样式**」。
+   *
+   * 根因：`cellPos` 是"格内偏移"，**只在格内有意义**。上一版进/出格子都没动它 ⇒
+   * 元素出去时带着旧偏移（自由层不读它，所以看不出来）⇒ **再进格子时那个旧偏移复活** ⇒
+   * 被绝对定位到格子外面 ⇒ 看起来"跑到画布上了"，而 `w`/`h` 已被本函数换成格内口径
+   * ⇒ **"位置在画布、样式是格内"**，正是用户描述的那个诡异状态。
+   * ⇒ 进/出格子都**归零**：进格子 = 从左上角开始（新的流式/定位起点），
+   *   出格子 = 位置由画布自由层接管（`x`/`y` 那套）。
+   */
+  return { ...child, w: round1(pct), h: round1(boxH), cellPos: undefined }
 }
 
 /**
@@ -219,5 +299,6 @@ export function normalizeChildInCell<T extends AnyElement>(child: T, cellWidthMm
 export function normalizeChildOutOfCell<T extends AnyElement>(child: T, cellWidthMm: number): T {
   const pct = childWidthPct(child)
   const w = Math.max(2, round1((Number.isFinite(cellWidthMm) && cellWidthMm > 0 ? cellWidthMm : 20) * pct / 100))
-  return { ...child, w, x: 0, y: 0 }
+  /* ⚠️ `cellPos` 必须清掉 —— 那是"格内偏移"，出了格子就是脏数据（见 `normalizeChildInCell` 的注释）。 */
+  return { ...child, w, x: 0, y: 0, cellPos: undefined }
 }

@@ -114,6 +114,7 @@ export function mapTextStyle(src: IRParaStyle | IRFontStyle): TextStyle {
   if (src.bold !== undefined) out.bold = src.bold
   if (src.italic !== undefined) out.italic = src.italic
   if (src.underline !== undefined) out.underline = src.underline
+  if (src.underlineStyle !== undefined) out.underlineStyle = src.underlineStyle
   if (src.strike !== undefined) out.strike = src.strike
   if (src.color !== undefined) out.color = src.color
   if (src.background !== undefined) out.background = src.background

@@ -1,3 +1,4 @@
+import { clearNodeStyles } from './clear-node-styles'
 /**
  * 顶栏工具栏：文本编辑 + 纸张/方向 + 预览 + 页面设置。
  *
@@ -36,14 +37,24 @@ import {
   type TemplateDoc,
   type TextStyle,
 } from '../../lib/types'
-import { CapsuleSelect, ColorInput, Num, Seg } from './Controls'
+import { CapsuleSelect, ColorInput, Num, Seg, UnderlineDashBtn, underlineDashToggle, underlineSolidToggle } from './Controls'
 import { Popover } from './Popover'
 import { FONT_OPTIONS, PAPER_OPTIONS, TEXT_SWATCHES } from './Inspector'
 import { IconCaret, IconEye, IconMerge, IconMinus, IconPlus, IconRedo, IconSliders, IconSplit, IconTable, IconUndo } from './Icons'
 import { cellLabel, findCell, nodeKindLabel, nodeStyleOf, updateCell, type NodeRef } from './useEditorState'
 // 表格结构动作：与右侧面板**同一份**实现（`./table-actions` 的纯函数）。
 // 两条入口各写一套是这个项目栽过三次的坑；确认层同理，合并一律经 `onAskMerge` 走 shell。
-import { MAX_COLS, addColPatch, addRowPatch, applySplitCell, canSplitCell, delColPatch, delRowPatch } from './table-actions'
+import {
+  MAX_COLS,
+  addColPatch,
+  addRowPatch,
+  applySplitCell,
+  canMergeDown,
+  canMergeRight,
+  canSplitCell,
+  delColPatch,
+  delRowPatch,
+} from './table-actions'
 
 /** 文本工具作用在哪一层 */
 export type ToolScope = 'node' | 'cell' | 'element' | 'default' | 'none'
@@ -153,8 +164,13 @@ export function Toolbar(props: ToolbarProps) {
    * 界面这里是"提前置灰并说清"，动作层那边才是**权威**。
    * 只靠其中一边都不行 —— 只有置灰会被人绕过，只有 null 则是"点了没反应"。
    */
-  const rightOk = !!(table && cellLoc && cellLoc.colIdx + 1 < (table.rows[cellLoc.rowIdx]?.cells.length ?? 0))
-  const downOk = !!(table && cellLoc && table.rows[cellLoc.rowIdx + 1]?.cells[cellLoc.colIdx])
+  /*
+   * 右边 / 下边能不能合并：**必须问动作层的同一把尺子**（`canMergeRight` / `canMergeDown`）。
+   * 原来写的是 `cells[colIdx + 1]` / `rows[rowIdx + 1].cells[colIdx]` —— 数组下标在有合并
+   * （尤其 rowspan）的表里会偏，结果就是"按钮亮着、点下去没反应"。
+   */
+  const rightOk = !!(table && selectedCellId && canMergeRight(table, selectedCellId))
+  const downOk = !!(table && selectedCellId && canMergeDown(table, selectedCellId))
   const splitOk = !!(table && selectedCellId && canSplitCell(table, selectedCellId))
 
   const scopeText = ((): string => {
@@ -186,7 +202,24 @@ export function Toolbar(props: ToolbarProps) {
       return
     }
     if (scope === 'cell' && selected?.kind === 'table' && cell) {
-      const rows = updateCell(selected.rows, cell.cell.id, { style: { ...cell.cell.style, ...p } })
+      /*
+       * ⚠️⚠️ **整体改单元格样式 ⇒ 覆盖子节点的所有样式**（2026-10-17 用户选 B）。
+       *
+       * 这是**第三条**"整体改样式"的路径（前两条在 `Inspector`：`patchCellStyle` / `patchStyle`）。
+       * 用户实测踩的就是这条：「在**画布顶部工具栏**改加粗/字号，那个单独设过的字段完全不受影响」
+       *   —— 因为这里只改 `style`、**没清 `cell.nodes` 里各节点的 `style`** ✅
+       *
+       * ⚠️ **写代码时别只看"面板"，顶栏工具栏是同一件事的另一个入口**
+       *   （这个项目里"同一行为多条实现路径"已经栽过多次）。
+       * ⚠️ 与 `Inspector.patchCellStyle` **同一个算法**：解构删 `style`，
+       *   不留 `style: undefined`（让"没有覆写"只有一种形态）。
+       */
+      /* ⚠️ **唯一实现**：`clearNodeStyles`（2026-10-17 收敛，别再各自抄一遍） */
+      const nodes = clearNodeStyles(cell.cell.nodes ?? [])
+      const rows = updateCell(selected.rows, cell.cell.id, {
+        style: { ...cell.cell.style, ...p },
+        nodes,
+      })
       props.onMerge(selected.id, { rows } as Partial<AnyElement>, key)
       return
     }
@@ -232,10 +265,12 @@ export function Toolbar(props: ToolbarProps) {
           aria-pressed={!!style.underline}
           disabled={disabled}
           title="下划线"
-          onClick={() => applyPatch({ underline: style.underline ? undefined : true })}
+          onClick={() => applyPatch(underlineSolidToggle(style))}
         >
           U
         </button>
+        {/* 下划虚线：U 管"要不要线"，它管"线长什么样"（填空线用） */}
+        <UnderlineDashBtn style={style} onToggle={() => applyPatch(underlineDashToggle(style))} />
         <button
           type="button"
           className={`bp-tgl bp-tgl--strike${style.strike ? ' is-on' : ''}`}
@@ -370,7 +405,13 @@ export function Toolbar(props: ToolbarProps) {
           type="button"
           className="bp-minibtn"
           aria-label="与右侧单元格合并"
-          title={cellLoc ? '与右边那一格合并（会丢内容，先问你）' : '先在画布上点一下要合并的那一格'}
+          title={
+            !cellLoc
+              ? '先在画布上点一下要合并的那一格'
+              : rightOk
+                ? '与右边那一格合并（会丢内容，先问你）'
+                : '右边没有可合并的格子；或者你选的是标题列的第 1 列 —— 它会连普通列一起并掉，把标题列的底纹盖到第 2 列'
+          }
           disabled={!rightOk}
           onClick={mergeRight}
         >
@@ -380,7 +421,13 @@ export function Toolbar(props: ToolbarProps) {
           type="button"
           className="bp-minibtn"
           aria-label="与下方单元格合并"
-          title={cellLoc ? '与下面那一格合并（会丢内容，先问你）' : '先在画布上点一下要合并的那一格'}
+          title={
+            !cellLoc
+              ? '先在画布上点一下要合并的那一格'
+              : downOk
+                ? '与下面那一格合并（会丢内容，先问你）'
+                : '下面没有可合并的格子，或者这条边跨在「表头行 / 数据行」的分界上 —— 表头要按行每页重复打印，跨界的合并会让表头错位'
+          }
           disabled={!downOk}
           onClick={mergeDown}
         >

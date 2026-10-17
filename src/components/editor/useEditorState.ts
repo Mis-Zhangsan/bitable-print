@@ -221,9 +221,16 @@ export type { FoundElement } from './doc-bands'
 export { findCell, updateCell } from './table-query'
 export type { CellLocation } from './table-query'
 
-/** "第 N 行第 M 列" 这类定位文案，Canvas 的 title 与 Inspector 的面包屑共用 */
+/**
+ * "第 N 行第 M 列" 这类定位文案，Canvas 的 title 与 Inspector 的面包屑共用。
+ *
+ * ⚠️ 列号要用 `gridCol`（网格列起点），**不是** `colIdx`（数组下标）——
+ * 表格有合并时两者不等：被上方 `rowspan` 覆盖的列在这一行没有元素，下标会左移，
+ * 面包屑就会把"第 3 列"显示成"第 2 列"。`gridCol` 由 `findCell` 摊平后给出。
+ */
 export function cellLabel(loc: CellLocation): string {
-  return `第 ${loc.rowIdx + 1} 行 第 ${loc.colIdx + 1} 列`
+  const col = typeof loc.gridCol === 'number' && loc.gridCol >= 0 ? loc.gridCol : loc.colIdx
+  return `第 ${loc.rowIdx + 1} 行 第 ${col + 1} 列`
 }
 
 // ============================================================
@@ -1016,6 +1023,16 @@ export function createDefaultElement(spec: NewElementSpec, contentWMm: number): 
         rows: Array.from({ length: rows }, (_, r) => ({
           id: newId('row'),
           isHeader: hasHeader && r === 0,
+          /*
+           * ⚠️⚠️ **必须给默认行高**（2026-10-17 用户报：
+           *   「拖入表格后看着有高度，但实际属性中**所有单元格的高度为 0**」）。
+           *
+           * 不给 `heightMm` = **自适应行**（行高由内容撑）——
+           * 而属性面板读的就是 `heightMm` ⇒ **显示 0** ✅
+           * ⇒ 给一个"看着就是表格"的默认值（10mm，约 3 行 10.5pt 文字）。
+           * ⚠️ 与"拖表格时按矩形换算"那条**不冲突**：那条会覆盖这个默认值。
+           */
+          heightMm: 10,
           cells: Array.from({ length: cols }, () => ({
             id: newId('cell'),
             colspan: 1,

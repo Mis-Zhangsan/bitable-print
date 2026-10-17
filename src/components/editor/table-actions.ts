@@ -37,6 +37,7 @@
  */
 
 import {
+  DEFAULT_CELL_PADDING_MM,
   finite,
   newId,
   type InlineNode,
@@ -50,7 +51,15 @@ import {
   type TextStyle,
 } from '../../lib/types'
 import { round1 } from './round'
-import { findCell, updateCell } from './table-query'
+import { findCell, tableGrid, updateCell, type GridCell } from './table-query'
+
+/*
+ * `tableGrid` / `GridCell` 的实现住在 `./table-query`（见那里 `findCell` 也要算网格列号），
+ * 这里转出去：本文件内部照样用，`__selftest.mts` 里的 `A.tableGrid(...)` 也照旧。
+ */
+export { tableGrid } from './table-query'
+export type { GridCell } from './table-query'
+import { childHeightMm, childOffsetXPct, childOffsetYMm, childWidthPct } from '../../lib/cell-geometry'
 
 /**
  * 这一层要写回的补丁。
@@ -141,6 +150,75 @@ export function emptyCell(): TableCell {
 }
 
 /**
+ * 去掉「表头那三项」：`bold` / `align` / `background`。
+ *
+ * 用于**标题格被拆到非标题行**的情形（2026-10-17 用户报：
+ * 「随着合并、拆分的进行，标题行的样式（加粗、灰底）会散乱到表格之中」）。
+ *
+ * 只删这三项 —— 它们正是 `setHeaderStylePatch` 写进去的那组；字体 / 字号 / 字色与
+ * "是不是表头"无关，一律保留（用户可能已经调过）。
+ */
+function stripHeaderStyle(s: TextStyle | undefined): TextStyle | undefined {
+  if (!s) return undefined
+  const rest: TextStyle = { ...s }
+  delete rest.bold
+  delete rest.align
+  delete rest.background
+  return rest
+}
+
+/**
+ * 按 `headerCol` 这一位**重刷第一列的标题样式** —— 列结构变动后的**唯一收口**。
+ *
+ * ## 为什么必须有它
+ *
+ * `headerCol` 是"**第 0 列**是标题列"这个**列位**标记，而标题的视觉（加粗/居中/灰底）
+ * 是逐格快照。列结构一动，"谁是第 0 列"就变了，快照必然错位。用户实测（2026-10-17）：
+ *
+ *   · 第一列拆 1×2 ⇒ `insertColAt` 给**每一行**补列、新格继承左邻（第 0 列）⇒
+ *     **拆出来的第 1 列整列都是灰底加粗**（不止拆到的那一行）；
+ *   · 在最左边插一列 ⇒ 原第一列变成第 1 列，但它的灰底**留着** ⇒ 两列都像标题列；
+ *   · 删除第一列 ⇒ 新的第一列**不带**标题样式，可 `headerCol` 还是 true ⇒ 标记与视觉脱节。
+ *
+ * 所以"插列 / 删列 / 拆分补列 / 取消合并补格"之后都要过一遍这里：
+ *   第 0 列 ⇒ 补上三项（底纹沿用格子已有色）；
+ *   其余列 ⇒ 清掉三项（**但 `isHeader` 行的格归行表头管，不碰**）。
+ *
+ * ⚠️ 只处理"样式"，不改 `headerCol` 这个位 —— 位由 `setHeaderColPatch` 唯一负责。
+ * ⚠️ 代价：用户如果手动把某格涂成 `#f2f3f5` 又碰巧改了列结构，会被当成标题样式清掉。
+ *    这个色本来就是表头专用灰，且只在结构变动时发生，接受。
+ */
+function restyleHeaderColRows(headerCol: boolean | undefined, rows: TableRow[], colCount: number): TableRow[] {
+  if (headerCol !== true || colCount <= 0) return rows
+  const grid = tableGrid(rows, colCount)
+  return rows.map((row, r) => ({
+    ...row,
+    cells: row.cells.map((c) => {
+      /* 用对象引用定位（同一行里可能被 rowspan 覆盖过，`grid` 里指向同一对象） */
+      const g = (grid[r] ?? []).find((x) => x?.cell === c)
+      if (!g) return c
+      if (g.colStart === 0) {
+        if (c.style?.bold === true && c.style?.align === 'center' && c.style?.background) return c
+        return {
+          ...c,
+          style: {
+            ...c.style,
+            bold: true,
+            align: 'center' as const,
+            background: c.style?.background ?? '#f2f3f5',
+          },
+        }
+      }
+      /* 行表头的格由 `isHeader` 管，列这边不要抢 */
+      if (row.isHeader === true) return c
+      if (c.style?.bold !== true && c.style?.background !== '#f2f3f5') return c
+      const stripped = stripHeaderStyle(c.style)
+      return { ...c, style: stripped && Object.keys(stripped).length > 0 ? stripped : undefined }
+    }),
+  }))
+}
+
+/**
  * 深拷贝到"可以就地改"的层级。
  *
  * 只拷 `rows` / `cells` 两层：行内 `nodes` 是只读的（合并只搬 `colspan` / `rowspan`，
@@ -159,41 +237,156 @@ function cols(el: TableElement): number {
 // 合并 / 拆分
 // ============================================================
 
+interface MergeRightHit {
+  rowIdx: number
+  aId: string
+  bId: string
+}
+
+/**
+ * 「能不能右合并」的**唯一判据** —— 动作层与工具条可用性共用（与 `mergeDownHit` 对称）。
+ *
+ * ⚠️ **标题列的第一列不许向右合并**（2026-10-17）：合并块会以第 0 列为起点、`colspan` 扩到
+ * 第 2 列，于是标题列的灰底加粗**视觉上盖到普通列**。列不像行那样有"跨页重复"，
+ * 但"标题列只有第 1 列"这个结构位同样不能被一个跨界的合并块打穿。
+ */
+export function mergeRightHit(el: TableElement, cellId: string): MergeRightHit | null {
+  const loc = findCell(el.rows, cellId)
+  if (!loc) return null
+  const row = el.rows[loc.rowIdx]
+  const a = row?.cells[loc.colIdx]
+  const b = row?.cells[loc.colIdx + 1]
+  if (!row || !a || !b) return null
+  if (el.headerCol === true) {
+    const grid = tableGrid(el.rows, cols(el))
+    const aPos = (grid[loc.rowIdx] ?? []).find((g) => g?.cell.id === a.id)
+    if (aPos && aPos.colStart === 0) return null
+  }
+  return { rowIdx: loc.rowIdx, aId: a.id, bId: b.id }
+}
+
+/** 右合并按钮/菜单项是否可点（`mergeRightHit` 的薄封装，口径完全相同） */
+export function canMergeRight(el: TableElement, cellId: string): boolean {
+  return mergeRightHit(el, cellId) !== null
+}
+
 /**
  * 右合并。`decide` 只在**被并掉的那一格非空**时被调用；它返回 false 就整体不产生补丁。
  *
  * 为什么必须经过 `decide`：合并丢弃的 `nodes` 是不可恢复的（拆分补的是空单元格）。
  * 把这一步做进动作里，工具条与面板就不可能各自决定"要不要问用户"。
+ *
+ * 定位规则已收敛进 `mergeRightHit`（含"标题列第一列不许右合并"那条护栏），这里只负责落地。
  */
 export function applyMergeRight(el: TableElement, cellId: string, decide: MergeDecision): TableActionResult | null {
-  const loc = findCell(el.rows, cellId)
-  if (!loc) return null
+  const hit = mergeRightHit(el, cellId)
+  if (!hit) return null
   const rows = cloneRows(el.rows)
-  const row = rows[loc.rowIdx]
-  const a = row?.cells[loc.colIdx]
-  const b = row?.cells[loc.colIdx + 1]
+  const row = rows[hit.rowIdx]
+  const idx = row?.cells.findIndex((c) => c.id === hit.aId) ?? -1
+  const a = idx >= 0 ? row.cells[idx] : null
+  const b = idx >= 0 ? row.cells[idx + 1] : null
   if (!row || !a || !b) return null
   const parts = discardedPartsOf(b)
   // ⚠️ 只在**真的会丢东西**时才问 `decide`。
   // "空单元格合并不弹确认"是原实现的行为（不给无谓摩擦），把它做成动作层的结构性保证，
   // 而不是指望每个调用方都记得"空的时候点确认要返回 true"。
   if (hasDiscardedContent(parts) && !decide(parts)) return null
-  row.cells.splice(loc.colIdx, 2, { ...a, colspan: Math.max(1, a.colspan) + Math.max(1, b.colspan) })
+  row.cells.splice(idx, 2, { ...a, colspan: Math.max(1, a.colspan) + Math.max(1, b.colspan) })
   return { patch: { rows }, nextCellId: a.id }
 }
 
-/** 下合并。与 `applyMergeRight` 同一套确认口径 */
+interface MergeDownHit {
+  /** `a` 所在行（数组下标 = 网格行号，行不会因 rowspan 消失） */
+  rowIdx: number
+  /** `a` 的网格列起点 */
+  colStart: number
+  /** 正下方那一行的行号 */
+  belowRowIdx: number
+  aId: string
+  bId: string
+}
+
+/**
+ * 「能不能下合并」的**唯一判据** —— 动作层与工具条可用性共用。
+ *
+ * 为什么要单独抽出来：工具条原来用 `rows[rowIdx+1]?.cells[colIdx]` 判断"下面还有格"，
+ * 与这里刚修好的网格口径**又不一致** ⇒ 会出现"按钮亮着但点下去没反应"，
+ * 或者"明明能合并却灰着"。判据只准有一份。
+ */
+export function mergeDownHit(rows: readonly TableRow[], colCount: number, cellId: string): MergeDownHit | null {
+  const grid = tableGrid(rows, colCount)
+  let aPos: GridCell | null = null
+  let rowIdx = -1
+  for (let r = 0; r < grid.length && !aPos; r += 1) {
+    for (const g of grid[r]) {
+      /* `rowStart === r` ⇒ 只认**起始行**那一份，被 rowspan 覆盖的行不算 */
+      if (g && g.cell.id === cellId && g.rowStart === r) {
+        aPos = g
+        rowIdx = r
+        break
+      }
+    }
+  }
+  if (!aPos) return null
+  const aCs = Math.max(1, aPos.colSpan)
+  const belowRowIdx = rowIdx + Math.max(1, aPos.rowSpan)
+  if (belowRowIdx >= rows.length) return null
+  /*
+   * ⚠️ 不许跨「表头行 / 数据行」的边界（2026-10-17）。
+   *
+   * 表头的语义是"打印多行数据时**每页重复**"，而打印层按 `isHeader` 连续行切分
+   * （`render/html.ts` 的 `tableHeaderRowCount`）。真让一格跨在边界上，那一格
+   * 一半属于表头、一半属于数据体 —— 跨页重复时必然错位，而且是"看起来像样式散乱"
+   * 的那种错（灰底跑到数据区）。宁可在这一层就不让做。
+   */
+  if ((rows[rowIdx]?.isHeader === true) !== (rows[belowRowIdx]?.isHeader === true)) return null
+  const bPos =
+    (grid[belowRowIdx] ?? []).find(
+      (g) => g && g.colStart === aPos!.colStart && g.rowStart === belowRowIdx && g.cell.id !== cellId,
+    ) ?? null
+  /* `colspan` 不一致 ⇒ 拼出来不是矩形，合并会破坏网格 */
+  if (!bPos || Math.max(1, bPos.colSpan) !== aCs) return null
+  return { rowIdx, colStart: aPos.colStart, belowRowIdx, aId: aPos.cell.id, bId: bPos.cell.id }
+}
+
+/** 下合并按钮/菜单项是否可点（`mergeDownHit` 的薄封装，口径完全相同） */
+export function canMergeDown(el: TableElement, cellId: string): boolean {
+  return mergeDownHit(el.rows, cols(el), cellId) !== null
+}
+
+/**
+ * 下合并。与 `applyMergeRight` 同一套确认口径。
+ *
+ * ⚠️⚠️ **2026-10-17 修：正下方必须按"网格列"找，不能按数组下标**
+ *
+ * 旧写法 `b = rows[loc.rowIdx + 1]?.cells[loc.colIdx]` 里的 `colIdx` 是
+ * `findCell` 给的**数组下标**。span 模型下数组下标 ≠ 网格列号：
+ * 只要上方有 `rowspan` 跨下来，那一行的 `cells` 就会**少几个元素**，下标整体左移。
+ *
+ * 用户实测场景（3×3 把中间整列合并成一格）：
+ *   第一次合并后 行1 = `[c_1_0, c_1_2]`（`c_1_1` 已被吃掉）。
+ *   第二次对同一个 `c_0_1` 下合并：`loc.colIdx` 仍是 1 ⇒ 取到 `cells[1]` = **`c_1_2`**，
+ *   而 3 列里正下方应该是网格列 1（此时已经是 `c_1_2` 所在的列 2）。
+ *   ⇒ 把 **`c_1_2` 吞掉**、`rowspan` 却 +1 ⇒ 行1 只剩 `[c_1_0]`，
+ *     表格右侧凭空塌掉一块（用户看到"最右侧那个大的单元格点不中"，就是它没了）。
+ *
+ * 定位规则已收敛进 `mergeDownHit`（工具条判可用性也用它），这里只负责在副本上落地。
+ */
 export function applyMergeDown(el: TableElement, cellId: string, decide: MergeDecision): TableActionResult | null {
-  const loc = findCell(el.rows, cellId)
-  if (!loc) return null
+  const hit = mergeDownHit(el.rows, cols(el), cellId)
+  if (!hit) return null
   const rows = cloneRows(el.rows)
-  const a = rows[loc.rowIdx]?.cells[loc.colIdx]
-  const b = rows[loc.rowIdx + 1]?.cells[loc.colIdx]
+  const a = rows[hit.rowIdx]?.cells.find((c) => c.id === hit.aId) ?? null
+  const belowRow = rows[hit.belowRowIdx]
+  const bIdx = belowRow?.cells.findIndex((c) => c.id === hit.bId) ?? -1
+  const b = bIdx >= 0 ? belowRow.cells[bIdx] : null
   if (!a || !b) return null
+
   const parts = discardedPartsOf(b)
   if (hasDiscardedContent(parts) && !decide(parts)) return null
-  a.rowspan = Math.max(1, a.rowspan) + Math.max(1, b.rowspan)
-  rows[loc.rowIdx + 1].cells.splice(loc.colIdx, 1)
+  a.rowspan = Math.max(1, finite(a.rowspan, 1)) + Math.max(1, finite(b.rowspan, 1))
+  belowRow.cells.splice(bIdx, 1)
   // 下合并后留下的还是原来那一格，选中不需要变 —— 与原实现一致
   return { patch: { rows } }
 }
@@ -207,24 +400,77 @@ export function canSplitCell(el: TableElement, cellId: string): boolean {
 
 /**
  * 拆分。补回来的是**空单元格** —— 这就是合并会丢内容的原因，也是确认层存在的理由。
+ *
+ * ⚠️⚠️ **2026-10-17 修：补格位置必须按"网格列"算，不能按数组下标**
+ *
+ * 旧写法给下方行补格用的是 `splice(loc.colIdx + k, 0, ...)`。`loc.colIdx` 是
+ * **起始行**里的数组下标，而下方行可能被别的 `rowspan` 覆盖、数组更短，下标会偏。
+ *
+ * 用户场景（左上角先纵向合并再拆）：行0 列0 跨 2 行 ⇒ 行1 的 `cells` 变成
+ * `[c_1_1, c_1_2]`（列 0 没有元素）。此时把 `c_1_1`（网格列 **1**）向下合并再取消合并，
+ * `loc.colIdx = 0` ⇒ 在行2 的**数组开头**插格 ⇒ 行2 变成 `[新, c_2_0, c_2_2]`，
+ * 整行**右移一格**、新空格跑到最左边。正确是 `[c_2_0, 新, c_2_2]`。
+ *
+ * 修法：先用摊平网格拿到目标格的 `colStart / rowSpan / colSpan`，
+ * 再把"每行要插入的下标"**在改 span 之前**预算出来（改完 span 网格会缺列、摊不平）。
  */
 export function applySplitCell(el: TableElement, cellId: string): TableActionResult | null {
-  const loc = findCell(el.rows, cellId)
-  if (!loc) return null
+  const colCount = cols(el)
   const rows = cloneRows(el.rows)
-  const c = rows[loc.rowIdx]?.cells[loc.colIdx]
-  if (!c) return null
-  const extraCols = Math.max(0, finite(c.colspan, 1) - 1)
-  const extraRows = Math.max(0, finite(c.rowspan, 1) - 1)
+  const grid = tableGrid(rows, colCount)
+  const pos = grid.flat().find((g) => g?.cell.id === cellId) ?? null
+  if (!pos) return null
+  const c = pos.cell
+  const r0 = pos.rowStart
+  const c0 = pos.colStart
+  const cRs = Math.max(1, pos.rowSpan)
+  const extraCols = Math.max(0, Math.max(1, pos.colSpan) - 1)
+  const extraRows = Math.max(0, cRs - 1)
+
+  /* 下方每一行"网格列 c0 的位置"对应哪个数组下标 —— 必须在复位 span 之前算 */
+  const slots: { row: number; idx: number; style?: TextStyle }[] = []
+  for (let r = 1; r <= extraRows; r += 1) {
+    const row = rows[r0 + r]
+    if (!row) break
+    const rg = grid[r0 + r] ?? []
+    let idx = row.cells.length
+    for (let i = 0; i < row.cells.length; i += 1) {
+      const g = rg.find((x) => x?.cell === row.cells[i])
+      if (g && g.colStart >= c0) {
+        idx = i
+        break
+      }
+    }
+    /*
+     * ⚠️ 补出来的格**继承这一行自己的样式**（2026-10-17）：
+     *    原来是 `emptyCell()`（无样式）⇒ 在标题行里取消合并，补回来的格变成白底普通格，
+     *    表头就"缺了一块"。取插入位右边那格（没有就取左边那格）当样本 ——
+     *    它就在这一行里，所以标题行拿到的是标题样式、数据行拿到的是数据样式。
+     */
+    const sample = row.cells[idx]?.style ?? row.cells[idx - 1]?.style
+    slots.push({ row: r0 + r, idx, style: sample })
+  }
+
   c.colspan = 1
   c.rowspan = 1
-  for (let k = 1; k <= extraCols; k += 1) rows[loc.rowIdx].cells.splice(loc.colIdx + k, 0, emptyCell())
-  for (let r = 1; r <= extraRows; r += 1) {
-    const target = rows[loc.rowIdx + r]
-    if (!target) break
-    for (let k = 0; k <= extraCols; k += 1) target.cells.splice(loc.colIdx + k, 0, emptyCell())
+  /* 起始行：新格补在它**右边**（同行相邻，数组下标就是它的位置） */
+  const idx0 = rows[r0].cells.indexOf(c)
+  for (let k = 1; k <= extraCols; k += 1) {
+    const fresh = emptyCell()
+    /* 起始行就在 `c` 旁边 ⇒ 直接跟 `c` 一个样（标题格拆出来仍是标题格） */
+    if (c.style) fresh.style = { ...c.style }
+    rows[r0].cells.splice(idx0 + k, 0, fresh)
   }
-  return { patch: { rows } }
+  /* 下方行：每行补 `extraCols + 1` 个，落在预算好的位置 */
+  for (const s of slots) {
+    for (let k = 0; k <= extraCols; k += 1) {
+      const fresh = emptyCell()
+      if (s.style) fresh.style = { ...s.style }
+      rows[s.row].cells.splice(s.idx + k, 0, fresh)
+    }
+  }
+  /* 补格会改变列位（跨列合并被拆开）⇒ 标题列样式按新列位重刷 */
+  return { patch: { rows: restyleHeaderColRows(el.headerCol, rows, colCount) } }
 }
 
 // ============================================================
@@ -254,6 +500,37 @@ export function setColWidthPatch(el: TableElement, colIdx: number, mm: number): 
  *
  * @param newWMm 元素的新总宽（mm）
  */
+/**
+ * 拖**外框的上下边**改表格总高时，**按比例缩放每一行的行高**（2026-10-14 补）。
+ *
+ * ⚠️ **为什么必须有它**：宽边有 `scaleColWidths`，高边**一直是空的** ——
+ *   于是用户实测：「**点击表格的上下锚点拖动大小，只会改变表格外侧的蓝框大小，
+ *   表格高度一点没变，只是蓝色选取框变大了**」（左右锚点正常）。
+ *   根因：默认 `row.heightMm` 是空 ⇒ 行高**由内容撑** ⇒ 表格高完全不受 `el.h` 影响。
+ *
+ * ⚠️ **行高为"自适应"（缺席）时**：按**均分**处理 ——
+ *   新总高 ÷ 行数。这样"拖高"这个动作第一次就把自适应行变成**显式行高**，
+ *   之后的行高就有了"真值"，`Σ行高 === el.h` 这个不变量才能成立
+ *   （与宽边"`Σ列宽 === w`"完全对称）。
+ *
+ * ⚠️ 尾行吸收取整误差 —— 否则 `Σ` 会比 `target` 差 0.1mm 量级，越拖越偏（同 `scaleColWidths`）。
+ */
+export function scaleRowHeights(el: TableElement, newHMm: number): Partial<TableElement> {
+  const target = Math.max(1, round1(newHMm))
+  const rows = el.rows ?? []
+  if (rows.length === 0) return { h: target }
+  const cur = rows.map((r) => (typeof r.heightMm === 'number' && r.heightMm > 0 ? r.heightMm : 0))
+  const sum = cur.reduce((a, b) => a + b, 0)
+  // 全是自适应（或全是 0）⇒ 均分
+  const next =
+    sum <= 0
+      ? rows.map(() => round1(target / rows.length))
+      : cur.map((c) => (c > 0 ? round1((c / sum) * target) : 0))
+  const acc = next.reduce((a, b) => a + b, 0)
+  next[next.length - 1] = round1(next[next.length - 1] + (target - acc))
+  return { h: round1(next.reduce((a, b) => a + b, 0)), rows: rows.map((r, i) => ({ ...r, heightMm: next[i] })) }
+}
+
 export function scaleColWidths(el: TableElement, newWMm: number): Partial<TableElement> {
   const target = Math.max(1, round1(newWMm))
   const cur = el.colWidthsMm.map((c) => Math.max(0, c))
@@ -339,7 +616,28 @@ export function setRowHeightPatch(el: TableElement, rowIdx: number, mm: number |
     }
     return { ...r, heightMm: round1(mm) }
   })
-  return { rows }
+  return addTableHeightPatch(el, rows)
+}
+
+/**
+ * ⚠️ **改行高之后，把 `el.h` 同步成「行高之和」**（2026-10-14 补）。
+ *
+ * 用户报：「**右键菜单中修改行高、使其缩小的话，单元格是缩小了，
+ *  但表格外面的蓝色选区（元素外框）不会缩小**」。
+ * 根因：`setRowHeightPatch` 只改了 `rows`，**从不更新 `el.h`** ——
+ *   而它在宽边是**对称地做过**的（`setColWidthPatch` 会同步 `w`）⇒ 又是"只做了一半"。
+ *
+ * ⚠️ **只在"所有行都有显式行高"时才同步**：有自适应行时
+ *   "Σ行高"根本表达不了表格的真实高（自适应行的实际高由内容撑）⇒
+ *   那种情况**不动 `el.h`**，避免把外框改成一个错的数。
+ * ⚠️ 取整用 `round1`，与列宽同一口径（否则 Σ 会差 0.1mm 量级、越改越偏）。
+ */
+function addTableHeightPatch(el: TableElement, rows: TableRow[]): Partial<TableElement> {
+  const heights = rows.map((r) => (typeof r.heightMm === 'number' && r.heightMm > 0 ? r.heightMm : null))
+  if (heights.some((h) => h === null)) return { rows }
+  const nums = heights.filter((h): h is number => h !== null)
+  const sum = round1(nums.reduce((a, b) => a + b, 0))
+  return { rows, h: sum }
 }
 
 // ============================================================
@@ -421,47 +719,9 @@ export function setCellNodesPatch(rows: TableRow[], cellId: string, nodes: Inlin
 //   · 数组下标 ≠ 网格列号。⇒ 任何按列的操作都必须先摊平成网格。
 // `tableGrid()` 就是那一步，且它是**只读**的：把 `(行, 列) → {cell, colStart, rowSpan…}` 算出来，
 // 后面四个动作全部基于它，谁也不用再自己数列。
-
-/** 网格里的一格：指向真实的单元格对象，外加它在网格中的位置 */
-export interface GridCell {
-  cell: TableCell
-  /** 网格列起点（0-based） */
-  colStart: number
-  colSpan: number
-  /** 网格行起点 */
-  rowStart: number
-  rowSpan: number
-}
-
-/**
- * 把 span 模型摊平成 `rows × cols` 的网格。
- *
- * `grid[r][c]` = 覆盖这一格的单元格（**同一个对象**会在它覆盖的每格出现 —— 靠引用相等判重）；
- * `null` = 这一格是空的、需要补一个 `emptyCell()`。
- *
- * ⚠️ 传入的 `rows` 决定了返回的 `cell` 引用：**要就地改就得传副本**
- *    （所以调用方一律 `cloneRows` 之后再摊平，否则会改到原始文档对象）。
- */
-export function tableGrid(rows: readonly TableRow[], colCount: number): (GridCell | null)[][] {
-  const n = Math.max(0, Math.floor(colCount))
-  const grid: (GridCell | null)[][] = rows.map(() => Array.from({ length: n }, () => null))
-  for (let r = 0; r < rows.length; r += 1) {
-    let col = 0
-    for (const cell of rows[r].cells) {
-      // 跳过已经被**上方 rowspan** 占住的列
-      while (col < n && grid[r][col]) col += 1
-      if (col >= n) break
-      const colSpan = Math.max(1, finite(cell.colspan, 1))
-      const rowSpan = Math.max(1, finite(cell.rowspan, 1))
-      const gc: GridCell = { cell, colStart: col, colSpan, rowStart: r, rowSpan }
-      for (let rr = r; rr < Math.min(rows.length, r + rowSpan); rr += 1) {
-        for (let k = 0; k < colSpan && col + k < n; k += 1) grid[rr][col + k] = gc
-      }
-      col += colSpan
-    }
-  }
-  return grid
-}
+//
+// ⚠️ 2026-10-17：实现**已下沉到 `./table-query`** —— `findCell` 也要算网格列号（面包屑用），
+// 而那一层是两者共同的底层。这里保留 re-export，本文件与自测的 `A.tableGrid(...)` 照旧可用。
 
 /** 某一行里"从这一行开始"的格子（按数组顺序），带它们的网格列起点 */
 function rowEntries(grid: (GridCell | null)[][], rowIdx: number, colCount: number): GridCell[] {
@@ -498,6 +758,29 @@ export function cellWidthMm(el: TableElement, cellId: string): number {
     .reduce((a, b) => a + finite(b, 0), 0)
   // 列宽数组缺失/全是 0 时别返回 0（那会让调用方算出 0 宽的元素）—— 退回整表宽
   return sum > 0 ? sum : finite(el.w, 0)
+}
+
+/**
+ * 单元格**内容区高度**（mm）= 行高 − 上下内边距。
+ *
+ * ⚠️ 行高是**自适应**（`heightMm` 缺席 / ≤0）时返回 `undefined` —— 那种格子没有分母：
+ * "元素多高 → 行多高 → 元素该多高"是循环依赖，只能退回按格宽那一档。
+ *
+ * ⚠️ 为什么单开一个函数、不直接传 `row.heightMm`：
+ *   `heightMm` 是 **border box 总高**（含内边距），而格内元素是画在**内容区**里的。
+ *   拿总高去约束元素 ⇒ 元素比内容区高 2×内边距 ⇒ **压在单元格边框上**
+ *   （2026-10-17 用户报："附件不会根据单元格当前的高度自动压缩嵌入，反而是压在单元格之上"）。
+ */
+export function cellContentHeightMm(el: TableElement, cellId: string): number | undefined {
+  const loc = findCell(el.rows, cellId)
+  if (!loc) return undefined
+  const h = loc.row?.heightMm
+  if (typeof h !== 'number' || !Number.isFinite(h) || h <= 0) return undefined
+  const pad = Math.max(
+    0,
+    finite(loc.cell.paddingMm, finite(el.cellPaddingMm, DEFAULT_CELL_PADDING_MM)),
+  )
+  return Math.max(0, h - pad * 2)
 }
 
 /** 表格行列的下限：至少要留一行一列（否则表格就不存在了） */
@@ -552,8 +835,31 @@ export function insertRowAt(el: TableElement, rowIdx: number, where: 'above' | '
     const g = grid[at - 1]?.[c] ?? null
     if (g && g.rowStart + g.rowSpan > at) covered.add(c)
   }
-  const newRow: TableRow = { id: newId('row'), cells: [] }
-  for (let c = 0; c < colCount; c += 1) if (!covered.has(c)) newRow.cells.push(emptyCell())
+  /*
+   * ⚠️⚠️ **2026-10-17 修：新行要"像它所在的那一行"，不能是白底空行**
+   *
+   * 用户报：「表格设置了标题行之后…新增加的格子哪怕是在原来的标题行位置，
+   *          也没有继承标题行的样式」。
+   * 根因：新行只写了 `heightMm`，`cells` 全是 `emptyCell()`（无样式）、也没 `isHeader`。
+   * ⇒ 在表头里插一行，冒出来的是一条白底普通行，把表头劈成两半：
+   *   视觉上"表头断了一行"，打印时跨页重复也会漏掉它。
+   *
+   * 模板行取**用户操作的那一行**（`rowIdx`），行高 / `isHeader` / 单元格样式全部从它继承。
+   * 样式按**网格列**取（`refGrid[c]`），不是按数组下标 —— 上方有 rowspan 时数组会短。
+   */
+  const refRow = rows[rowIdx] ?? rows[at - 1] ?? rows[at] ?? null
+  const inheritH =
+    typeof refRow?.heightMm === 'number' && refRow.heightMm > 0 ? refRow.heightMm : 10
+  const newRow: TableRow = { id: newId('row'), heightMm: inheritH, cells: [] }
+  if (refRow?.isHeader === true) newRow.isHeader = true
+  const refGrid = grid[rowIdx] ?? []
+  for (let c = 0; c < colCount; c += 1) {
+    if (covered.has(c)) continue
+    const fresh = emptyCell()
+    const sample = refGrid[c]?.cell
+    if (sample?.style) fresh.style = { ...sample.style }
+    newRow.cells.push(fresh)
+  }
   rows.splice(at, 0, newRow)
   return { patch: { rows }, nextCellId: newRow.cells[0]?.id }
 }
@@ -632,7 +938,15 @@ export function insertColAt(el: TableElement, colIdx: number, where: 'left' | 'r
    */
   const origTotal = el.colWidthsMm.reduce((a, b) => a + finite(b, 0), 0)
   const scaled = scaleColWidths({ ...el, colWidthsMm: widths }, origTotal > 0 ? origTotal : finite(el.w, 100))
-  return { patch: { rows, colWidthsMm: scaled.colWidthsMm ?? widths, w: scaled.w ?? round1(finite(el.w, 100)) } }
+  const nextWidths = scaled.colWidthsMm ?? widths
+  return {
+    patch: {
+      /* 插列会改变"谁是第 0 列" ⇒ 标题列的样式必须按新列位重刷（见 `restyleHeaderColRows`） */
+      rows: restyleHeaderColRows(el.headerCol, rows, nextWidths.length),
+      colWidthsMm: nextWidths,
+      w: scaled.w ?? round1(finite(el.w, 100)),
+    },
+  }
 }
 
 /**
@@ -728,7 +1042,14 @@ export function deleteColAt(el: TableElement, colIdx: number, decide: MergeDecis
 
   const widths = [...el.colWidthsMm]
   widths.splice(colIdx, 1)
-  return { patch: { rows, colWidthsMm: widths, w: round1(widths.reduce((a, b) => a + b, 0)) } }
+  return {
+    patch: {
+      /* 删列后原来的第 1 列可能升为第 0 列 ⇒ 标题列样式跟着重刷 */
+      rows: restyleHeaderColRows(el.headerCol, rows, widths.length),
+      colWidthsMm: widths,
+      w: round1(widths.reduce((a, b) => a + b, 0)),
+    },
+  }
 }
 
 // ============================================================
@@ -844,6 +1165,33 @@ function nodesAsLine(cell: TableCell): InlineNode[] {
 }
 
 /**
+ * 矩形合并**为什么不能做**（`null` = 可以做）。
+ *
+ * 与 `mergeRange` 内部的护栏是**同一份判据** —— 工具条用它提前置灰 + 说清原因，
+ * 动作层用它做最后把关。两边各写一份必然分叉（这个项目已经栽过三次）：
+ * 单步合并（下/右）有 `Toolbar` 的 title 说明，矩形合并原来只有**静默 null** ——
+ * 用户拖选跨过表头边界后点"合并"，界面上一点反应都没有。
+ */
+export function mergeRangeBlockReason(el: TableElement, rawRange: CellRange): string | null {
+  const colCount = cols(el)
+  if (colCount <= 0 || el.rows.length === 0) return '表格结构还不完整'
+  const range = expandRangeToWholeCells(el.rows, colCount, rawRange)
+  if (el.headerCol === true && range.c1 === 0 && range.c2 > 0) {
+    return '选区从标题列跨进了普通列 —— 合并后标题列的底纹会盖到第 2 列。请分成两次合并'
+  }
+  let seeHead = false
+  let seePlain = false
+  for (let r = range.r1; r <= range.r2 && r < el.rows.length; r += 1) {
+    if (el.rows[r]?.isHeader === true) seeHead = true
+    else seePlain = true
+  }
+  if (seeHead && seePlain) {
+    return '选区跨过了「表头行 / 数据行」的分界 —— 表头要按行每页重复打印，跨界的合并会让表头错位'
+  }
+  return null
+}
+
+/**
  * 矩形选区 → 一个合并格。
  *
  * 保留**左上角那一格**（它的 id 不变 ⇒ 后续"选中/编辑"的锚点稳定），其余格：
@@ -851,7 +1199,7 @@ function nodesAsLine(cell: TableCell): InlineNode[] {
  *   · 附件配置等"一格只能留一个"的东西 ⇒ 保留第一个，其余进 `decide` 让用户确认（与合并同口径）；
  *   · 新格的 `colspan/rowspan` = 选区尺寸。
  *
- * 返回 `null` 的情况都表示"这一下不该发生"：范围非法、不是矩形、或用户取消了确认。
+ * 返回 `null` 的情况都表示"这一下不该发生"：范围非法、不是矩形、跨了表头边界、或用户取消了确认。
  */
 export function mergeRange(
   el: TableElement,
@@ -866,6 +1214,15 @@ export function mergeRange(
 
   const range = expandRangeToWholeCells(el.rows, colCount, rawRange)
   if (!rangeIsRectangular(el.rows, colCount, range)) return null
+
+  /*
+   * ⚠️ **不许跨「表头 / 数据」的边界**（2026-10-17，与 `mergeRightHit` / `mergeDownHit` 同一底线）：
+   * 表头靠"**连续的行**"或"**第 0 列**这个列位"表达，跨界的合并块会让"表头"失去边界 ——
+   * 行表头会让打印的跨页重复错位，列表头会让底纹盖到普通列。
+   * 选区完全落在表头内、或完全落在数据区，都照常允许。
+   * 判据与工具条**共用** `mergeRangeBlockReason`（它还会给用户一句人话）。
+   */
+  if (mergeRangeBlockReason(el, rawRange)) return null
 
   const grid = tableGrid(el.rows, colCount)
   const anchor = grid[range.r1]?.[range.c1]
@@ -1002,6 +1359,15 @@ export function setHeaderRowsPatch(el: TableElement, rawRange: CellRange, on: bo
           },
     )
   }
+  /*
+   * ⚠️ **取消表头行之后按"标题列"这一位再刷一遍**（2026-10-17 补漏）：
+   * `setHeaderStylePatch(on=false)` 是把选区里**所有**格的三项都清掉的，
+   * 连第 0 列（标题列）的格也不放过。上面那段只补了**角格**（`i === 0`），
+   * 于是「表头 3 行 + 标题列」取消表头行后，第 2、3 行的第一列会变成普通格 ——
+   * 可 `headerCol` 还开着，它们本该还是标题列。
+   * `restyleHeaderColRows` 正好干这件事（第 0 列补、其余列清），幂等。
+   */
+  rows = restyleHeaderColRows(el.headerCol, rows, colCount)
   return { patch: { ...r.patch, rows, repeatHeader: on ? true : el.repeatHeader } }
 }
 
@@ -1043,13 +1409,19 @@ export function setHeaderColPatch(el: TableElement, on: boolean): TableActionRes
   const colCount = cols(el)
   if (colCount <= 0) return null
   const grid = tableGrid(el.rows, colCount)
-  const row0IsHeader = el.rows[0]?.isHeader === true
   const rows = cloneRows(el.rows).map((row, r) => ({
     ...row,
     cells: row.cells.map((c) => {
       const g = (grid[r] ?? []).find((x) => x?.cell.id === c.id)
       if (!g || g.colStart !== 0) return c
-      if (!on && r === 0 && row0IsHeader) return c
+      /*
+       * ⚠️ **取消标题列时，属于表头行的格一律不动**（2026-10-17 修）。
+       * 原来只保住**角格**（`r === 0`）：于是「表头 3 行 + 标题列」取消标题列，
+       * 第 2、3 行第 0 列会被清成普通格 —— 可它们明明还是表头行的一部分，
+       * 用户看到的是"表头右半边还在、左边一列掉了"。
+       * 判据用 `isHeader`（结构位），不是 `r === 0`。
+       */
+      if (!on && el.rows[r]?.isHeader === true) return c
       return {
         ...c,
         style: {
@@ -1121,11 +1493,12 @@ export type SplitCellResult = { ok: true; patch: Partial<TableElement> } | { ok:
  * 把网格撑歪）以及**总宽守恒**。自己再写一遍"补一行/补一列"必然会和它们分叉，而分叉的表现是
  * "表格看着歪了"，极难归因。
  *
- * ⚠️ 副作用要说清（**不是 bug，是这一版明确接受的取舍**）：
- *    补列走的是 `insertColAt` 的比例缩（整表每列都窄一点、总宽不变）⇒
- *    **别的行里那一列的格子也会跟着变窄**。要让它保持原宽，就得把邻居的格子合并起来
- *    （colspan 手术），而那一手术在有内容的邻居上会**丢东西**。
- *    取舍：宁可整表等比窄一点点（和"插入一列"是同一个可见结果），也不静默吃掉用户打的字。
+ * ⚠️ 结构副作用要说清（**不是 bug，是"真拆"模型下不可避免的**）：
+ *    列是**整表共享**的 ⇒ 补出来的列会贯穿所有行，**别的行里那一列也会被切成多个窄列**
+ *    （它们的格子和内容都在，只是被分到更窄的列里）。要避免这个只能做"嵌套子表格"，
+ *    而那会让"选中 / 右键 / 行高列宽 / 面板"全部要再认一层，已明确否决。
+ *    ⇒ 宽度上**只等分被拆的那一块**，区间外的列一毫米都不动，总宽严格不变
+ *      （见下面 `widthsBefore` / `blockW0` 那段）。
  *
  * ── 三条护栏（宁可不做，也不做错）──────────────────────────────────
  *   ① 目标格找得到、行列数合法、且不小于它当前占的行列；
@@ -1158,14 +1531,106 @@ export function splitCellToGrid(
     return { ok: false, reason: `这一格现在占 ${rs} 行 × ${cs} 列，拆不成更小的 ${wantRows} × ${wantCols}` }
   }
 
-  /* ① 补足行列。补在目标块的**外侧**（行补在块下方、列补在块右侧）⇒ 补出来的格子必然落在块内且是空的 */
+  /*
+   * ⚠️ **2026-10-17 回退**：这里原本走"嵌套子表格"（用户选 ③），后改为 ② Word 式"真拆"。
+   *   原因：嵌套让"选中/右键/行高列宽/面板"全都要**再认一层**，成本持续叠加；
+   *   而 Excel 本身**没有"块内拆成 2×2"这个功能**（它的"拆分"= 取消合并）。
+   *   ⇒ 恢复"真拆"（往表里插行/列），与 Word 一致。
+   */
+
+  /*
+   * ① 补足行列。补在目标块的**外侧**（行补在块下方、列补在块右侧）⇒ 补出来的格子必然落在块内且是空的
+   *
+   * ⚠️⚠️ **补完要把"块内那几行"的行高重新均分**（2026-10-17 用户报：
+   *   「拆分后表格变成 3×2，且中间增加的那一行高度也是 0 ……
+   *     正常应该第一行那个单元格变成 2×2 的四个小单元格，**表格整体大小不变**」）。
+   *
+   * 根因：`insertRowAt` 是"**往表里插一行**" ⇒ 表格总高 = 原高 + 新行高 ⇒ **整体变高** ✅
+   * ⇒ 先记下"块原本占的总高"，补完后**按 `wantRows` 均分回去**（总高不变）。
+   * ⚠️ 只改 `r0 .. r0+wantRows-1` 这几行，其它行一个字都不动。
+   */
+  const blockH0 = (() => {
+    let h = 0
+    for (let i = 0; i < rs; i += 1) {
+      const v = el.rows[r0 + i]?.heightMm
+      h += typeof v === 'number' && v > 0 ? v : 10
+    }
+    return h
+  })()
+  /*
+   * ⚠️⚠️ **补出来的行该不该算表头？**（2026-10-17 用户报：
+   *   「把第一行的某个单元格拆分为两行或者两行以上后，这多出来的几行都有标题行的样式」）
+   *
+   * `insertRowAt` 现在会"像它参照的那一行"，而补行的参照行正是**被拆的那一行** ⇒
+   * 表头行一拆，多出来的行全是表头（灰底 + `isHeader`）。
+   * 但拆分的语义是"**把这个格切成几块**"，不是"新增几行表头"：
+   * 用户勾了几行表头，拆完还得是几行。
+   *
+   * 判据取**块下方那一行**：
+   *   · 它是数据行 ⇒ 补出来的行也是数据行（本次修的就是这条）；
+   *   · 它是表头行（说明表头本来就有多行、这次拆分插在表头区内部）⇒ 保持表头，
+   *     否则会把 `tableHeaderRowCount` 的"开头连续"打断，后面的表头行静默失效。
+   */
+  const belowIsHeader = el.rows[r0 + rs]?.isHeader === true
   let cur = el
   for (let i = rs; i < wantRows; i += 1) {
     const r = insertRowAt(cur, r0 + rs - 1, 'below')
     if (!r) return { ok: false, reason: '补行失败（已经到行数上限）' }
     cur = { ...cur, ...r.patch }
   }
+  /* ⚠️ **均分行高**：补了行之后，把块内那几行摊成同一个高度（总和 = `blockH0`） */
+  if (wantRows > rs) {
+    const per = Math.max(2, round1(blockH0 / wantRows))
+    cur = {
+      ...cur,
+      rows: cur.rows.map((row, ri) =>
+        ri >= r0 && ri < r0 + wantRows ? { ...row, heightMm: per } : row,
+      ),
+    }
+  }
+  /*
+   * 数据区里补出来的行：**整行**都去掉表头标记与标题样式。
+   * 只清"目标区间里那几格"不够 —— `insertRowAt` 把参照行（表头）的样式复制给了新行**每一格**，
+   * 区间左右两侧那些格子照样是灰底加粗。
+   */
+  if (wantRows > rs && !belowIsHeader) {
+    cur = {
+      ...cur,
+      rows: cur.rows.map((row, ri) => {
+        if (ri < r0 + rs || ri >= r0 + wantRows) return row
+        return {
+          ...row,
+          isHeader: false,
+          cells: row.cells.map((c) => {
+            const stripped = stripHeaderStyle(c.style)
+            return stripped && Object.keys(stripped).length > 0
+              ? { ...c, style: stripped }
+              : { ...c, style: undefined }
+          }),
+        }
+      }),
+    }
+  }
   let colsAdded = false
+  /*
+   * ⚠️ **补列前先记下"被拆那一块原本占的宽度"**（2026-10-17 用户报：
+   *   「没有被选中的单元格不受影响，整个表格的大小也不受影响」）。
+   *
+   * `insertColAt` 的宽度策略是**整表等比缩**（那是"插入一列"该有的语义：表格外框不动）。
+   * 但拆分不一样 —— 用户要的是"**等分这个被拆分的单元格**"：
+   *   只有被拆的那 1 列（或 cs 列）变窄，其余列**一毫米都不动**。
+   * 整表等比缩虽然也守住了总宽，但用户看到的是"整张表每一列都微调了" ⇒ 正是"没选中的单元格也受影响"。
+   *
+   * ⇒ 补完列之后用 `widthsBefore` 重建列宽数组：区间 `[c0, c0 + cs)` 的总宽不变，
+   *   均摊到 `[c0, c0 + wantCols)` 这 wantCols 列上；区间外的列原值照抄。
+   *   `Σ列宽` 因此严格不变（`Σ === w` 这条不变量照旧成立）。
+   */
+  const widthsBefore = [...el.colWidthsMm]
+  const blockW0 = (() => {
+    let s = 0
+    for (let i = c0; i < c0 + cs; i += 1) s += finite(widthsBefore[i], 0)
+    return s
+  })()
   for (let i = cs; i < wantCols; i += 1) {
     const r = insertColAt(cur, c0 + cs - 1, 'right')
     if (!r) return { ok: false, reason: '补列失败（已经到列数上限）' }
@@ -1192,28 +1657,114 @@ export function splitCellToGrid(
   /* ③ 重建目标矩形：每格都变成 1×1。内容留在**左上那一格**（分开放会让人分不清哪块是原文），
         样式沿用原格（标题格的加粗/底纹因此跟着走） */
   const style = loc.cell.style
+  /*
+   * ⚠️⚠️ **2026-10-17 修：按"网格区间"重建，不按数组下标切片**
+   *
+   * 旧写法是 `cut = 该行里目标块的下标` → `[...slice(0,cut), ...fresh(wantCols), ...slice(cut+wantCols)]`，
+   * 它只在"目标块在这一行正好占 `wantCols` 个数组元素"时才成立。而 span 模型里：
+   *   · 一个 `colspan=N` 的合并格在 `row.cells` 里**只占 1 个元素**；
+   *   · 被 `rowspan` 覆盖到的第 2..N 行**根本没有这个元素**（旧写法 `cut < 0` ⇒ 整行不动）。
+   *
+   * 用户实测场景（3×3 把中间整列合并成一格 → 再拆 3×3）：
+   *   补 2 列后第 1 行是 `[左, 目标格(colspan=3), 右]` 共 3 个元素，
+   *   旧写法 `slice(1 + 3)` = `slice(4)` ⇒ **把"右"那一格误删**；
+   *   第 2、3 行找不到目标格 ⇒ 一列都没补。
+   *   结果 `colWidthsMm` 是 5 列、每行元素数却是 4 / 2 / 2 ⇒ 网格错位，
+   *   最后一列没有 cell 对象 ⇒ **点不中**（用户报"最右侧那个大的单元格无法点击选中"）。
+   *
+   * 正确口径：拿补完行列后的网格，按区间 `[c0, c0 + wantCols)` 给**每个真实 cell** 定位：
+   *   与区间不相交 ⇒ 保留（左边的一律在前、右边的一律在后）；
+   *   与区间相交   ⇒ 丢弃（就是被拆掉的那块，以及补出来的空位）；
+   *   中间插入 `wantCols` 个新格。
+   * 这样"删掉几个、插入几个"与网格宽度严格一一对应，`Σ(colspan) === colWidthsMm.length` 不会被破坏。
+   */
   const rows = cur.rows.map((row, ri) => {
     if (ri < r0 || ri >= r0 + wantRows) return row
-    /* 这一行里"目标块最左那一格"在本行数组里的下标 */
-    const cut = row.cells.findIndex((c) => grid[ri]?.[c0]?.cell.id === c.id)
-    if (cut < 0) return row
+    const rowGrid = grid[ri] ?? []
+    /* 真实 cell → 它在网格里的起点/跨度（rowspan 覆盖行里同一 cell 会出现多次，取第一次=起始位置） */
+    const pos = new Map<TableCell, { colStart: number; colSpan: number }>()
+    for (const g of rowGrid) {
+      if (g && !pos.has(g.cell)) pos.set(g.cell, { colStart: g.colStart, colSpan: Math.max(1, g.colSpan) })
+    }
+    const left: TableCell[] = []
+    const right: TableCell[] = []
+    for (const c of row.cells) {
+      const p = pos.get(c)
+      /* 网格里查不到位置（结构已不一致的极端情况）⇒ 保守留在右侧，宁可多一格也不静默丢内容 */
+      if (!p) {
+        right.push(c)
+        continue
+      }
+      const overlaps = p.colStart < c0 + wantCols && p.colStart + p.colSpan > c0
+      if (overlaps) continue
+      if (p.colStart < c0) left.push(c)
+      else right.push(c)
+    }
+    /*
+     * ⚠️⚠️ **2026-10-17 修：新格的样式不能无脑抄"被拆的那一格"**
+     *
+     * 用户报：「表格设置了标题行之后，随着合并、拆分的进行，标题行的样式（加粗、灰底）
+     *          会散乱到表格之中」。
+     * 旧写法是 `if (style) freshCell.style = { ...style }` ⇒ 把一个**标题格**的
+     * `bold + 居中 + #f2f3f5 灰底` 复制给 `wantRows × wantCols` 个新格；
+     * 只要拆分跨出标题行（`wantRows` 补出来的行在数据区），灰底加粗就"漏"进数据行。
+     *
+     * 正确口径：**逐格按"结构位"决定**，而不是整行共用一个样式：
+     *   · `rowHead`（`isHeader` 行）或 `colHead`（`headerCol` 且落在第 0 列）⇒ 一定是表头格，
+     *     要有 `bold + 居中 + 底纹`（底纹沿用原格/邻居已有的色，没有才用默认灰）；
+     *   · 不是表头格 ⇒ 用邻居（左优先、右兜底）的样式，并把标题三项剥掉
+     *     （`stripHeaderStyle`）—— 邻居就在这一行里，所以字体/字号照样跟着走。
+     */
+    const rowHead = cur.rows[ri]?.isHeader === true
+    const neighbourStyle = left[left.length - 1]?.style ?? right[0]?.style
+    const baseStyle = neighbourStyle ?? style
     const fresh: TableCell[] = Array.from({ length: wantCols }, (_, k) => {
       const freshCell = emptyCell()
-      if (style) freshCell.style = { ...style }
+      /* 表头列只认**第一网格列**：拆出 3 列时只有落在第 0 列的那一格算表头 */
+      const isHead = rowHead || (cur.headerCol === true && c0 + k === 0)
+      if (isHead) {
+        freshCell.style = {
+          ...baseStyle,
+          bold: true,
+          align: 'center',
+          background: baseStyle?.background ?? '#f2f3f5',
+        }
+      } else if (baseStyle) {
+        const stripped = stripHeaderStyle(baseStyle)
+        /* 剥完啥也不剩就别挂一个空对象（`style` 有值会走"显式覆盖"那条路） */
+        if (stripped && Object.keys(stripped).length > 0) freshCell.style = stripped
+      }
       if (ri === r0 && k === 0) {
         freshCell.nodes = [...loc.cell.nodes]
         if (loc.cell.children) freshCell.children = [...loc.cell.children]
       }
       return freshCell
     })
-    return { ...row, cells: [...row.cells.slice(0, cut), ...fresh, ...row.cells.slice(cut + wantCols)] }
+    return { ...row, cells: [...left, ...fresh, ...right] }
   })
 
-  const patch: Partial<TableElement> = { rows }
-  /* 补过列才需要回写列宽（`insertColAt` 已经把总宽守恒算好了，这里只是把它带出去） */
+  /* 补列 / 补格都会改变列位 ⇒ 标题列样式按新列位重刷（`headerCol` 是列位标记，样式得跟着走） */
+  const patch: Partial<TableElement> = { rows: restyleHeaderColRows(el.headerCol, rows, cols(cur)) }
+  /* 补过列才需要回写列宽（结构上已经补好了，这里只解决"宽度怎么分"） */
   if (colsAdded) {
-    patch.colWidthsMm = cur.colWidthsMm
-    patch.w = cur.w
+    /*
+     * 只等分"被拆那一块"：区间 `[c0, c0+wantCols)` 的总宽 = 原 `blockW0`，区间外的列原值照抄。
+     * 先向下取到 0.1mm，让**尾列吸收全部取整误差** ⇒ `Σ列宽` 严格不变，不会出现负宽的尾列。
+     * 极端情况 `blockW0` 小到每列不足 0.1mm ⇒ 退回 `insertColAt` 的整表等比缩（宁可微调，也不产生 0 宽列）。
+     */
+    const per = Math.floor((blockW0 / wantCols) * 10) / 10
+    if (per > 0) {
+      const tail = round1(blockW0 - per * (wantCols - 1))
+      patch.colWidthsMm = [
+        ...widthsBefore.slice(0, c0),
+        ...Array.from({ length: wantCols }, (_, k) => (k === wantCols - 1 ? tail : per)),
+        ...widthsBefore.slice(c0 + cs),
+      ]
+      patch.w = el.w
+    } else {
+      patch.colWidthsMm = cur.colWidthsMm
+      patch.w = cur.w
+    }
   }
   return { ok: true, patch }
 }
@@ -1361,8 +1912,23 @@ export function setCellBordersPatch(
 // 单元格作为素材容器（2026-09-22，用户规格 六）
 // ============================================================
 
-/** 单元格里最多放几个块级子元素。规格：「一个单元格默认放一个主元素」 */
-export const MAX_CELL_CHILDREN = 1
+/**
+ * 单元格里最多放几个块级子元素。
+ *
+ * ⚠️⚠️ **2026-10-16 从 1 放宽到 8**（用户报：
+ *   「一个单元格内，**附件、图片、条形码二维码不能共存，会相互替换**……
+ *     一个单元格内，**可以同时容纳多个**图片、条形码、二维码、附件，**不会替换**，
+ *     而是**并排显示**，用户可以**自由拖动排布**」）。
+ *
+ * 原注释写的是「规格：一个单元格默认放一个主元素」——
+ *   那正是"新拖进去的元素把旧的顶掉"的来源（`slice(-MAX)` 会切掉最早的）。
+ * ⇒ 现在放宽到 8 个（够用且不至于让面板/命中测试变得难用）。
+ *
+ * ⚠️ 放宽后**还有两处必须跟着改**（原来写死"只操作第 0 个"）：
+ *   · `EditorShell.tsx` 的 `patchCellChild`（现在支持传 `childId`）
+ *   · `detachChildFromCell`（现在支持传 `childId`）
+ */
+export const MAX_CELL_CHILDREN = 8
 
 /**
  * **能作为块级子元素驻留在单元格里**的取值（唯一来源）。
@@ -1402,13 +1968,98 @@ export function attachChildToCell(
   const loc = findCell(el.rows, cellId)
   if (!loc) return null
   const existing = loc.cell.children ?? []
+  /*
+   * ⚠️ **满了就不加，绝不顶掉已有的**（2026-10-16 用户报："会相互替换"）。
+   *   原来是 `[...existing, child].slice(-MAX)` —— 上限为 1 时**等于替换**，
+   *   放宽到 8 之后这个写法仍然会在第 9 个时**悄悄吃掉第 1 个** ⇒ 必须改。
+   *   `replaced` 这个返回值改为表示"已满、本次没加进去"（调用方可据此提示用户）。
+   */
   const replaced = existing.length >= MAX_CELL_CHILDREN
-  const next = [...existing, child].slice(-MAX_CELL_CHILDREN)
+  /*
+   * ⚠️⚠️ **新元素自动避让**（2026-10-16 用户要求："并排显示，用户可以自由拖动排布"）。
+   *
+   * 不做这一步的话，多个子元素各自按自己的 `cellPos` 绝对定位 ⇒ **默认全叠在一起**，
+   * 用户看到的就是"加进来了但只看得见一个"。
+   *
+   * 策略：**横排优先（紧挨着排），放不下就换行**。
+   *   · 横向：`x = max(已有右边界)`；
+   *   · 放不下（`x + 新宽 > 100`）⇒ `x = 0`、`y = max(已有下边界)`；
+   *   · 已有元素没设过 `cellPos` ⇒ 视作 `x = 0`（老数据）。
+   * ⚠️ 只在**新加**时算一次（初始摆位）；之后用户怎么拖**不再干预**。
+   * ⚠️ 只有在"格子还没被手动摆过"时才避让 —— 已有元素全都没 `cellPos` 说明是"流式"数据，
+   *   那种情况下第一个元素直接放 0,0（保持老观感）。
+   */
+  const placed = ((): AnyElement => {
+    if (existing.length === 0) return child
+    const wNew = childWidthPct(child)
+    let maxRight = 0
+    let maxBottom = 0
+    for (const c of existing) {
+      maxRight = Math.max(maxRight, childOffsetXPct(c) + childWidthPct(c))
+      /*
+       * ⚠️ **下边界要用 `childHeightMm`**（2026-10-16 修 #3）：
+       *   原来写 `typeof c.h === 'number' ? c.h : 0` —— `h` 是 `'auto'`（图片/码常见）时**加 0**
+       *   ⇒ `maxBottom` 偏小 ⇒ **换行后放回 y=0** ⇒ 与第一行元素**完全重叠** ✅
+       *   `childHeightMm` 会正确处理 `'auto'`（与渲染端**同一口径**）。
+       */
+      /*
+       * ⚠️ **高度给一个最小兜底 2mm**（2026-10-16 第二次修 #3）。
+       *
+       * 探针实测过：4 个"w=30 / h=10"的元素排得完全正确；
+       *   **但 `h` 算不出来的元素**（`h: 'auto'` 的图片/码、**附件**——画布上只是占位盒、
+       *   模型里常没有 `h`）会走 `?? 0` ⇒ **`maxBottom` 停在 0**
+       *   ⇒ **每个换行的元素都被放回 `y = 0`** ⇒ "第四个与第三个完全重叠" ✅
+       * ⇒ 兜底 2mm 之后 `maxBottom` **必然递增** ⇒ 换行不重叠。
+       * ⚠️ 这里**不追求算准**（附件真实高度要单元格高，`table-actions` 里拿不到）——
+       *   达到"不重叠"就够（用户随后会自己拖）。
+       */
+      /*
+       * ⚠️ **兜底高度 2 → 10mm**（2026-10-16 第四轮）。
+       *
+       * 用户报："同一个格内拖入**超过四个**元素时，**从第四个开始，
+       *   往后的每一个元素都会重叠到第三个元素上**"。
+       *
+       * 探针 + `normalizeChildInCell` 对照后确认：拖进去的元素会被归一成
+       *   "**按单元格尺寸等比适应**" ⇒ **每个都很大 ⇒ 每次都在"换行"分支**；
+       *   而 `y` 全靠 `maxBottom + 2` 错开 —— **2mm 相对于元素自身的高度（占位盒 ≈ 9–10mm）太小**，
+       *   视觉上就是"叠在一起" ✅
+       * ⇒ 兜底改 **10mm**（与格内占位盒的实际高度同量级）。
+       * ⚠️ 仍**不追求算准**（附件真实高度要单元格高，这里拿不到）—— 达到"看得出是几个"就够。
+       */
+      maxBottom = Math.max(maxBottom, childOffsetYMm(c) + Math.max(10, childHeightMm(c) ?? 0))
+    }
+    const wrap = maxRight + wNew > 100 + 0.01
+    const nextX = wrap ? 0 : Math.round(maxRight * 10) / 10
+    const nextY = wrap ? Math.round((maxBottom + 2) * 10) / 10 : childOffsetYMm(child)
+    return { ...child, cellPos: { xPct: Math.min(nextX, Math.max(0, 100 - wNew)), yMm: nextY } } as AnyElement
+  })()
+  const next = replaced ? existing : [...existing, placed]
   const rows = cloneRows(el.rows)
   const target = rows[loc.rowIdx]?.cells[loc.colIdx]
   if (!target) return null
   target.children = next
   return { patch: { rows }, replaced }
+}
+
+/**
+ * **清空格子里的所有子元素**（2026-10-16 用户要求：
+ *   「右键单元格空白处，有个**移除格内元素**的选项，**当前点击无用**，
+ *     改为**点击后清空格内所有元素**」）。
+ *
+ * ⚠️ 与 `detachChildFromCell`（取一个、要把元素交还给调用方）不同：
+ *   这里是**纯删除**，不返回元素本身。
+ * ⚠️ 删空之后**把 `children` 字段整个删掉**（不留下一个空数组 ——
+ *   不制造"有没有子元素"的第二种形态）。
+ */
+export function clearCellChildren(el: TableElement, cellId: string): TableActionResult | null {
+  const loc = findCell(el.rows, cellId)
+  if (!loc) return null
+  if (!loc.cell.children || loc.cell.children.length === 0) return null
+  const rows = cloneRows(el.rows)
+  const target = rows[loc.rowIdx]?.cells[loc.colIdx]
+  if (!target) return null
+  delete target.children
+  return { patch: { rows } }
 }
 
 /**
@@ -1420,16 +2071,29 @@ export function attachChildToCell(
 export function detachChildFromCell(
   el: TableElement,
   cellId: string,
+  /**
+   * ⚠️ **要取出的那一个**（2026-10-16 放宽上限后新增）。
+   *   不传 ⇒ 退回"取最后一个"（**老调用点的行为逐字不变**）。
+   */
+  childId?: string,
 ): (TableActionResult & { child: AnyElement | null }) | null {
   const loc = findCell(el.rows, cellId)
   if (!loc) return null
   const existing = loc.cell.children ?? []
   if (existing.length === 0) return null
-  const child = existing[existing.length - 1] ?? null
+  /*
+   * ⚠️⚠️ **只删"被取出的那一个"**（2026-10-16）。
+   *   原来是 `const child = existing[existing.length - 1]; target.children = []`
+   *     —— 上限为 1 时两者等价，**放宽后那会"取一个、丢掉整格"** ❌
+   */
+  const idx = childId ? existing.findIndex((c) => c.id === childId) : existing.length - 1
+  if (idx < 0) return null
+  const child = existing[idx] ?? null
   const rows = cloneRows(el.rows)
   const target = rows[loc.rowIdx]?.cells[loc.colIdx]
   if (!target) return null
-  target.children = []
+  target.children = (target.children ?? []).filter((c) => c.id !== child?.id)
+  if (target.children.length === 0) delete target.children
   return { patch: { rows }, child }
 }
 

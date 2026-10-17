@@ -263,7 +263,29 @@ function coerceDoc(raw: Record<string, unknown>): TemplateDoc {
 
   const bands = isPlainObject(raw.bands) ? raw.bands : {}
   const loop = isPlainObject(bands.loop) ? bands.loop : {}
-  return {
+
+  /*
+   * ⚠️⚠️ **表格元素的 `w` 必须等于「列宽之和」**（2026-10-14 修的严重 bug）。
+   *
+   * **症状**：格内图片/附件的位置和它在画布中所在的单元格**严重不符**（压线、跑到别的格、跨格）；
+   *          以及**打印时整个表格被压扁**成一条细长条。
+   *
+   * **根因**：画布上 `<table>` 是 `width:100%`（= 元素框 `el.w`），而列宽写的是
+   *   `<col style="width: Xmm">` ⇒ `table-layout:fixed` 下浏览器会**按比例压缩列宽**：
+   *     **实际列宽 = `colWidthsMm[i] × k`，其中 `k = el.w ÷ Σ列宽`**
+   *   而**所有格内元素的定位都用 `cellWidthMm()`**，它返回的是**原始列宽**（`Σ列宽`）
+   *   ⇒ 差了整整一个 `k` ⇒ 位置必然偏。
+   *   （同一个 `k` 也解释了"打印时表格被压扁" —— 那时打印端拿 `el.w` 当表格宽。）
+   *
+   * ⇒ **在这里把两者对齐**：`el.w := Σ列宽`。对齐之后 `k ≡ 1`，
+   *   画布 / 打印 / 格内定位**三处口径一致**，位置自然就对了。
+   *
+   * ⚠️ 放在 `coerceDoc` 里 ⇒ **所有加载路径（打开模板 / 导入 / 粘贴）都会经过**，
+   *    一次修好**存量模板**，不必让用户手工重建。
+   * ⚠️ 只在**差异明显**（> 0.05mm）时才写 —— 不无谓地改动本来干净的数据。
+   * ⚠️ `Σ列宽` 为 0（异常数据）时**不动** `el.w`，交给 `cellWidthMm()` 原有的兜底。
+   */
+  const coerced = {
     schemaVersion: SCHEMA_VERSION,
     pageSetup,
     bands: {
@@ -274,7 +296,89 @@ function coerceDoc(raw: Record<string, unknown>): TemplateDoc {
       },
       footer: isRecordArray(bands.footer) ? (bands.footer as AnyElement[]) : [],
     },
+  } as TemplateDoc
+  for (const el of elementsOf(coerced)) {
+    if (el.kind !== 'table') continue
+    const sum = el.colWidthsMm.reduce((a, b) => a + numOr(b, 0), 0)
+    if (sum > 0 && Math.abs(numOr(el.w, 0) - sum) > 0.05) {
+      el.w = Math.round(sum * 10) / 10
+    }
+    /*
+     * ⚠️ **自愈：把格内子元素的"超界 cellPos"夹回合法范围**（2026-10-14）。
+     *
+     * 上一轮曾短暂放宽过拖动钳制（允许 `xPct + w > 100`），
+     * **超界的坐标被存进了文档**（用户实测 `xPct = 64.748% + w = 38.7% = 103.45%`）
+     * ⇒ 渲染时元素右沿超出格子 ⇒ 压线。
+     * ⇒ 加载时把 `xPct` 夹回 `[0, 100 − w]`（一次修好存量脏数据）。
+     */
+    /* ⚠️ 这一格的上下内边距（mm）—— 与渲染端 `renderCellContent` 的 `padMm` 同源 */
+    const padMm = numOr(el.cellPaddingMm, 1.5)
+    /*
+     * ⚠️⚠️ **`el.h` 也要等于「行高之和」**（2026-10-14 补，与 `el.w := Σ列宽` **完全对称**）。
+     *
+     * 为什么会漏：宽边早就自愈了（`el.w := Σ列宽`），**高边从来没有**。
+     * 而画布上"图片类元素"（**表格在 `PIC_LIKE` 里**）的**外框是"固定高 `el.h` + `overflow:hidden`"**
+     *   ⇒ 当 `el.h` **小于**表格实际高时，**表格下半部被裁掉** ⇒
+     *   元素拖进"被裁掉的那块"就**看不见** ⇒ 用户读作「**底边彻底拖不下去了**」
+     *   （实测：行高 31 + 7 + 36.1 = 74.1mm，而 `el.h` 是旧值 ⇒ 下半部被裁）。
+     * ⚠️ **只在"所有行都有显式行高"时才写** —— 有自适应行时"Σ行高"表达不了真实高，
+     *   那时不能动 `el.h`（否则会把外框改成一个错的数）。
+     */
+    const heights = el.rows.map((r) =>
+      typeof (r as { heightMm?: number }).heightMm === 'number' &&
+      (r as { heightMm?: number }).heightMm! > 0
+        ? (r as { heightMm: number }).heightMm
+        : null,
+    )
+    if (heights.length > 0 && heights.every((h) => h !== null)) {
+      const sumH = heights.reduce((a, b) => a + (b as number), 0)
+      if (sumH > 0 && Math.abs(numOr(el.h, 0) - sumH) > 0.05) {
+        el.h = Math.round(sumH * 10) / 10
+      }
+    }
+    for (const row of el.rows) {
+      for (const cell of row.cells) {
+        for (const ch of cell.children ?? []) {
+          const pos = (ch as { cellPos?: { xPct?: number; yMm?: number } }).cellPos
+          if (!pos) continue
+          /* ① 横向：夹回 `[0, 100 − w]` */
+          if (typeof pos.xPct === 'number') {
+            const wPct = numOr((ch as { w?: unknown }).w, 0)
+            const maxX = Math.max(0, 100 - wPct)
+            if (pos.xPct > maxX) pos.xPct = maxX
+            if (pos.xPct < 0) pos.xPct = 0
+          }
+          /*
+           * ② 纵向：夹回 `[0, 内容区高 − 盒高]`
+           *
+           * ⚠️ **上一版只夹了横向、漏了纵向** ⇒ 用户在"钳制被放宽"那几轮拖到底存的**超界 `yMm`**
+           *   一直留在文档里 ⇒ 渲染时按它画 ⇒ **底边看起来"贴住了"（其实是超出）**，
+           *   而上/左/右留内边距**才是正确行为** —— 用户因此以为"只有底边对、其余三边错"。
+           * ⇒ 一起夹掉。行高缺席（自适应）时**不夹**（那时没有可用的内容区高）。
+           */
+          if (typeof pos.yMm === 'number' && typeof row.heightMm === 'number' && row.heightMm > 0) {
+            /*
+             * ⚠️⚠️ **`row.heightMm` 本身就是「内容区高」，不要再减内边距**（2026-10-14 用实测数据核对出来）。
+             *
+             * `<tr style="height:36.1mm">` 里的 36.1 是**内容盒**高，单元格的内边距是**加在它外面**的
+             *   ⇒ `td` 的 border box 高 = `36.1 + 2×1.5 = 39.1mm`
+             *   （实测：td 高 234.4px ÷ 缩放 1.59 = 39.0mm ✓ 吻合）。
+             * ⇒ `maxY` 应该是 **`行高 − 盒高` = `36.1 − 18 = 18.1mm`**。
+             * ⚠️ 我原来写成 `行高 − 2×pad − 盒高` = 15.1mm —— **多减了一次内边距**，
+             *   会把元素夹得**偏高 1.5mm**（用户实测"元素太靠下"正是这个反方向的对照）。
+             * ⚠️ 画布端的钳制用的是 `(td border box 高 − 2×pad)` = 36.1 ✓ **本来就是对的** ——
+             *   两端只有这里不一致，已统一。
+             */
+            const boxH = numOr((ch as { h?: unknown }).h, 0)
+            const maxY = Math.max(0, row.heightMm - boxH)
+            if (pos.yMm > maxY) pos.yMm = Math.round(maxY * 100) / 100
+            if (pos.yMm < 0) pos.yMm = 0
+          }
+        }
+      }
+    }
   }
+  return coerced
 }
 
 /** 结构校验 + 归一化。deserializeDoc 与导入流程共用（保证".bptpl.json 里的单模板"也能走同一套规则） */

@@ -110,12 +110,31 @@ function PaletteImpl({ tab, fields, onDragStart, onNotice }: PaletteProps) {
       if (arr) arr.push(f)
       else map.set(label, [f])
     }
-    return [...map.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+    /*
+     * ⚠️⚠️ **"未知字段"永远排最后**（2026-10-17 用户要求：
+     *   「把左侧的**未知字段移动到最后面** —— 这类未知字段在多维表格中多半是『对象』类型的字段，
+     *     是给**字段捷径**使用的，**不需要打印**，先移动到最后」）。
+     *
+     * 原来只按"数量降序"排 ⇒ 未知字段有 3 个就排到"日期"后面、"单选"前面，
+     *   挡在真正能用的字段中间 ✅
+     * ⇒ 排序键加一档：**未知字段垫底**，其余仍按"数量降序 + 名称"。
+     * ⚠️ 判据用 `fieldMeta(...).label === '未知字段'`（与"字段类型"的唯一来源一致），
+     *   不在名字上做字符串匹配。
+     */
+    const isUnknownGroup = (label: string): boolean => label === '未知字段'
+    return [...map.entries()].sort((a, b) => {
+      const ua = isUnknownGroup(a[0]) ? 1 : 0
+      const ub = isUnknownGroup(b[0]) ? 1 : 0
+      if (ua !== ub) return ua - ub
+      return b[1].length - a[1].length || a[0].localeCompare(b[0])
+    })
   }, [fields, keyword])
 
   const isCollapsed = (label: string): boolean => {
     const v = collapsed[label]
     if (typeof v === 'boolean') return v
+    /* ⚠️ 「未知字段」**默认折叠**（2026-10-17）：它不能打印，收起来少占视线 */
+    if (label === '未知字段') return !keyword.trim()
     // 搜索时强制展开：用户既然搜了，就是想看到具体字段
     return foldByDefault && !keyword.trim()
   }

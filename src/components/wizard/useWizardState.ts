@@ -1057,6 +1057,25 @@ export function useWizardState({
           signal: ac.signal,
         })
 
+        /*
+         * ⚠️⚠️ **把"图片加载失败"的真实原因带进渲染提示**（2026-10-14）。
+         *
+         * 用户报「**从第 5 条记录起全部"图片加载失败"**」，但界面上只有一句固定文案 ——
+         * 真正的原因（`ImageFailure.reason`，例如"获取链接失败：xxx"）一直存在
+         * `lib/attachment.ts` 里，**从来没被带出来** ⇒ 排查只能靠猜。
+         * ⇒ 补成 warning，让用户和排查者都能看到**到底为什么失败**。
+         * ⚠️ 放在"中断检查"**之前**：取消是正常流程，不该被报成失败。
+         */
+        if (imageFailures.length > 0) {
+          rendered.warnings.push(
+            ...imageFailures.map((f) => ({
+              kind: 'image-failed' as const,
+              message: `图片「${f.attachmentName}」加载失败：${f.reason}`,
+              recordId: f.recordId,
+            })),
+          )
+        }
+
         /**
          * ⚠️ 被中断时要**把 phase 交还给 idle**（2026-09-19 修）。
          *
@@ -1116,13 +1135,62 @@ export function useWizardState({
 
   const doPrint = useCallback(async () => {
     setOutput({ phase: 'working', message: '正在准备打印…', result: null, guidance: null })
-    // 打印前强制重取图片链接（F4-23）——从编辑到打印很可能已超过 10 分钟
-    const rendered = await runRender({ forOutput: true, forceImages: true })
+    /*
+     * ⚠️⚠️ **复用预览时取好的图片，不再强制重取**（2026-10-14 用户拍板）。
+     *
+     * 原来这里是 `forceImages: true`，理由写在注释里：「从编辑到打印很可能已超过 10 分钟」（F4-23）。
+     * 但用户指出这个理由**站不住**：
+     *   · 预览完**有问题** ⇒ 用户会回去改模板、**重新预览**（链接随之刷新）；
+     *   · 预览完**没问题** ⇒ 用户**直接打印**。
+     *   ⇒ 真实的"预览 → 打印"间隔通常只有几秒到一两分钟，**不可能晾十分钟**。
+     *   ⇒ 强行重取的代价是**实打实的**：十几条记录要重新取链接 + 重下几十张图，
+     *     界面卡在"正在排版"（看起来像死了），打印却早就弹框了。
+     *
+     * ⚠️ **万一真过期了怎么办**：下面会检查渲染结果里的 `image-failed`，
+     *   弹出「图片链接已过期，请重新预览一次再打印」——
+     *   让**极少数**情况多走一步，好过**每一次**打印都白等一轮。
+     */
+    const rendered = await runRender({ forOutput: true, forceImages: false })
     if (!rendered) {
       setOutput({ phase: 'error', message: render.error ?? '渲染失败，无法打印', result: null, guidance: null })
       return
     }
+    /*
+     * ⚠️ **链接过期兜底提示**（2026-10-14）。
+     *   飞书附件临时链接有有效期；既然打印时不再重取，就可能拿到过期的 URL。
+     *   渲染层会把"拿不到图"记成 `image-failed`（`render/html.ts`）——
+     *   这里据此给出**一句能照做的提示**，而不是让用户对着一堆占位框发呆。
+     */
+    const expiredCount = rendered.warnings.filter((x) => x.kind === 'image-failed').length
+    if (expiredCount > 0) {
+      setOutput({
+        phase: 'error',
+        message: `有 ${expiredCount} 张图片的链接已过期，无法打印。请点「上一步」重新预览一次再打印。`,
+        result: null,
+        guidance: null,
+      })
+      return
+    }
     try {
+      /*
+       * ⚠️⚠️ **必须先让 React 画一帧，再去调 `window.print()`**（2026-10-14 找到的真根因）。
+       *
+       * 症状：系统打印框弹出后，插件那边**一直卡在"正在排版 8/16"**。
+       *
+       * 我一开始以为"是另一轮渲染在跑"，**错了**。真因是**时序**：
+       *   `setRender(...)` 只是把状态**排进 React 的更新队列**，
+       *   紧接着 `printDocument()` 里调 `window.print()` —— 那是**同步阻塞主线程**的，
+       *   ⇒ React **没机会把这次重渲染刷进 DOM** ⇒ 用户看到的还是上一帧的"正在排版"。
+       *   （打印框关掉之后才会刷新 —— 所以它"看起来一直卡着"。）
+       *
+       * ⇒ 在打印前**主动让出一个宏任务 + 一帧**，确保"已完成"那个状态真的画到屏幕上了，
+       *   再去阻塞。⚠️ 用 `rAF` + `setTimeout` 双保险：`rAF` 拿到的是"下一帧"，
+       *   而布局/绘制可能还要再排一次，所以再等一个宏任务最稳。
+       */
+      setRender((s) => (s.phase === 'ready' ? s : { ...s, phase: 'ready' }))
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => setTimeout(() => resolve(), 0))
+      })
       await printDocument(rendered.html, doc!.pageSetup, rendered.pageWidthMm, rendered.pageHeightMm, {
         title: active?.name ?? '打印',
       })
@@ -1482,6 +1550,24 @@ function collectAttachConfigs(d: TemplateDoc): AttachmentPrintConfig[] {
         for (const row of el.rows) {
           for (const cell of row.cells ?? []) {
             if (cell.attachment) out.push(cell.attachment)
+            /*
+             * ⚠️⚠️ **必须连"格内子元素里的附件"一起扫**（2026-10-14 修的严重 bug）。
+             *
+             * 用户报：「**向导第③步预览 / 实际打印 / 导出 PDF 全都"图片加载失败"**，
+             *          但**编辑器里的预览能出真图**」。
+             *
+             * 根因：这个函数原来看的只有 `cell.attachment`（**格子级**的附件配置），
+             *   而用户的附件是**拖动放进格子的块级子元素**（存在 `cell.children` 里）⇒
+             *   **一个 config 都收不到** ⇒ 上游 `deriveAttachConfig` 返回 `null` ⇒
+             *   **整批跳过图片下载** ⇒ 渲染时 `ctx.images` 是空 Map ⇒ 全部走"图片加载失败"分支。
+             * ⚠️ 而编辑器预览走的是**另一条链**（`resolvePreviewImages`，不看这个 config）
+             *   ⇒ 所以那条能出图 ⇒ 造成"同一个模板、两条路结果不同"。
+             */
+            if (Array.isArray(cell.children)) {
+              for (const child of cell.children) {
+                if (child.kind === 'attach' && child.config) out.push(child.config)
+              }
+            }
           }
         }
       }

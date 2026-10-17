@@ -385,7 +385,18 @@ export function parseRPr(rPr: XmlNode | undefined): IRFontStyle {
   if (i !== undefined) out.italic = i
 
   const u = firstChild(rPr, 'w:u')
-  if (u) out.underline = (attr(u, 'w:val') ?? 'single') !== 'none'
+  if (u) {
+    const val = attr(u, 'w:val') ?? 'single'
+    out.underline = val !== 'none'
+    /*
+     * ⚠️ **Word 的下划线线型要带过来**（2026-10-17）：
+     * `w:u/@w:val` 有 single / thick / double / dash / dotted / dotDash / longDash / wave…
+     * 我们只区分**实线 / 虚线**两档 ⇒ 带 dash / dot / wave 的归到 `dashed`，其余按实线。
+     * 不做 double / thick —— 模型里没有对应值，假装支持只会在打印时露出马脚
+     * （Word 模板里"填空线"就是 `dash`，丢掉线型等于把用户的模板改成了实线）。
+     */
+    if (out.underline && /dash|dot|wave/i.test(val)) out.underlineStyle = 'dashed'
+  }
 
   const strike = onOff(firstChild(rPr, 'w:strike'))
   if (strike !== undefined) out.strike = strike

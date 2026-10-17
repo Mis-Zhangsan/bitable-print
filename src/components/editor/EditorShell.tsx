@@ -84,8 +84,10 @@ import {
   tableGrid,
   CELL_BLOCK_KINDS,
   attachChildToCell,
+  clearCellChildren,
   detachChildFromCell,
   cellWidthMm,
+  cellContentHeightMm,
   mergeRange,
   patchRangeStyle,
   resizeTableTo,
@@ -741,6 +743,57 @@ export function EditorShell({
     [api, doc, nodeTarget],
   )
 
+  /**
+   * ⚠️ **换绑行内字段节点指向的字段**（2026-10-17 用户要求："顶部名称可以下拉更换"）。
+   *
+   * ⚠️ 与 `applyNodeStyle` 同一个三段式，只是改的是 `fieldId` / `fieldName`。
+   * ⚠️ **不清 `style`**：用户换字段时，这一处已有的字号/颜色应该跟着保留
+   *   （他是在"换个字段来套用已调好的样式"，不是"重新插一个"）。
+   */
+  const applyNodeField = useCallback(
+    (fieldId: string, fieldName: string) => {
+      const ref = nodeTarget?.ref
+      if (!ref) return
+      const nodes = nodesAtRef(doc, ref)
+      const cur = nodes?.[ref.index]
+      if (!nodes || !cur || cur.type !== 'field') return
+      const arr = nodes.slice()
+      arr[ref.index] = { ...cur, fieldId, fieldName }
+      if (ref.cellId) {
+        const found = findElement(doc, ref.elementId)
+        if (!found || found.el.kind !== 'table') return
+        api.mergeElement(ref.elementId, { rows: updateCell(found.el.rows, ref.cellId, { nodes: arr }) })
+        return
+      }
+      api.mergeElement(ref.elementId, { nodes: arr })
+    },
+    [api, doc, nodeTarget],
+  )
+
+  /**
+   * ⚠️ **切换行内字段节点的"自动换行"**（2026-10-17 用户要求）。
+   * 与 `applyNodeField` 同一个三段式，只改 `wrap`。
+   */
+  const applyNodeWrap = useCallback(
+    (wrap: boolean) => {
+      const ref = nodeTarget?.ref
+      if (!ref) return
+      const nodes = nodesAtRef(doc, ref)
+      const cur = nodes?.[ref.index]
+      if (!nodes || !cur || cur.type !== 'field') return
+      const arr = nodes.slice()
+      arr[ref.index] = { ...cur, wrap }
+      if (ref.cellId) {
+        const found = findElement(doc, ref.elementId)
+        if (!found || found.el.kind !== 'table') return
+        api.mergeElement(ref.elementId, { rows: updateCell(found.el.rows, ref.cellId, { nodes: arr }) })
+        return
+      }
+      api.mergeElement(ref.elementId, { nodes: arr })
+    },
+    [api, doc, nodeTarget],
+  )
+
   /** 清掉这一处的全部样式覆写（回到完全继承外层） */
   const clearNodeStyle = useCallback(() => {
     const ref = nodeTarget?.ref
@@ -1015,7 +1068,11 @@ export function EditorShell({
       const block = cellBlockElementOf(payload)
       if (block) {
         /* 传格宽：码的 `w` 要按 `18mm / 格宽` 反算，外层绿框才会贴着码（第四批第 3 / 5 条） */
-        const child = normalizeChildInCell(block, cellWidthMm(found.el, cellId))
+        const child = normalizeChildInCell(
+          block,
+          cellWidthMm(found.el, cellId),
+          cellContentHeightMm(found.el, cellId),
+        )
         const r = attachChildToCell(found.el, cellId, child)
         if (!r) return false
         api.mergeElement(tableId, r.patch)
@@ -1289,9 +1346,13 @@ export function EditorShell({
       onSetBand={api.setElementBand}
       onSelectCell={handleSelectCell}
       onAskMerge={requestMerge}
+      /* ⚠️ 面板的"行高/列宽"入口：转给 Canvas 的同一个对话框（2026-10-17） */
+      onAskCellSize={(tableId, cellId, kind) => canvasRef.current?.askCellSize(tableId, cellId, kind)}
       onNodeStyle={applyNodeStyle}
       onClearNodeStyle={clearNodeStyle}
       onNodeProps={applyNodeProps}
+      onNodeField={applyNodeField}
+      onNodeWrap={applyNodeWrap}
       onSelectNode={handleSelectNode}
       onNotice={notice}
     />
@@ -1311,6 +1372,7 @@ export function EditorShell({
       selectedId={api.selectedId}
       onSelect={handleSelect}
       onRemove={api.removeElement}
+      recordCount={records?.length ?? 1}
     />
   )
 
@@ -1583,8 +1645,17 @@ export function EditorShell({
                       key={t.key}
                       type="button"
                       role="tab"
-                      aria-selected={paletteTab === t.key}
-                      className={`bp-seg__item${paletteTab === t.key ? ' is-active' : ''}`}
+                      /*
+                       * ⚠️⚠️ **高亮要用真实的 `tab`，不能用 `paletteTab`**（2026-10-17 用户报：
+                       *   「点击检查后，页面虽然跳到检查页，但**顶部的标签会回到"字段"**」）。
+                       *
+                       * 根因：`paletteTab`（见上面 1281 行）是给 `Palette` 组件用的、只有
+                       *   `'fields' | 'elements'` 两个值 ⇒ `tab === 'inspect'` 时它算成 `'fields'`
+                       *   ⇒ **"检查"这个 tab 永远不高亮，"字段"永远亮着** ✅
+                       *   （`paletteTab` 的语义是"调色板显示哪一类"，**不是"当前选中哪个 tab"**。）
+                       */
+                      aria-selected={tab === t.key}
+                      className={`bp-seg__item${tab === t.key ? ' is-active' : ''}`}
                       onClick={() => setTab(t.key)}
                     >
                       <span className="bp-seg__text">{t.label}</span>
@@ -1595,7 +1666,25 @@ export function EditorShell({
             ) : (
               <div className="bp-side__head">
                 <span className="bp-side__title">
-                  {tab === 'style' ? '属性' : tab === 'elements' ? '元素' : '字段'}
+                  {/*
+                    ⚠️⚠️ **三元链必须覆盖所有 tab**（2026-10-17 用户报：
+                      「点击顶部的"检查"时，**光标会跳回"字段"**，但实际上页面是正常切换到检查页的」）。
+
+                    根因：这条链只写了 `style / elements / 其它` 三档 ⇒
+                      **`tab === 'inspect'` 落进了兜底的 `'字段'`** ⇒
+                      内容渲染的是检查页、**标题却写着"字段"** ✅
+                      （用户看到的"跳回字段"就是这个标题，不是页面真的切回去了。）
+
+                    ⚠️ 以后再加 tab，**这里必须同步** —— 它是唯一一个"按 tab 出文案"的地方，
+                      漏了不会报错、只会显示错的字。
+                  */}
+                  {tab === 'style'
+                    ? '属性'
+                    : tab === 'elements'
+                      ? '元素'
+                      : tab === 'inspect'
+                        ? '检查'
+                        : '字段'}
                 </span>
                 <button
                   type="button"
@@ -1652,7 +1741,24 @@ export function EditorShell({
                 /* 归一化尺寸口径：自由层的 `w` 是 mm、格内是百分比（见 types.ts 第 ④ 条）。
                    不换算的话，一个 40mm 宽的图片进了格子会变成 40% 宽 —— 用户什么都没做，
                    只是把它拖进格子，尺寸不该自己变。 */
-                const r = attachChildToCell(table, cellId, normalizeChildInCell(el, cellWidthMm(table, cellId)))
+                /*
+                 * ⚠️ **带上这一格的行高**（2026-10-13 用户口径："两者取小"）：
+                 *   从画布拖进格子的元素要"不超过格宽、也不超过行高"。
+                 * ⚠️ 行高可能是**自适应**（`heightMm` 缺席）⇒ 传 `undefined`，
+                 *    `normalizeChildInCell` 会退回"按格宽"那一档（没有分母算不了）。
+                 * ⚠️ 找行用"哪一行的 cells 里有这个 cellId"，不用下标 ——
+                 *    `rowspan` 覆盖的行里，数组下标 ≠ 网格行号。
+                 */
+                /*
+                 * ⚠️ 传**内容区高**（行高 − 上下内边距），不是 `row.heightMm`：
+                 *   `heightMm` 是 border box 总高，拿它约束元素会让元素压在边框上
+                 *   （2026-10-17 用户报的"附件压在单元格之上"）。
+                 */
+                const r = attachChildToCell(
+                  table,
+                  cellId,
+                  normalizeChildInCell(el, cellWidthMm(table, cellId), cellContentHeightMm(table, cellId)),
+                )
                 if (!r) return false
                 // 先写格子、再删原元素 —— 顺序反了会出现"元素没了、内容也没进去"的空档
                 api.mergeElement(tableId, r.patch)
@@ -1707,6 +1813,7 @@ export function EditorShell({
             selectedCellId={selectedCellId}
             selectedNode={activeNodeRef}
             onSelectNode={handleSelectNode}
+
             outOfBoundsIds={outOfBoundsElementIds}
             dropActive={dropLabel !== null}
             dropTarget={dropTarget}
@@ -1770,10 +1877,11 @@ export function EditorShell({
               deleteRow: (tableId, cellId) => requestMerge(tableId, cellId, 'row'),
               deleteCol: (tableId, cellId) => requestMerge(tableId, cellId, 'col'),
               askMergeRange: (tableId, range) => requestMerge(tableId, '', 'range', range),
-              moveChildToCell: (fromTableId, fromCellId, toTableId, toCellId) => {
+              moveChildToCell: (fromTableId, fromCellId, toTableId, toCellId, childId) => {
                 const f = findElement(doc, fromTableId)
                 if (!f || f.el.kind !== 'table') return
-                const det = detachChildFromCell(f.el, fromCellId)
+                /* ⚠️ 透传 childId（一格多个时必须指定，否则拖出去的可能不是你抓的那个） */
+                const det = detachChildFromCell(f.el, fromCellId, childId)
                 if (!det || !det.child) return
                 const t = findElement(doc, toTableId)
                 if (!t || t.el.kind !== 'table') return
@@ -1790,10 +1898,10 @@ export function EditorShell({
                 if (att) api.mergeElement(toTableId, att.patch)
                 notice(att?.replaced ? '已换到目标格（目标格原来的元素被替换掉了）' : '已换到目标格')
               },
-              takeOutChild: (tableId, cellId, at) => {
+              takeOutChild: (tableId, cellId, at, childId) => {
                 const f = findElement(doc, tableId)
                 if (!f || f.el.kind !== 'table') return
-                const r = detachChildFromCell(f.el, cellId)
+                const r = detachChildFromCell(f.el, cellId, childId)
                 if (!r) return
                 api.mergeElement(tableId, r.patch)
                 if (!r.child) return
@@ -1827,11 +1935,53 @@ export function EditorShell({
                 )
                 notice(at ? '已把格内元素取出，放到你松开的位置' : '已把格内元素取出，放到表格右侧')
               },
-              removeChild: (tableId, cellId) => {
+              clearChildren: (tableId, cellId) => {
                 const f = findElement(doc, tableId)
                 if (!f || f.el.kind !== 'table') return
-                const r = detachChildFromCell(f.el, cellId)
+                /* ⚠️ 纯删除：不需要"把元素交还画布"（那是 `removeChild` 的事） */
+                const r = clearCellChildren(f.el, cellId)
                 if (r) api.mergeElement(tableId, r.patch)
+              },
+              removeChild: (tableId, cellId, childId) => {
+                const f = findElement(doc, tableId)
+                if (!f || f.el.kind !== 'table') return
+                /* ⚠️ **把 `childId` 透传下去**（2026-10-16）—— 一格多个时必须指定删哪一个 */
+                const r = detachChildFromCell(f.el, cellId, childId)
+                if (r) api.mergeElement(tableId, r.patch)
+              },
+              /*
+               * **格内子元素的定位**（2026-10-13）。写 `cellPos`（`{xPct, yMm}`）——
+               * 一旦写上，渲染两端就切成"绝对定位 + 定位容器"（见 `lib/cell-geometry.ts`）。
+               *
+               * ⚠️ 只改**第 0 个**子元素：`MAX_CELL_CHILDREN = 1` 是一格一个的硬约束
+               *    （见 types.ts 的 `children` 注释）。不遍历全部是因为那会掩盖
+               *    "哪天约束被放宽了"这件事 —— 真放宽时应该来这里显式改。
+               * ⚠️ 就地 map 出一份新的 rows，不 mutate：本项目全程走不可变更新，
+               *    否则撤销栈拿不到正确的快照。
+               */
+              patchCellChild: (tableId, cellId, patch, mergeKey, childId) => {
+                const f = findElement(doc, tableId)
+                if (!f || f.el.kind !== 'table') return
+                const rows = f.el.rows.map((row) => ({
+                  ...row,
+                  cells: row.cells.map((c) =>
+                    c.id === cellId && c.children && c.children.length > 0
+                      ? {
+                          ...c,
+                          /*
+                           * ⚠️⚠️ **按 `childId` 定位**（2026-10-16 放宽 `MAX_CELL_CHILDREN` 后）。
+                           *   原来写死"只改第 0 个" —— 那时一格只有一个、等价；
+                           *   放宽后必须能指定改哪一个，否则**拖第二个元素会改到第一个** ❌
+                           *   ⚠️ 不传 `childId` ⇒ 退回第 0 个（老调用点行为不变）。
+                           */
+                          children: c.children.map((ch) =>
+                            !childId || ch.id === childId ? ({ ...ch, ...patch } as AnyElement) : ch,
+                          ),
+                        }
+                      : c,
+                  ),
+                }))
+                api.mergeElement(tableId, { rows }, mergeKey)
               },
               applyRange: (tableId, range, op) => {
                 const f = findElement(doc, tableId)

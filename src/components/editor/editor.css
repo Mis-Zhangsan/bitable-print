@@ -745,9 +745,21 @@
   min-height: 0;
 }
 
-/* 表格：行分摊多出来的高度，所以「拖底边」现在真的会让表格变高（以前只改框、行不动） */
+/*
+ * ⚠️⚠️ **表格必须退出 flex 拉伸**（2026-10-14）。
+ *
+ * 光删掉上面那条 `height: 100%` **不够** —— `.bp-el--fill > *` 的 `flex: 1 1 auto`
+ * 在**纵向 flex 容器**里会**同样把表格纵向拉高**（效果和 `height:100%` 一模一样）。
+ *
+ * ⇒ 让表格不参与拉伸（`flex: 0 0 auto`），高度**完全由"行高之和"决定**，
+ *   与打印端逐字同口径。
+ *
+ * ⚠️ 与 `height: 100%` 的对话：那条是为了"拖底边能让表格变高"，
+ *   但代价是"行高只能按比例分配"⇒ 画布与打印分叉（见上面的注释）。
+ *   "拖底边改高"要靠**拖拽逻辑按比例缩放各行 `heightMm`** 来实现，不能靠 CSS 撑。
+ */
 .bp-el--fill > .bp-el-table {
-  height: 100%;
+  flex: 0 0 auto;
 }
 
 /*
@@ -1240,8 +1252,17 @@
 /* 单元格内的就地编辑：高度交给单元格撑（父级 td 有 padding + 行高），
    不能用基类的 height:100% —— 那会让 td 里的 textarea 撑满整行，视觉上跳一下 */
 .bp-inline-edit--cell {
+  /*
+   * ⚠️ **必须能滚 + 按内容长高**（2026-10-17 用户报：
+   *   「双击单元格编辑时，出现的文本编辑框**无法显示所有内容**」）。
+   *
+   * 根因：基础类里是 `overflow: hidden`，而 `textarea` 的 `height: auto`
+   *   **不是"按内容长高"**（那是 div 的行为）⇒ 只剩浏览器给的默认 2 行，多的被裁 ✅
+   * ⇒ `overflow-y: auto` 兜底（JS 那边还会自动撑高，双保险）。
+   */
   height: auto;
   min-height: 1.4em;
+  overflow-y: auto;
 }
 
 .bp-el-note {
@@ -1254,14 +1275,29 @@
 .bp-chip {
   display: inline-block;
   max-width: 100%;
-  padding: 0 3px;
+  /*
+   * ⚠️⚠️ **胶囊字号从 `0.92em` 改成 `1em`**（2026-10-17 用户报：
+   *   「手动输入的文字**还是比胶囊样式的字段高**」，配图里"是"和「产品名称」并排，
+   *   文字明显比胶囊里的字大一圈）。
+   *
+   * 根因：`0.92em` 让胶囊里的字**比同行的裸文字小 8%** —— 两个不同字号的字
+   *   **物理上不可能"齐"**（无论 baseline 还是 middle 都只能对齐某一条参考线，
+   *   视觉上总有一边显得"高/大"）。
+   * ⇒ 统一成 `1em`：胶囊内外同字号，行盒也一致，才谈得上"在同一行"。
+   * ⚠️ 胶囊的"视觉区分"靠**边框 + 底纹 + 颜色**，不靠缩小字号 —— 那本来也不是它的职责。
+   */
+  font-size: 1em;
+  /*
+   * ⚠️ `padding: 0 3px → 1px 3px`（同日）：给上下各 1px，
+   * 让胶囊的**盒高**和裸文字的行盒更接近（原来上下 0 + 1px 边框，比文字矮、看起来"缩在中间"）。
+   */
+  padding: 1px 3px;
   border: 1px solid var(--accent);
   border-radius: var(--r-xs);
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: 0.92em;
-  line-height: 1.35;
-  vertical-align: baseline;
+  line-height: 1.2;
+  vertical-align: middle;
   /**
    * ⚠️ 这里**不能**写 `overflow: hidden`（2026-09-18 飞书真机反馈后修正）。
    *
@@ -1283,12 +1319,32 @@
  * chip 内部承载文本的那一层 —— **截断与省略号都归它**。
  * 单独成层的原因见上面 `.bp-chip` 的注释：截断需要的 `overflow: hidden` 不能挂在 chip 自己身上。
  */
+/*
+ * ⚠️⚠️ **默认自动换行**（2026-10-17 用户要求："是否自动换行"开关）。
+ *
+ * 原来这里是 `nowrap + ellipsis`（永不换行、超了打省略号），而**打印端是 `pre-wrap`**
+ *   ⇒ 画布和打印本来就不一致 ✅
+ * ⇒ 现在：**默认换行**（与打印一致）；只有 `wrap === false` 的节点才加 `.is-nowrap` 走截断。
+ * ⚠️ `overflow-wrap: anywhere`：中文/长串编号也能在任意位置断行
+ *   （`word-break: break-word` 对连续无空格的长串不够用）。
+ */
 .bp-chip__text {
   display: block;
   max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ⚠️ 关闭自动换行 ⇒ 不换行 + 省略号裁切（与打印端的 `nowrap + hidden` 同语义） */
+/*
+ * ⚠️ **关闭自动换行 ⇒ 直接裁切，不加省略号**（2026-10-17 用户明确要求：
+ *   "**不需要增加末尾省略号，直接裁切**"）。
+ * ⚠️ 与打印端同语义（那边也是 `overflow:hidden`、无 `ellipsis`）。
+ */
+.bp-chip.is-nowrap .bp-chip__text {
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  text-overflow: clip;
 }
 
 .bp-chip--sys {
@@ -1322,10 +1378,15 @@
   word-break: break-word;
 }
 
-.bp-el-cell.is-header {
-  font-weight: var(--fw-medium);
-}
-
+/*
+ * ⚠️ `.bp-el-cell.is-header` 原来有一条 `font-weight: var(--fw-medium)`，2026-10-17 **删掉**。
+ *
+ * 理由：表头的视觉**完全由 `cell.style`（bold / align / background）承载**，
+ * 打印端（`render/html.ts`）只读 `cell.style`、不读 `isHeader`（`isHeader` 只用于跨页重复）。
+ * 那条 CSS 会让"用户在面板里手动取消表头行加粗"之后，**画布仍是 500、打印却是 400** ——
+ * 正是本项目反复收口的"画布 vs 打印不一致"。
+ * 新建表时 `useEditorState` 会同时写 `isHeader` 和标题样式，所以删掉不影响默认观感。
+ */
 .bp-el-cell.is-selected {
   outline: 1.5px solid var(--accent);
   outline-offset: -1.5px;
@@ -1414,6 +1475,20 @@
   position: absolute;
   inset: 0;
   pointer-events: none;
+  /*
+   * ⚠️ **必须高于 `.bp-handle`（它写了 `z-index: 1`）**（2026-10-13 探针实测修复）。
+   *
+   * 实测数据（`_probe-table-handles.mjs` 的 `elementFromPoint` 命中测试）：
+   *   · 列手柄 #3（表格**最右外框**）⇒ 命中 `bp-handle--e` 而不是自己 ❌
+   *   · 行手柄 #2（表格**底边**）   ⇒ 命中 `bp-handle--s` 而不是自己 ❌
+   *   ⇒ 那两条边界上的手柄**在 DOM 里存在、但点不到** ⇒ 用户拖不动"最后一列宽 / 最后一行高"。
+   *
+   * 原来这里没有 z-index，而 `.bp-handle` 是 1 ⇒ 元素缩放手柄盖在表格手柄之上。
+   * ⇒ 抬到 2。**副作用是刻意的**：在**表格编辑态**下，与元素手柄重合的那几条边
+   *    （左/右/上/下中点）优先解释为"行列边界"，而不是"缩放整个元素" ——
+   *    这也正是用户进编辑态想要的动作。
+   */
+  z-index: 2;
 }
 
 .bp-tbl-size__col,
@@ -1442,6 +1517,40 @@
 .bp-tbl-size__col:hover,
 .bp-tbl-size__row:hover {
   background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/*
+ * ⚠️ **外框侧的手柄**（`--start`，2026-10-13 加）：表格的左外框 / 上外框。
+ *
+ * 拖它们改**第 1 列宽 / 第 1 行高**，另一端保持不动（`side='start'` 的语义）。
+ *
+ * ⚠️ **必须去掉 `translateX/Y(-50%)`**（基类里那两条是为了让手柄骑在**内部**边线上、左右各半）：
+ *    外框这条边**正好压在元素的边界**上，居中会让一半伸到元素外面 ——
+ *    能不能点到就取决于外层有没有裁剪（`.bp-el` 的 overflow 是活的），太脆。
+ *    ⇒ 整条塞进元素内（`left/top: 0` + 不居中），**一定能点到**。
+ * ⚠️ 特异性（0,2,0）高于基类（0,1,0）⇒ 不需要 `!important`。
+ *
+ * ⚠️⚠️ **`z-index: 1` 是必需的**（探针实测后补，2026-10-13）：
+ *    外框手柄与**内部**边线手柄必然**交叉**（上外框横穿每一条列内线，左外框纵穿每一条行内线）。
+ *    JSX 里我把两条 `--start` 排在最前 ⇒ 同 z-index 时**后画的兄弟赢** ⇒
+ *    交叉点上会命中"里面的那条" ⇒ 拖上外框时光标变成 `col-resize`、拖 dy 毫无反应
+ *    （探针原始读数：`row#0 hit=SPAN.bp-tbl-size__col self=false`）。
+ *    ⇒ 抬到 1。
+ *
+ *    **归属规则（就是用户直觉）**：交叉点上**外框赢** ——
+ *    左上角那一小块归**上外框**（它写在左外框之后 ⇒ 同 z-index 时在后 ⇒ 赢）：
+ *      `上外框 > 左外框 > 列内线 > 行内线`
+ */
+.bp-tbl-size__col--start {
+  left: 0;
+  transform: none;
+  z-index: 1;
+}
+
+.bp-tbl-size__row--start {
+  top: 0;
+  transform: none;
+  z-index: 1;
 }
 
 /*
@@ -2587,12 +2696,34 @@
  *     —— 最后那个孤零零的色块比竖条好看不到哪去。
  */
 .bp-color__swatches {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, 13px);
-  gap: 2px;
+  /*
+   * ⚠️ **横向一排，不换行**（2026-10-17 用户要求："参考二维码中的排列方式，横向一排"）。
+   *
+   * 原来是 grid + `repeat(auto-fill, 13px)` —— 列数取决于容器宽，
+   * 而它和"字号"挤在两列布局里、字色列只有 ~30-80px
+   * ⇒ **每行只放 1-2 个 ⇒ 看着就是竖着堆** ✅
+   * ⇒ flex + nowrap（一排）；窄了允许横向滚动（不换行、不压扁）。
+   * ⚠️ `flex: none` 必须写，否则色块被压成细条。
+   */
+  display: flex;
+  flex-wrap: nowrap;
+  gap: calc(3px * var(--bp-inv, 1));
   min-width: 0;
-  align-content: center;
+  align-items: center;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+
+.bp-color__swatches::-webkit-scrollbar {
+  display: none;
+}
+
+/*
+ * ⚠️ **原 `.bp-grid2--tight { grid-template-columns: auto minmax(0,1fr) }` 已删除**（2026-10-17）。
+ *   它是给"字号 | 字色"那一行写的，而那两样后来改成了"各占一行" ⇒ 规则成了死代码；
+ *   更糟的是它和"开关两列"那段**同名叠加** ⇒ 第一列 `auto`（按内容）、第二列吃掉剩余
+ *   ⇒ 两列严重不等宽 ⇒ 开关飘到中间、标签被裁 ✅
+ */
 
 .bp-color__dot {
   width: 13px;
@@ -2722,6 +2853,14 @@
 }
 .bp-tgl--strike {
   text-decoration: line-through;
+}
+/*
+ * 「下划虚线」按钮：里面的 U 自己带一条虚线（`text-decoration-style: dashed`），
+ * 和旁边那条实线的 U 一眼能分开。用户要的是"填空线"（经办人：_ _ _ _），这就是入口。
+ */
+.bp-tgl--underdash .bp-deco-dash {
+  text-decoration: underline dashed;
+  text-underline-offset: 2px;
 }
 
 .bp-img-preview {
@@ -3344,6 +3483,13 @@
 
 .bp-tools__group {
   flex: none;
+  /*
+   * ⚠️ `display:inline-flex` 且**不设 flex-wrap** ⇒ 组内永远一行。
+   * 这是有意的：字形组（B / I / U / U虚线 / S）一旦组内换行，会出现"4 个在上、1 个在下"的参差，
+   * 而且工具行高度会随选中对象变化 —— 高度一变，画布在用户按下的那一刻整体位移
+   * （本项目踩过这个坑，见 `Toolbar` 里关于"布局稳定"的注释）。
+   * 宽度不够时请让**整组**换行，不要给这里加 `flex-wrap: wrap`。
+   */
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -4338,6 +4484,35 @@
   width: 100%;
 }
 
+/*
+ * **格内元素的缩放锚点**（2026-10-13，共 8 个）。
+ *
+ * 出现在子元素边框的 8 个方位（4 角 + 4 边中点），拖着改「占格宽」与「高」。
+ *
+ * ⚠️⚠️ **样式必须与画布元素的锚点（`.bp-handle`）一致**（用户 2026-10-13 要求：
+ *   「单元格内的附件等元素，选中后的 8 个锚点和在画布中该元素的锚点**不一样**，
+ *    统一成和画布中的锚点样式一样」）：
+ *    · 描边用 `--accent`（**蓝**）而不是 `--success`（绿）—— 绿色是"格内元素描边"的语义，
+ *      但锚点是**操作手柄**，它该和画布上的手柄长得一样，用户才能一眼认出"这是同一个东西"；
+ *    · 尺寸同样 8px + `--bp-inv` 反向缩放（与 `.bp-handle` 逐字一致）。
+ *      ⚠️ 原来是 7px，差 1px 在一排 8 个锚点上很显眼。
+ * ⚠️ 8 个方位的**光标**由内联 `cursor` 给（`Canvas.tsx`）—— 不写 8 条 CSS 类，
+ *    类名一多必漏，漏掉的那个光标变默认箭头、用户以为"这个点不能拖"。
+ * ⚠️ `z-index: 3`：要压在同格其它内容（以及 `.bp-tbl-size` 的 2）之上才点得到。
+ */
+.bp-cellchild-h {
+  position: absolute;
+  /* ⚠️ 11px（不是 8）：用户报"鼠标移上去**很难出现**缩放指针" —— 8px 在缩放后命中区只有几个像素 */
+  width: calc(11px * var(--bp-inv, 1));
+  height: calc(11px * var(--bp-inv, 1));
+  margin: calc(-5.5px * var(--bp-inv, 1));
+  transform: scale(var(--bp-inv, 1));
+  border: 1.5px solid var(--accent);
+  border-radius: 1px;
+  background: var(--pp-surface);
+  z-index: 3;
+}
+
 .bp-el-cell__child-img {
   display: block;
   width: 100%;
@@ -4563,6 +4738,26 @@
   pointer-events: none;
 }
 
+/*
+ * 拖动格内元素、**脱离格子之后**的跟随显示（2026-10-13）。
+ *
+ * ⚠️ 用**画布样式**（虚线蓝框）而不是格内样式（绿框 + 类型角标）——
+ *   用户口径：「拖动到单元格外时，**样式应当在拖动过程中就变换**」。
+ *   ⇒ 不需要等松手，拖着的时候就能看出"它已经不是格里的东西了"。
+ * ⚠️ `pointer-events: none`：它是"影子"，不能抢走下面元素的命中。
+ * ⚠️ `z-index: 60` 要高于表格手柄（2）与格内锚点（3）—— 它是全场最上层的跟随物。
+ * ⚠️ 尺寸由内联样式给（按画布口径的 mm）⇒ 这里只管外观。
+ */
+.bp-child-ghost-body {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  outline: 1px dashed var(--accent);
+  background: var(--pp-surface, #fff);
+  opacity: 0.9;
+  overflow: hidden;
+}
+
 /* 表格悬浮菜单里的小字提示（编辑态下告诉用户怎么框选） */
 .bp-table-bar__hint {
   color: var(--text-4);
@@ -4766,4 +4961,761 @@
   color: var(--success, #0f8f5f);
   font-size: calc(9px * var(--bp-inv, 1));
   line-height: 1.5;
+}
+
+/*
+ * ⚠️ **数字输入框的"上下调节按钮"**（2026-10-15 用户要求）。
+ *
+ * 为什么不用原生 `type="number"` 的 spinner：原生 number 会把 `1.` 这种**中间态**
+ * 判为非法并**清空输入框**，用户没法输入 `0.25` / `10.5` 这类小数
+ * （见 `Controls.tsx` 里 `<input>` 上方那段注释）。
+ * ⇒ 自己画两个小三角，行为完全可控。
+ *
+ * ⚠️ `tabIndex={-1}` 由 TSX 侧设置：按钮**不抢键盘焦点** ——
+ *   否则用户在输入框里按 ↑↓ 会跳到按钮上，而不是"加减数值"。
+ */
+.bp-num__spin {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  gap: 0;
+  margin-left: 2px;
+}
+
+.bp-num__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 9px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-3, var(--ink-2));
+  font-size: 7px;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+}
+
+.bp-num__btn:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 2px;
+}
+
+/*
+ * ⚠️ **「被挤压的那条边」高亮**（2026-10-15 用户澄清）。
+ *
+ * 用户原话：「**动效应该加在被挤压的那条边上，不是加在元素上**」——
+ *   所以高亮画在**单元格的边框**（内阴影），而不是元素自己发光。
+ *
+ * ⚠️ **阴影值**由 `Canvas.tsx` 通过 CSS 变量 `--push-shadow` 传入（**四边可同时拼**，
+ *   斜着拖到角落时左右+上下一起亮）；
+ *   **动画放在这里** —— 因为 CSS 动画只能作用于样式表里的声明，inline 的 box-shadow 动不了。
+ * ⚠️ 用 `inset` 内阴影而**不是 `border`**：border 会改变盒模型尺寸，
+ *   而这个文件里所有几何（命中测试/手柄落点/列宽占比）都按 border-box 读 `getBoundingClientRect`。
+ */
+@keyframes bp-edge-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.bp-el-cell.is-push {
+  box-shadow: var(--push-shadow);
+  animation: bp-edge-pulse 0.7s ease-in-out infinite;
+}
+
+/*
+ * ⚠️ **「宽 × 高（mm）+ 锁比例」那一行**（2026-10-15 用户要求：尺寸区的第一行）。
+ *
+ * 布局：两个数值框夹一个锁按钮 —— 用 flex 等分，**中轴对齐**，
+ *   中间那个按钮**不参与伸缩**（`flex: none`），否则两个框宽会随内容跳。
+ * ⚠️ 按钮用 `onPointerDown preventDefault` 保焦点：点它不该让输入框失焦
+ *   （失焦会触发 commit，可能把用户刚输入到一半的值刷掉）。
+ */
+.bp-size-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.bp-size-row > .bp-num {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.bp-size-mm {
+  flex: none;
+  color: var(--ink-3, var(--ink-2));
+  font-size: var(--fs-xs, 11px);
+}
+
+.bp-lock {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--ink-3, var(--ink-2));
+  cursor: pointer;
+}
+
+.bp-lock:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ⚠️ 锁定态要**一眼可辨**：只换图标不够（🔒/🔓 在小尺寸下差别小），再加底色 */
+.bp-lock.is-on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/*
+ * ⚠️ **数字输入框：单位画在框外**（2026-10-15 用户要求）。
+ *
+ * 用户原话：「**左偏移、上偏移为什么两个的单位不一样，有点奇怪，建议把单位放在框外，
+ *   不然看不清输入框内的数字**」。
+ *
+ * 原来 suffix 在 `.bp-num`（**带边框的那个盒子**）内部 ⇒ 挤占输入区、数字被压窄看不清。
+ * ⇒ 外面包一层 `bp-num-wrap`：内层保持原样（边框/底色/焦点态都挂在 `.bp-num` 上，不动），
+ *   suffix 挂到外层右侧。
+ * ⚠️ 在 `Controls.tsx` 的 `Num` 组件内部改 ⇒ **几十个调用点一个字都不用动**。
+ */
+.bp-num-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* 内层吃满剩余宽度 ⇒ 输入区变宽（这正是"看得清数字"的来源） */
+.bp-num-wrap > .bp-num {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.bp-num-wrap > .bp-num__suffix {
+  flex: none;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+}
+
+/*
+ * ⚠️ **数字输入框"看不清数字"的修法**（2026-10-15 用户第二次反馈，附图：
+ *   `21.!` / `1!` —— 数字被右侧的上下箭头挡住了）。
+ *
+ * 根因：输入区 = 「数字 + 13px 的上下按钮」挤在**半栏宽**里（属性面板本来就是两列布局），
+ *   数值稍长就被截断。加 `suffix` 之后更挤。
+ *
+ * ⇒ **让上下按钮默认"不占宽度"**：只在**悬停或聚焦**时才出现 ——
+ *   平时输入区拿到全部宽度（数字看得清），要调数值时鼠标移上去按钮就回来。
+ * ⚠️ 用 `width: 0` + `overflow: hidden` 而不是 `opacity: 0`：
+ *   后者**仍然占位**，数字照样被挤。
+ * ⚠️ 不用 `display: none` 是留个动画（宽度过渡），视觉上"推出来"更顺。
+ */
+.bp-num__spin {
+  width: 0;
+  overflow: hidden;
+  transition: width 0.12s ease;
+}
+
+.bp-num:hover .bp-num__spin,
+.bp-num:focus-within .bp-num__spin {
+  width: 11px;
+}
+
+/* 按钮本身也收窄一点（13 → 11），给数字再让一点空间 */
+.bp-num__btn {
+  width: 11px;
+}
+
+/* 输入框：数字不要被省略号吃掉（宁可贴边也不要 "21…"） */
+.bp-num__input {
+  text-overflow: clip;
+}
+
+/* 两列布局里每格本来就窄 ⇒ 内边距再收紧一点 */
+.bp-grid2 .bp-num {
+  padding: 0 4px;
+}
+
+/*
+ * ⚠️ **格内元素：内容在元素框里"垂直居中"**（2026-10-15 用户报）。
+ *
+ * 用户原话：「**二维码、条形码、图片、附件的选区比选区内的文字大一圈，特别是下半幅**……
+ *   单元格内外的**显示差别还特别大**，重新优化」（附图：格内文字挤在上半部、下半部空白；
+ *   而顶层的同一元素是**居中**的）。
+ *
+ * 根因：`.bp-el-cell__child` 是 `display: block` ⇒ 内容**顶部对齐**；
+ *   而"元素框"（holder）的高来自 `h`（mm），往往比占位内容高 ⇒ 下半部空一大截。
+ *   ⇒ 与顶层元素"内容居中"的表现**不一致**，用户一眼就看出"内外差别大"。
+ *
+ * ⚠️ 用 flex **纵向居中**（`justify-content: center` 管主轴、这里是纵向）；
+ *   **不加 `align-items: center`** —— 那会让图片/二维码失去 `width:100%` 的"撑满"行为，
+ *   横向必须保持撑满（尺寸由「占格宽」控制）。
+ * ⚠️ 只影响**格内**（顶层有自己的一套，已经居中）。
+ */
+.bp-el-cell__child {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  height: 100%;
+}
+
+/*
+ * ⚠️ **禁用的数字框**（2026-10-15）：如"原图"模式下的「尺寸」——
+ *   那时尺寸由图片本身决定，这个框不参与渲染，必须**明确禁用**，
+ *   否则用户会以为"改了没反应"（留一个能改但无效的输入框是最坏的做法）。
+ */
+.bp-num-wrap.is-disabled {
+  opacity: 0.55;
+}
+
+.bp-num-wrap.is-disabled .bp-num {
+  cursor: not-allowed;
+}
+
+.bp-num-wrap.is-disabled .bp-num__input,
+.bp-num-wrap.is-disabled .bp-num__spin {
+  pointer-events: none;
+}
+
+/*
+ * ⚠️ **定位辅助线**（2026-10-16 用户要求："拖动时有定位辅助线" + "要有一定的吸附作用"）。
+ *
+ * 拖动格内元素、接近"内容区左沿 / 水平中线 / 右沿"（或 上沿 / 垂直中线 / 下沿）时：
+ * 元素**吸附过去**，同时在格子里画一条线标出对齐到了哪条参考线。
+ *
+ * ⚠️⚠️ **画风必须与画布的智能对齐线一致**（用户 2026-10-16 要求："蓝色虚线"）——
+ *   对齐的是  里  /  那一套：
+ *     · 颜色：（**蓝**）—— 不用橙色（那是"警告"的语义，且画布上没用过）
+ *     · 线宽： —— **反向缩放**，纸张缩到 50% 时屏幕上仍是 1px
+ *       （⚠️ 之前我写死  ⇒ **缩放后变粗**，这就是用户说的"横竖粗细不统一"的来源）
+ *     · 虚实：**虚线**（，4px 实 / 4px 空，与  同参数）
+ *
+ * ⚠️  是必须的 —— 线压在子元素上，
+ *   不关掉指针事件会把"按下拖动"和"右键菜单"全挡掉。
+ * ⚠️ ：与  同层（压在格内子元素  之上）。
+ * ⚠️ 用  让"线"正好压在参考线上（而不是偏半个线宽）。
+ */
+.bp-snap-line {
+  position: absolute;
+  pointer-events: none;
+  z-index: 6;
+}
+
+/* 竖线（横向参考）：宽度取反缩放值；虚线方向从上到下 */
+.bp-snap-line--v {
+  top: 0;
+  bottom: 0;
+  width: calc(1px * var(--bp-inv, 1));
+  transform: translateX(-50%);
+  background: repeating-linear-gradient(
+    to bottom,
+    var(--accent) 0,
+    var(--accent) calc(4px * var(--bp-inv, 1)),
+    transparent calc(4px * var(--bp-inv, 1)),
+    transparent calc(8px * var(--bp-inv, 1))
+  );
+}
+
+/* 横线（纵向参考）：高度取同一个值 —— **与竖线逐字对称**（这正是"粗细统一"的保证） */
+.bp-snap-line--h {
+  left: 0;
+  right: 0;
+  height: calc(1px * var(--bp-inv, 1));
+  transform: translateY(-50%);
+  background: repeating-linear-gradient(
+    to right,
+    var(--accent) 0,
+    var(--accent) calc(4px * var(--bp-inv, 1)),
+    transparent calc(4px * var(--bp-inv, 1)),
+    transparent calc(8px * var(--bp-inv, 1))
+  );
+}
+
+/*
+ * ⚠️ **字段块的"朴素外观"**（2026-10-16 用户要求：
+ *   「保持原来的样式，**不要那个绿色边框**，还是和原来的**蓝色胶囊**一样，可以自由拖动就行」）。
+ *
+ * 背景：字段块当"块级子元素"是**为了能绝对定位**（格内只有块级才能自由拖动），
+ *   但"块级子元素"会被套上通用外观（**绿色描边 + 右上角类型角标**）——
+ *   而它在"行内节点"时代是没有这些的（只有一颗蓝色胶囊）。
+ *
+ * ⇒ 这两条**只对字段块**生效，其它格内元素（图片/附件/码/线/文本）保持原样。
+ * ⚠️ **不动选中态**（is-selected）—— 选中时仍要有蓝框（否则用户不知道自己选中了）。
+ * ⚠️ 用 outline 而不用 border：border 会改变盒模型尺寸（这个文件里所有几何都读 border-box）。
+ */
+.bp-el-cell__child.is-plain {
+  outline: none;
+}
+
+/* 右上角那个"字段块「文本」"的角标也去掉（行内时代没有它） */
+.bp-el-cell__child.is-plain::after {
+  display: none;
+}
+
+/*
+ * ⚠️ **字段块被选中时，胶囊边框加粗**（2026-10-16 用户报：
+ *   「原来的“文本”字段**被选中后，蓝色边框会加粗**；当前被选中后**没有任何效果**，
+ *     导致不好确认是否已经被选中」）。
+ *
+ * 背景：字段块当“块级子元素”之后，选中态落在**外层** .bp-el-cell__child.is-selected，
+ *   而它给的是“外框蓝线”—— 但字段块已经用 is-plain 把外框去掉了（用户要求“不要绿框”）
+ *   ⇒ **选中就看不出来了**。
+ *
+ * ⇒ 让**内层的胶囊**来表达“被选中”：边框加粗 1px（1 → 2）。
+ * ⚠️ 加的是 border-width 而不是 outline：胶囊本来就有 1px 边框，
+ *   改宽度**视觉上就是“加粗”**（与用户说的“原来的效果”一致）；
+ *   用 outline 会在外面再套一圈、看着像“双层边”。
+ * ⚠️ 配 box-sizing: border-box，保证加粗不把元素撑大。
+ */
+.bp-el-cell__child.is-selected .bp-chip {
+  border-width: 2px;
+}
+
+.bp-el-cell__child.is-selected .bp-el-text {
+  box-sizing: border-box;
+}
+
+
+/*
+ * ⚠️ **节点面板顶部：字段选择器**（2026-10-17 用户要求：
+ *   「顶部元素名称；与附件不同的是，**普通字段的顶部名称可以下拉更换**」+ 「更紧凑」）。
+ *
+ * 原来这里是"这一处的样式"标题 + 三段说明（5 行），压成一行：
+ *   左边 = 可点击的字段选择器，右边 = 一个灰色小字"只影响这一处"。
+ * ⚠️ 选择器要 `flex:1 + min-width:0`，否则长字段名会把右边的提示挤出去。
+ */
+.bp-panel__title--picker {
+  padding: calc(2px * var(--bp-inv, 1)) 0 calc(6px * var(--bp-inv, 1));
+}
+
+.bp-nodepick {
+  display: flex;
+  align-items: center;
+  gap: calc(8px * var(--bp-inv, 1));
+  width: 100%;
+}
+
+.bp-nodepick > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.bp-nodepick__hint {
+  flex: none;
+  font-size: clamp(10px, calc(11px * var(--bp-inv, 1)), 11px);
+  color: var(--pp-ink-mute);
+  white-space: nowrap;
+}
+
+/*
+ * ⚠️ **节标题右侧的操作区**（2026-10-17 用户要求："插入字段改成右上角 + 图标"）。
+ *
+ * `.bp-sec` 原来是普通块级；这里改成 `flex` 是为了让"标题按钮"占满剩余宽度、
+ * **操作按钮贴右边** —— 不改成 flex 的话，action 会掉到标题下面一行。
+ * ⚠️ `.bp-sec__head` 要 `flex:1; min-width:0`（否则长标题会把 action 挤出去）。
+ */
+.bp-sec {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: calc(4px * var(--bp-inv, 1));
+}
+
+.bp-sec > .bp-sec__head {
+  flex: 1;
+  min-width: 0;
+}
+
+.bp-sec__action {
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+
+.bp-sec__action > button {
+  width: calc(20px * var(--bp-inv, 1));
+  height: calc(20px * var(--bp-inv, 1));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.bp-sec__action > button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ⚠️ 节内容区要独占一整行（flex-wrap 之后它会掉到下一行） */
+.bp-sec > .bp-sec__body {
+  flex-basis: 100%;
+}
+
+/*
+ * ⚠️ **已插入字段：可拖动排序**（2026-10-17 用户要求："按住拖动顺序"）。
+ *
+ * `grab` / `grabbing` 是"可拖"的通用语汇 —— 不给光标的话用户不知道这行能拖。
+ * ⚠️ 拖动中的半透明由 `:active` 表达（原生 DnD 没有"拖动中"的伪类）。
+ */
+.bp-fieldref[draggable="true"] {
+  cursor: grab;
+}
+
+.bp-fieldref[draggable="true"]:active {
+  cursor: grabbing;
+  opacity: 0.6;
+}
+
+/*
+ * ⚠️ **"已插入的字段"标题行 + 右侧 `+`**（2026-10-17 用户要求：把 + 放在这行后面）。
+ * ⚠️ `margin-left:auto` 让 `+` 贴右；`align-items:center` 让按钮与灰字垂直居中。
+ */
+.bp-fieldlist__head {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--bp-inv, 1));
+}
+
+.bp-fieldlist__head > .bp-hint {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+
+.bp-fieldlist__add {
+  flex: none;
+  width: calc(20px * var(--bp-inv, 1));
+  height: calc(20px * var(--bp-inv, 1));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.bp-fieldlist__add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/*
+ * ⚠️ **拖动把手**（2026-10-17 用户要求："字段前面加个类似 = 的图标"）。
+ * ⚠️ `color` 要淡一点：它是"提示"不是"内容"，不该跟字段名抢注意力。
+ * ⚠️ `cursor: grab` 也加在把手上（整行也是 grab，但用户常按在图示上）。
+ */
+.bp-fieldref__grip {
+  flex: none;
+  width: calc(12px * var(--bp-inv, 1));
+  text-align: center;
+  color: var(--text-3);
+  font-size: calc(11px * var(--bp-inv, 1));
+  line-height: 1;
+  cursor: grab;
+  user-select: none;
+  letter-spacing: -1px;
+}
+
+/*
+ * ⚠️ **拖动中的两种态**（2026-10-17 用户要求："让用户直观看到预落点"）。
+ *
+ * · `is-dragging`：被按住的那行 —— **半透明 + 虚线框**（"它正在被搬走"）；
+ * · `is-over`    ：拖动经过的那行 —— **上边缘 2px 蓝线**（"松手会插在它上面"）。
+ *   ⚠️ 用 `box-shadow: inset` 而不是 `border-top`：border 会改变盒高，
+ *     列表在拖动时会"跳一下"（这个文件里所有尺寸口径都按 border-box 读，别破这规矩）。
+ *   ⚠️ 加 `transition` 让颜色/透明度的变化**有过渡**（用户明确要"动效"）。
+ */
+.bp-fieldref {
+  transition: box-shadow 120ms ease, opacity 120ms ease;
+}
+
+.bp-fieldref.is-dragging {
+  opacity: 0.45;
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+}
+
+.bp-fieldref.is-over {
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+
+/*
+ * ⚠️ **紧凑版两列**（2026-10-17 用户要求："把两个功能的间距稍微缩短一些"）。
+ *
+ * `bp-grid2` 默认 `gap: var(--sp-2)`（8px）；两列里放"标签 + 开关"时，
+ *   8px 加两边内边距就吃掉了一个汉字的宽度 ⇒ 「自适应宽高」被挤到折行。
+ * ⚠️ 只收紧"列间距"，**不动 `Field` 内部间距** —— 那是全局节奏，改它会波及所有面板。
+ */
+.bp-grid2--tight {
+  gap: calc(4px * var(--bp-inv, 1));
+}
+
+/*
+ * ⚠️ **紧凑两列里，标签不折行**（2026-10-17 用户报："整体向左靠了，但**还是换行**"）。
+ *
+ * 背景：`.bp-field__label` 全局**允许换行**（那是刻意的 —— 注释里写着"标签永远不省略号"，
+ *   宁可折行也不截断，避免用户看不到完整功能名）。
+ *   但在 `bp-grid2--tight`（两列各半行）里，"自适应宽高"差一点点就折行 ⇒ 显示成"自适应宽 / 高"。
+ *
+ * ⇒ 只在**紧凑两列**里禁止折行：这里是"开关"这种短标签，折行比拥挤更难读。
+ * ⚠️ `min-width: 0` 让标签在极窄时**先被压缩**（配合 `overflow: hidden`），
+ *   而不是把开关挤出行外 —— 宁可标签略窄，也别让整行崩掉。
+ * ⚠️ 不改全局 `.bp-field__label`：整表面板那些长标签（"表头每页重复"…）就靠折行才不截断。
+ */
+.bp-grid2--tight .bp-field--inline > .bp-field__label {
+  /* ⚠️ **只禁止折行，不裁字**（2026-10-17 用户报："字都被震荡了" —— 那是 overflow:hidden 干的） */
+  white-space: nowrap;
+}
+
+/*
+ * ⚠️ **开关顶到这一列的右边界**（2026-10-17 用户要求：
+ *   「右侧不是还有很大的空间吗，把**自适应宽高后面的按钮顶着右边**放不可以吗」）。
+ * ⚠️ 两列是 `1fr 1fr`（等宽），`Field` 撑满整列后 `justify-content: space-between`
+ *   才会真的把开关推到列尾 —— 之前两列不等宽，开关就"停在中间"。
+ */
+.bp-grid2--tight > .bp-field--inline > .bp-field__switch,
+.bp-grid2--tight > .bp-field--inline > :last-child {
+  margin-left: auto;
+}
+
+/*
+ * ⚠️ **检查页：分组标题下的一句解释**（2026-10-17 用户困惑："字段块明明来自多维表格"）。
+ * ⚠️ 灰、小、不加粗 —— 它是"补充说明"，不该盖过列表本身。
+ */
+.bp-panel__note {
+  display: block;
+  margin: calc(2px * var(--bp-inv, 1)) 0 calc(6px * var(--bp-inv, 1));
+  font-size: clamp(10px, calc(11px * var(--bp-inv, 1)), 11px);
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+/*
+ * ⚠️ **检查页：按类别分组的折叠头**（2026-10-17 用户要求：参考"字段"页）。
+ *
+ * 与 `Palette` 的 `.bp-group` **刻意不同**：那一层是"最外层分组"（字号大、有分隔线），
+ * 这里是**嵌在"模板用到的字段"里面的二级分组**，所以更轻（字号与正文同级、无分隔线）。
+ * ⚠️ 不给它加 `border-bottom`：会和大分组的分隔线叠成双线。
+ */
+.bp-insp-kind {
+  display: flex;
+  flex-direction: column;
+}
+
+.bp-insp-kind__head {
+  display: flex;
+  align-items: center;
+  gap: calc(4px * var(--bp-inv, 1));
+  width: 100%;
+  padding: calc(3px * var(--bp-inv, 1)) 0;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: clamp(10px, calc(11px * var(--bp-inv, 1)), 11px);
+  text-align: left;
+  cursor: pointer;
+}
+
+.bp-insp-kind__head:hover {
+  color: var(--text-1);
+}
+
+/*
+ * ⚠️ **箭头方向必须与 `.bp-group__caret` 一致**（2026-10-17 用户报："收纳箭头的方向是不是反了"）：
+ *   · 收起 ⇒ `rotate(-90deg)`（**朝左**，和"未展开"的语义一致）；
+ *   · 展开 ⇒ `rotate(0deg)`（`IconCaret` 本身是**朝下**的 V）。
+ * ⚠️ 我第一版写成"默认不转（朝下）+ 展开时 rotate(90)（朝上）"——
+ *   于是**展开时箭头朝上**，和整个编辑器其它折叠处（`.bp-group` / `.bp-sec`）正好相反 ✅
+ */
+.bp-insp-kind__caret {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-3);
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+
+.bp-insp-kind__caret.is-open {
+  transform: rotate(0deg);
+}
+
+.bp-insp-kind__name {
+  flex: 1;
+  min-width: 0;
+}
+
+.bp-insp-kind__body {
+  display: flex;
+  flex-direction: column;
+  /* ⚠️ 左侧缩进 = caret 宽度 + gap，让"字段名"与"类别名"错开一档，层级一眼可读 */
+  padding-left: calc(15px * var(--bp-inv, 1));
+}
+
+/*
+ * ⚠️ **检查页的"手打文字 N 字"**（2026-10-17）。
+ * ⚠️ 上边加一条虚线分隔：它和上面的"字段不能在这里删"是两件事（一个是说明、一个是统计）。
+ */
+.bp-panel__foot--stat {
+  margin-top: calc(6px * var(--bp-inv, 1));
+  padding-top: calc(6px * var(--bp-inv, 1));
+  border-top: 1px dashed var(--line);
+}
+
+/*
+ * ⚠️ **检查页"按元素种类"的统计行**（2026-10-17）。
+ *
+ * 一行多个"种类 N"的胶囊，自动换行 —— 种类数不定（最少 1 个、最多 8 个），
+ * 用 flex-wrap 最稳；不用 grid（列数没法定）。
+ * ⚠️ 数字用 <b> 加粗：用户扫一眼要看的是"几个"。
+ */
+/*",
+ * ⚠️ **一个元素一行 + 灰底卡片**（2026-10-17 用户要求：
+ *   「顶部的这些内容排版都乱了，**一个元素一行**……界面上美观一些，可以参考其他两页的样式，**有个灰色的底色**」）。
+ *
+ * ⚠️ 原来是 `flex-wrap: wrap` —— 统计项长度不一（"表格"和"字符数"差三倍宽），
+ *   换行后**两边的空隙对不齐**，看着就是"乱" ✅
+ * ⚠️ 改成**纵向列表**：每行左名称右数字，行间用极淡的分隔线，整体一层浅灰底。
+ */
+.bp-insp-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: calc(4px * var(--bp-inv, 1)) 0 calc(6px * var(--bp-inv, 1));
+  padding: calc(2px * var(--bp-inv, 1)) calc(8px * var(--bp-inv, 1));
+  border-radius: var(--r-sm);
+  background: var(--pp-surface-2);
+}
+
+.bp-insp-stat__item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: calc(8px * var(--bp-inv, 1));
+  padding: calc(3px * var(--bp-inv, 1)) 0;
+  font-size: clamp(10px, calc(11px * var(--bp-inv, 1)), 11px);
+  color: var(--text-2);
+}
+
+/* ⚠️ 行间极淡的分隔线（最后一行不要） */
+.bp-insp-stat__item + .bp-insp-stat__item {
+  border-top: 1px solid var(--line);
+}
+
+.bp-insp-stat__item > b {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+/*
+ * ⚠️ **检查页复用 `bp-chip-item` 的两个修饰**（2026-10-17 用户要求："直接引用字段页的风格"）。
+ *
+ * ⚠️ 基础 `.bp-chip-item` 是 `cursor: grab`（它是"可拖到画布"的调色板项）——
+ *   检查页里这些**不可拖**，必须改回默认光标，否则用户会以为能拖走。
+ * ⚠️ `--stat` 是"只读统计条"：左名称右数字，hover 不描边（点了也没动作）。
+ */
+.bp-chip-item--stat {
+  cursor: default;
+  justify-content: space-between;
+  gap: calc(8px * var(--bp-inv, 1));
+}
+
+.bp-chip-item--stat:hover {
+  border-color: transparent;
+  background: var(--surface-2);
+}
+
+.bp-chip-item__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bp-chip-item__num {
+  flex: none;
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+/*
+ * ⚠️ **检查页里的"二级分组"**：类别（文本/日期…）嵌在"模板用到的字段"这个大分组里。
+ *   比顶层 `.bp-group` 轻一档：左侧缩进 + 更小的字号，形成两层。
+ */
+.bp-group--sub {
+  padding-left: calc(10px * var(--bp-inv, 1));
+}
+
+.bp-group--sub > .bp-group__head {
+  font-size: clamp(10px, calc(11px * var(--bp-inv, 1)), 11px);
+}
+
+/*
+ * ⚠️ **单元格内部的"子表格"**（2026-10-17 用户选 A：真嵌套）。
+ *
+ * 语义：一格被"拆分"后，格子里放一张**真 `<table>`** —— 外围表格的行列不变，
+ *   所以"表格整体大小不变"、其它格子也不受影响。
+ * ⚠️ `table-layout: fixed` + `<colgroup>` ⇒ 与顶层同一套列宽语义（不靠内容撑）。
+ * ⚠️ 边框只画**内侧**（`+` 相邻格），外沿由宿主 `<td>` 的边框负责 —— 避免双线。
+ * ⚠️ `border-collapse: collapse` 与顶层一致。
+ */
+.bp-cell-subtable {
+  width: 100%;
+  height: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.bp-cell-subtable__td {
+  padding: 1px 2px;
+  border: 1px solid var(--line);
+  vertical-align: top;
+  overflow: hidden;
+  font-size: 0.95em;
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+/* ⚠️ 第一行/第一列**不画外侧线**（外沿是宿主 td 的边框，重复画会变双线） */
+.bp-cell-subtable tr:first-child > .bp-cell-subtable__td {
+  border-top: none;
+}
+
+.bp-cell-subtable tr > .bp-cell-subtable__td:first-child {
+  border-left: none;
+}
+
+.bp-cell-subtable tr:last-child > .bp-cell-subtable__td {
+  border-bottom: none;
+}
+
+.bp-cell-subtable tr > .bp-cell-subtable__td:last-child {
+  border-right: none;
 }

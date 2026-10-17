@@ -42,6 +42,7 @@ import {
   BOLD_FONT_WEIGHT,
   DEFAULT_TABLE_BORDER_PT,
   DEFAULT_TABLE_LINE,
+  GRID_STEPS_MM,
 } from '../../lib/types'
 import { fieldMeta } from '../../lib/field-types'
 import type { FieldMeta } from '../../lib/data-source'
@@ -81,6 +82,7 @@ import {
   MIN_ROW_MM,
   colEdgeFrac,
   scaleColWidths,
+  scaleRowHeights,
   setColWidthPatch,
   setRowHeightPatch,
 } from './table-actions'
@@ -94,12 +96,14 @@ import { CellRangeBar, type RangeOp } from './CellRangeBar'
 import { TableSizePanel } from './TableSizePanel'
 // 「拆分单元格」的输入弹层（第 7 条）：本组件只负责开/关与把动作层的拒绝原因透给它
 import { SplitCellDialog } from './SplitCellDialog'
+import { CellSizeDialog } from './CellSizeDialog'
 import {
   MAX_CELL_CHILDREN,
   canSplitCell,
   expandRangeToWholeCells,
   isFirstColHeaderStyled,
   isHeaderCellAt,
+  mergeRangeBlockReason,
   normalizeRange,
   rangeArea,
   resolveCellEdges,
@@ -118,15 +122,30 @@ import { ContextMenu, type CtxItem } from './ContextMenu'
 import { applySplitCell } from './table-actions'
 import type { AlignMode } from './useEditorState'
 // 格内子元素：复合 id（点击要选它自己）、百分比宽 / 固定高（渲染要认这两个口径）
-import { cellChildId, childHeightMm, childWidthPct, parseCellChildId } from './cell-child'
+import { SCALABLE_CELL_KINDS, cellChildId, childHeightMm, childWidthPct, parseCellChildId } from './cell-child'
 /* 格内盒高的口径（`h:'auto'` 也走默认高）—— 与打印端共用同一份实现，见它的注释 */
-import { childBoxHeightMm } from '../../lib/cell-geometry'
+import {
+  childBoxAlign,
+  childBoxLeftPct,
+  childBoxHeightMm,
+  childBoxSpanMm,
+  childOffsetXPct,
+  childOffsetYMm,
+  effectiveChildYMm,
+  isChildPositioned,
+  MIN_CELL_CHILD_PCT,
+} from '../../lib/cell-geometry'
+import { cellWidthMm } from './table-actions'
 
 /**
  * 1pt = 1/72 inch → CSS px
  */
-/** 空白右键菜单里的网格间距档位（mm） */
-const GRID_STEPS = [2, 5, 10, 20]
+/*
+ * ⚠️ **网格间距档位不再单独定义**（2026-10-17 用户报"两套逻辑"）：
+ *   原来这里是 `[2,5,10,20]`，而右侧页面属性用的是 `GRID_STEPS_MM`（`[1,2,2.5,5,10]`）
+ *   ⇒ 同一个"网格间距"在右键菜单里**少了 1mm / 2.5mm**，看着像两个功能 ✅
+ * ⇒ 统一取 `GRID_STEPS_MM`（全项目唯一来源）。
+ */
 
 /** 页边距预设（四边同值）—— 真机反馈要求右键里能直接调页边距 */
 const MARGIN_PRESETS: { name: string; mm: number }[] = [
@@ -266,6 +285,12 @@ export interface CanvasHandle {
   resolveDrop(clientX: number, clientY: number, probe: DropProbe): DropVerdict
   /** 把某元素滚动到可视区（检查条点击定位用） */
   scrollToElement(id: string): void
+  /**
+   * ⚠️ **打开"行高 / 列宽"对话框**（2026-10-17 用户要求：单元格面板里也要能设）。
+   *   ⚠️ **不重复造轮子**：对话框本来就在 `Canvas` 里（右键菜单那条路），
+   *   这里只是"多开一扇门" —— 面板按钮 → 这个 handle → 同一个 `sizeAsk`。
+   */
+  askCellSize(tableId: string, cellId: string, kind: 'row' | 'col'): void
 }
 
 /**
@@ -314,11 +339,52 @@ export interface CanvasContextActions {
    * `at` 给了就落在指定的版心坐标（**拖出来**那条路用它），
    * 不给就落在表格右侧（右键菜单那条路用它）。
    */
-  takeOutChild(tableId: string, cellId: string, at?: { xMm: number; yMm: number }): void
+  /**
+   * **把格内子元素取出到自由层**。
+   * ⚠️ `childId` 可选（2026-10-16）：一格多个时**必须传**，否则取到的"倒数第一个"
+   *   可能不是你抓的那个。不传 ⇒ 退回老行为（行为逐字不变）。
+   */
+  takeOutChild(
+    tableId: string,
+    cellId: string,
+    at?: { xMm: number; yMm: number },
+    childId?: string,
+  ): void
+  /**
+   * **格内子元素在格子里的偏移**（2026-10-13）：横向占格宽百分比、纵向 mm。
+   * ⚠️ 一旦调用，该子元素就从"流式"变成"绝对定位"（见 `types.ts` 的 `cellPos` 注释）。
+   */
+  /**
+   * ⚠️ **`childId`：改"哪一个"子元素**（2026-10-16 放宽 `MAX_CELL_CHILDREN` 后新增）。
+   *   不传 ⇒ 退回"第 0 个"（老调用点行为不变）。
+   */
+  patchCellChild(
+    tableId: string,
+    cellId: string,
+    patch: Partial<AnyElement>,
+    mergeKey?: string,
+    childId?: string,
+  ): void
   /** 只删掉格子里的子元素（保留格子里的文字） */
-  removeChild(tableId: string, cellId: string): void
+  /** ⚠️ `childId` 可选：不传 ⇒ 删"最后一个"（老调用点行为不变）；一格多个时**必须传** */
+  removeChild(tableId: string, cellId: string, childId?: string): void
+  /**
+   * **清空这一格的所有子元素**（2026-10-16 用户要求 —— 右键格空白处的「移除格内元素」）。
+   * ⚠️ 与 `removeChild`（删一个、要把元素交还画布）分开：这里是**纯删除**。
+   */
+  clearChildren(tableId: string, cellId: string): void
   /** 把子元素从一格**挪到另一格**（拖到别的格子上松开） */
-  moveChildToCell(fromTableId: string, fromCellId: string, toTableId: string, toCellId: string): void
+  /**
+   * **把格内子元素换到另一格**。
+   * ⚠️ `childId` 可选（2026-10-16）：一格多个时必须传（同 `takeOutChild`）。
+   */
+  moveChildToCell(
+    fromTableId: string,
+    fromCellId: string,
+    toTableId: string,
+    toCellId: string,
+    childId?: string,
+  ): void
   /** 拆分单元格（无丢失风险，直接改数据） */
   splitCell(tableId: string, cellId: string): void
   /** 设为/取消表头行（整行样式 + 打印时跨页重复） */
@@ -328,7 +394,11 @@ export interface CanvasContextActions {
 /** 右键命中的三种对象 —— 菜单项按它分岔，这就是用户要的"依据元素类型智能弹出" */
 type CtxTarget =
   /** 格内子元素（真机反馈第 3 条）：它住在格子里，不是画布上的自由元素 */
-  | { kind: 'child'; tableId: string; cellId: string }
+  /**
+   * ⚠️ **`childId`：右键点的到底是哪一个子元素**（2026-10-16 放宽 `MAX_CELL_CHILDREN` 后新增）。
+   *   一格多个时，没有它就只能"删最后一个" —— 会删错。
+   */
+  | { kind: 'child'; tableId: string; cellId: string; childId: string }
   | { kind: 'blank'; band: BandKey; xMm: number; yMm: number }
   | { kind: 'element'; id: string; band: BandKey }
   | { kind: 'cell'; tableId: string; cellId: string }
@@ -455,6 +525,8 @@ function textCss(el: AnyElement): CSSProperties {
     fontWeight: s?.bold ? BOLD_FONT_WEIGHT : 400,
     fontStyle: s?.italic ? 'italic' : 'normal',
     textDecoration: deco || 'none',
+    /* 下划虚线（`underline: true` + `underlineStyle: 'dashed'`）—— 用来拼填空线 */
+    ...(s?.underline && s?.underlineStyle === 'dashed' ? { textDecorationStyle: 'dashed' as const } : null),
     color: s?.color || DEFAULT_TEXT_STYLE.color,
     background: s?.background || undefined,
     textAlign: s?.align ?? DEFAULT_TEXT_STYLE.align,
@@ -481,9 +553,15 @@ function nodeCss(s?: TextStyle): CSSProperties | undefined {
   if (typeof s.fontSizePt === 'number' && Number.isFinite(s.fontSizePt)) out.fontSize = ptToPx(s.fontSizePt)
   if (s.bold !== undefined) out.fontWeight = s.bold ? BOLD_FONT_WEIGHT : 400
   if (s.italic !== undefined) out.fontStyle = s.italic ? 'italic' : 'normal'
+  /*
+   * ⚠️ 进入条件是 `underline` / `strike` **本身**设过，不能把 `underlineStyle` 也算进来：
+   *   只设线型、没设 `underline` 时算出的是 `textDecoration: 'none'`，
+   *   会把外层（单元格/元素）已经开着的下划线**抵消掉**。
+   */
   if (s.underline !== undefined || s.strike !== undefined) {
     out.textDecoration =
       [s.underline ? 'underline' : '', s.strike ? 'line-through' : ''].filter(Boolean).join(' ') || 'none'
+    if (s.underline && s.underlineStyle === 'dashed') out.textDecorationStyle = 'dashed'
   }
   if (s.color) out.color = s.color
   if (s.background) out.background = s.background
@@ -618,7 +696,64 @@ function pickableNode(n: InlineNode): boolean {
   return n.type === 'field' || n.type === 'sysvar'
 }
 
-function renderInline(nodes: InlineNode[], fields: FieldMeta[], keyPrefix: string, pick?: InlinePick): ReactNode[] {
+/**
+ * ⚠️ `outerColor`：**外层（单元格/元素）显式设的颜色**（2026-10-17）。
+ *   字段节点是个 `.bp-chip`，CSS 里写死 `color: var(--accent)`（蓝色胶囊）——
+ *   于是"外层改色"对字段**不生效**，而对手输文字生效（普通 span 会继承）⇒ 用户看到"只有文字变色"。
+ *   ⇒ 这里把外层色**以最高优先级的"兜底"写进内联 style**（节点自己设过颜色就不覆盖）。
+ */
+/**
+ * 行内 **inline-block**（字段胶囊 / 系统变量）的"继承装饰"。
+ *
+ * 为什么不能只靠父级的 `text-decoration`：CSS 的装饰**不会进入 atomic inline**
+ * （`inline-block`）内部 —— 父级画下划线时会在胶囊这一格**断开**。
+ * 于是"给一串文字加下划虚线做填空线、中间插一个字段"就会看到线断了一截，
+ * 字段看起来"没骑在虚线上"（2026-10-17 用户报：
+ *   「在经办人后面加入字段的话，不会出现在虚线上方」）。
+ * ⇒ 胶囊自己再画一遍；位置由同一 baseline 决定，与前后文字对齐。
+ */
+function chipDeco(
+  n: { style?: TextStyle },
+  outer?: { underline?: boolean; strike?: boolean; dashed?: boolean },
+): CSSProperties | undefined {
+  /* 节点自己设过装饰 ⇒ 以它为准（`nodeCss` 已经输出过了，这里不重复） */
+  if (n.style?.underline !== undefined || n.style?.strike !== undefined) return undefined
+  const u = outer?.underline === true
+  const st = outer?.strike === true
+  if (!u && !st) return undefined
+  return {
+    textDecoration: [u ? 'underline' : '', st ? 'line-through' : ''].filter(Boolean).join(' '),
+    ...(u && outer?.dashed ? { textDecorationStyle: 'dashed' as const } : null),
+  }
+}
+
+/** 从一份 `TextStyle` 取出 `renderInline`/`chipDeco` 要的装饰参数（三处调用共用） */
+function decoOf(s?: TextStyle): { underline?: boolean; strike?: boolean; dashed?: boolean } | undefined {
+  if (!s) return undefined
+  return {
+    underline: s.underline === true,
+    strike: s.strike === true,
+    dashed: s.underline === true && s.underlineStyle === 'dashed',
+  }
+}
+
+function renderInline(
+  nodes: InlineNode[],
+  fields: FieldMeta[],
+  keyPrefix: string,
+  pick?: InlinePick,
+  outerColor?: string,
+  /**
+   * ⚠️ **这一格的"自动换行"设置**（2026-10-17 用户要求：开关从字段挪到**单元格**）。
+   * `false` ⇒ 不换行 + 裁切。⚠️ 优先级：**单元格**（这是格子级语义）> 节点自己的 `wrap`。
+   */
+  cellWrap?: boolean,
+  /**
+   * 外层的装饰（下划线 / 删除线 + 线型）—— 只用于给 **inline-block 节点补画一遍**
+   * （父级的 `text-decoration` 进不去 atomic inline，见 `chipDeco` 的注释）。
+   */
+  outerDeco?: { underline?: boolean; strike?: boolean; dashed?: boolean },
+): ReactNode[] {
   const known = new Set(fields.map((f) => f.id))
   return nodes.map((n, i) => {
     const key = `${keyPrefix}_${i}`
@@ -659,8 +794,24 @@ function renderInline(nodes: InlineNode[], fields: FieldMeta[], keyPrefix: strin
       return (
         <span
           key={key}
-          className={`bp-chip${invalid ? ' bp-chip--missing' : ''}${selCls}`}
-          style={own}
+          /* ⚠️ 这一行是"蓝色胶囊"的全部来源（`bp-chip`）+ 选中态（`is-node-sel`）。
+             2026-10-17 回退"行内拖动"时，我的正则误删了它 ⇒ 元素变成纯黑字、没有选中效果。 */
+          /*
+           * ⚠️ `is-nowrap`：**关闭自动换行**时给（2026-10-17 用户要求）。
+           *   `wrap === false` ⇒ 不换行 + 省略号裁切；其余（含未设）⇒ 换行。
+           */
+          className={`bp-chip${invalid ? ' bp-chip--missing' : ''}${selCls}${(cellWrap === false || n.wrap === false) ? ' is-nowrap' : ''}`}
+          /*
+           * ⚠️ **外层色兜底**（2026-10-17）：`.bp-chip` 的 CSS 写死了 `color: var(--accent)`，
+           *   所以"在编辑框里整体改颜色"时字段不会跟着变（用户报的那个 bug）。
+           *   ⇒ 节点**自己没设颜色**时，把外层色写成内联 `color`（内联优先级高于类，能盖掉 accent）。
+           *   ⚠️ 自己设过就**尊重用户**（单字段改色的路径）。
+           */
+          style={{
+            ...own,
+            ...chipDeco(n, outerDeco),
+            ...(own?.color ? null : outerColor ? { color: outerColor } : null),
+          }}
           title={invalid ? `「${n.fieldName || '未绑定'}」已失效或未绑定字段，导出时会原样输出这段文字` : n.fieldName}
           {...nodeProps}
         >
@@ -671,7 +822,7 @@ function renderInline(nodes: InlineNode[], fields: FieldMeta[], keyPrefix: strin
       )
     }
     return (
-      <span key={key} className={`bp-chip bp-chip--sys${selCls}`} style={own} {...nodeProps}>
+      <span key={key} className={`bp-chip bp-chip--sys${selCls}`} style={{ ...own, ...chipDeco(n, outerDeco) }} {...nodeProps}>
         <span className="bp-chip__text">{SYSVAR_LABEL[n.key]}</span>
       </span>
     )
@@ -944,7 +1095,58 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   )
 
   /** 从格子里往外拖子元素时跟着指针的小浮标（规格 六）。视口坐标，与预览线同理 */
-  const [childGhost, setChildGhost] = useState<{ x: number; y: number; label: string } | null>(null)
+  /**
+   * 拖动格内元素时的**跟随显示**（2026-10-13 起支持"渲染元素本体"）。
+   *
+   * ⚠️ 原来只有 `{x, y, label}`（一个文字胶囊）。用户口径：
+   *   「元素**不能闪现出现**，而是拖动的时候**依然要跟手移动**，用户可以**实时看到元素的状态**，
+   *    如果是拖动到单元格外，元素的**样式应当在拖动过程中就变换**」。
+   * ⇒ 拖出格子的那一刻要把**元素本体**跟着鼠标画出来（用画布样式），
+   *   而不是等松手才让它"跳"到画布上。
+   *
+   * ⚠️ `child` 只在"已脱离格子"时给（未脱离时元素自己就在格子里跟手，不需要 ghost）。
+   */
+  const [childGhost, setChildGhost] = useState<{
+    x: number
+    y: number
+    label: string
+    /** 脱离格子时带上元素本体与它在画布上的尺寸（mm），供渲染 */
+    child?: AnyElement
+    wMm?: number
+    hMm?: number
+  } | null>(null)
+  /*
+   * ⚠️ **"顶到边界"的视觉反馈**（2026-10-15 用户要求："醒目地知道已经在蓄力了"）。
+   *
+   * 为什么需要：为了修"压线/脏数据"，`xPct`/`yMm` 都被夹死了 ⇒
+   *   顶到边界后元素**一动不动** ⇒ 用户看不到"我还在往外推"。
+   * ⇒ 这里只记一个**布尔状态**，渲染时给元素加 `is-pushing` 类（脉冲发光）。
+   *   **只影响观感、不碰数据** —— 数据那条线仍然严格夹紧。
+   */
+  const [childPush, setChildPush] = useState<{
+    cellId: string
+    l: boolean
+    r: boolean
+    t: boolean
+    b: boolean
+  } | null>(null)
+  /** ⚠️ 防抖：只在"顶到哪几条边"真的变化时才 setState（否则拖动每帧都 setState，会卡） */
+  const childPushRef = useRef('')
+  /*
+   * ⚠️ **定位辅助线**（2026-10-16 用户要求："拖动时有定位辅助线" + "要有一定的吸附作用"）。
+   *
+   * `lineX` / `lineY`：参考线的位置（**百分比 %** / **mm**），`null` = 这个方向没对齐到任何线。
+   * 画在 `<td>` 里（绝对定位 + 百分比）⇒ 随格子移动天然跟着走。
+   * ⚠️ **与 `childPush`（被挤压边高亮）分开** —— 语义不同
+   *   （一个"顶到边界"、一个"对齐到参考线"），合并会出现"两个都对但只显示一个"。
+   */
+  const [childSnap, setChildSnap] = useState<{
+    cellId: string
+    lineX: number | null
+    lineY: number | null
+  } | null>(null)
+  /** ⚠️ 防抖：只在"吸附目标"变化时才 setState（拖动每帧都 set 会卡） */
+  const childSnapRef = useRef('')
 
   useLayoutEffect(() => {
     /*
@@ -1424,7 +1626,17 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     node?.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' })
   }, [])
 
-  useImperativeHandle(ref, () => ({ hitTest, resolveDrop, scrollToElement }), [hitTest, resolveDrop, scrollToElement])
+  useImperativeHandle(
+    ref,
+    () => ({
+      hitTest,
+      resolveDrop,
+      scrollToElement,
+      /* ⚠️ 面板那条入口：打开同一个"行高/列宽"对话框（见 `sizeAsk`） */
+      askCellSize: (tableId, cellId, kind) => setSizeAsk({ tableId, cellId, kind }),
+    }),
+    [hitTest, resolveDrop, scrollToElement],
+  )
 
   // ---- 指针会话（拖动 / 缩放共用） ----
   const beginSession = useCallback(
@@ -1543,10 +1755,68 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
           const nd = Math.min(Math.max(geom.floorMm, snap(oDrawn + dy)), maxDrawnY)
           setPinnedId(nd <= geom.floorMm + 0.01 ? el.id : null)
           y = toModelY(nd)
-          h = drawnBottom - y
+          /*
+           * ⚠️⚠️ **必须用"画坐标的位移量"算高度**（2026-10-16 修，用户报：
+           *   「按住**左上和右上角**两个锚点，稍微拖动，**元素立刻放大、鼠标焦点跟丢**」）。
+           *
+           * 根因：`drawnBottom` 是**画坐标**（含 `geom.offsetMm` 的版式区偏移），
+           *   而 `y = toModelY(nd)` 已经把偏移减掉了 ——
+           *   ⇒ 原来的 `h = drawnBottom - y` 是"**画坐标 − 模型坐标**"，**多算了一个 `offsetMm`** ❌
+           *   ⇒ 顶部锚点（`n`）一拖，`h / oh` 立刻偏大 ⇒ **等比缩放的 `k` 虚高** ⇒ 元素爆大。
+           *   ⚠️ 这也解释了"**只有左上/右上角有问题**"—— 只有它们走 `n` 分支。
+           *
+           * ✅ 正确算法：**两个画坐标相减**（`nd - oDrawn` = 上边下移了多少）
+           *   ⇒ `h = oh − 下移量`，**全程同一坐标系**。
+           */
+          h = oh - (nd - oDrawn)
         } else if (dir.includes('s')) {
           /* 表头区里往下拉高也要夹住（否则底边越过循环区起点，等于又去推别人） */
           h = Math.min(snap(bottomEdge + dy) - oy, ceilMm - oy)
+        }
+
+        /*
+         * ⚠️⚠️ **四个"角落"锚点 = 等比缩放**（2026-10-16 用户要求：
+         *   「**格外的元素也按照格内元素的缩放逻辑** —— 上下左右四个点可以随意修改，
+         *     而拖动**四个角落点，应该是等比例缩放**」）。
+         *
+         * ⚠️ 与格内那套（`onChildResizeDown` 的 `isCorner` 分支）**同一套规则**：
+         *   ① **以"偏离起点更大"的那根轴为准** —— 往横向拉得狠就听横向、往纵向狠就听纵向，
+         *      否则会出现"我明明在往右拉，它却先动高度"的别扭手感；
+         *   ② **对角固定** —— 拖左边就推 `x`、拖上边就推 `y`（与上面 n/w 分支同一条纪律）。
+         * ⚠️ 顶层比格内**简单**：`w` / `h` 都是 **mm** ⇒ `ow / oh` 就是真实比例，不用折算；
+         *   格内那条要先把百分比的 `w` 换成 mm（分母 = 内容区宽）。
+         * ⚠️ `dir.length === 2` 就是角落（`nw` / `ne` / `sw` / `se`）—— 
+         *   四边锚点（`n`/`s`/`e`/`w`）**保持自由拉伸**，行为逐字不变。
+         */
+        const isCornerResize = dir.length === 2 && ow > 0 && oh > 0
+        if (isCornerResize) {
+          /*
+           * ⚠️⚠️ **用"相对起点的缩放因子"，不是"选一根轴"**（2026-10-16 修）。
+           *
+           * 我第一版写的是 `devW >= devH ? w : h * ratio` —— 那是**错的**：
+           *   元素的**当前宽高比**与"你拉出来的宽高比"不同时，另一根轴会**跳到按比例的值**
+           *   ⇒ 表现为"**元素突然放大、锚点脱离鼠标、不跟手**" ✅
+           *
+           * ✅ 正确写法（与 Figma 一致）：**从 1 倍开始连续变化**
+           *   `k = max(w / ow, h / oh)` ⇒ `w = ow * k`、`h = oh * k`
+           *   · **起点时 `k = 1`** ⇒ **绝不跳**；
+           *   · 取 `max` ⇒ 跟随"鼠标推得更远的那根轴" ⇒ **连续、单调** ⇒ **跟手**。
+           */
+          const kFromW = w / ow
+          const kFromH = h / oh
+          const kScale = Math.max(kFromW, kFromH)
+          w = ow * kScale
+          h = oh * kScale
+          /* 对角固定：拖左边 ⇒ 右边界不动；拖上边 ⇒ 下边界不动（与 n/w 分支同算法） */
+          if (dir.includes('w')) x = rightEdge - w
+          if (dir.includes('n')) {
+            /* ⚠️ **同样要同坐标系**（2026-10-16）：`h` / `oh` 都是**模型 mm**，
+               所以用 `oDrawn + (oh − h)` 得到新的上边（**画坐标**）；
+               写 `drawnBottom − h` 是"画 − 模型"，会多算一个 `geom.offsetMm`。 */
+            const nd = Math.min(Math.max(geom.floorMm, oDrawn + (oh - h)), maxDrawnY)
+            setPinnedId(nd <= geom.floorMm + 0.01 ? el.id : null)
+            y = toModelY(nd)
+          }
         }
 
         const MIN = 4
@@ -1608,6 +1878,17 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
          */
         const touchesVerticalEdge =
           mode === 'resize' && !!edge && (edge.includes('n') || edge.includes('s'))
+        /*
+         * ⚠️ **"任意方向的缩放"**（2026-10-15 三模式重构）。
+         *
+         * 用户口径：「**用户如果拖动大小，那么自动归类到自由模式**……
+         *   ⚠️ 注意：**如果用户没有手动拖动图片的大小，仅仅是拖动了位置，那么就不会归类到自由中**」。
+         * ⇒ 判据 = **`mode === 'resize'`（缩放，不是移动）**，**方向不限** ——
+         *   原来只认上下边（`touchesVerticalEdge`），于是"只拖左右把手"不会归入自由模式，
+         *   用户会觉得"我把框拖窄了，但它还是按适配格渲染"。
+         * ⚠️ 与 `touchesVerticalEdge` 分开保留：后者只管"写不写 `h`"（纯横向拖动不该动高度）。
+         */
+        const touchesAnyEdge = mode === 'resize' && !!edge
         /**
          * 类型放宽到 `unknown`：这个 patch 里既有数字（x/y/w/h）、数组（列宽），
          * 也有**嵌套对象**（附件的 `config`，见下面"自动转固定宽高"）。
@@ -1631,7 +1912,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
          * 且只在**真的拖了上下边**时改 —— 纯横向拖动不该顺带改尺寸模式。
          */
         const autoFixedBox =
-          touchesVerticalEdge && el.kind === 'attach' && el.config.sizeMode !== 'fixedBox'
+          touchesAnyEdge && el.kind === 'attach' && el.config.sizeMode !== 'fixedBox'
         if (autoFixedBox) patch.config = { ...el.config, sizeMode: 'fixedBox' }
         /**
          * 表格：拖外框改宽度时**必须同步列宽**。
@@ -1645,6 +1926,22 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
          */
         if (el.kind === 'table' && Math.abs(round1(w) - finite(el.w, 0)) > 0.05) {
           Object.assign(patch, scaleColWidths(el as TableElement, round1(w)))
+        }
+        /*
+         * ⚠️⚠️ **高度那半**（2026-10-14 补）——宽边有 `scaleColWidths`，高边一直是空的：
+         *   用户实测：「**点击表格的上下锚点拖动大小，只会改变表格外侧的蓝框大小，
+         *   表格高度一点没变，只是蓝色选取框变大了**」（左右锚点正常）。
+         *   根因：默认 `row.heightMm` 为空 ⇒ 行高**由内容撑** ⇒ 表格高完全不受 `el.h` 影响。
+         * ⇒ 与宽边**完全对称**地做一次：按比例缩放各行行高（全自适应时均分），
+         *   让 `Σ行高 === el.h` 这个不变量成立（首次拖高会把"自适应行"变成"显式行高"）。
+         * ⚠️ 条件是 `touchesVerticalEdge`（真的拖了上下边）—— 纯横向拖动不该顺带改行高。
+         */
+        /* ⚠️ `h` 是 `number | 'auto'` 且在闭包外可能被改写 ⇒ TS 的收窄会失效，先固化成局部常量 */
+        const hNum = typeof h === 'number' ? h : null
+        /* ⚠️ `el.h` 同样是 `number | 'auto'` —— `finite` 只收 number/null/undefined ⇒ 先归一 */
+        const elHNum = typeof el.h === 'number' ? el.h : 0
+        if (el.kind === 'table' && touchesVerticalEdge && hNum !== null && Math.abs(round1(hNum) - elHNum) > 0.05) {
+          Object.assign(patch, scaleRowHeights(el as TableElement, round1(hNum)))
         }
         onMerge(el.id, patch as unknown as Partial<AnyElement>, mergeKey)
       }
@@ -1702,7 +1999,29 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
    * 松手调一次 `onCommitEnd` 收成一步撤销。
    */
   const onBorderPointerDown = useCallback(
-    (e: ReactPointerEvent, el: TableElement, axis: 'col' | 'row', index: number) => {
+    (
+      e: ReactPointerEvent,
+      el: TableElement,
+      axis: 'col' | 'row',
+      index: number,
+      /**
+       * 拖的是**哪一侧**的边界：
+       *   · `'end'`（默认）= 这一列的**右**边界 / 这一行的**下**边界 —— 拖它，另一端（左/上）不动；
+       *   · `'start'`      = **表格的**左外框 / 上外框 —— 拖它改**第 1 列宽 / 第 1 行高**，
+       *                      但**右边界 / 下边界保持不动**（见下面 `originShift` 的注释）。
+       *
+       * ⚠️ 为什么要有 `'start'`（2026-10-13 用户反馈："表格的**第一行、第一列**无法用鼠标拖动缩放，
+       *    其他行、其他列倒是正常"）：
+       *    探针实测（`_probe-table-handles.mjs`）证明**内线是好的** ——
+       *    拖第 1 列右沿、第 1 行下沿都能改尺寸。用户拖不动的是**表格的左外框 / 上外框**，
+       *    因为那两条边上**压根没有手柄**（旧注释写着"故意不加"）。
+       *    ⚠️ 但旧注释的理由（"拖左外框到底算改列宽还是移动元素，一个手柄表达不了"）
+       *      **在本项目里其实可以表达**：列宽之和 = 元素总宽（E-45），
+       *      所以"改第 1 列宽 + 同步挪 x"的净效果就是**左边界动、右边界不动** ——
+       *      正是 Excel 里拖表格左边界的手感。这个语义是唯一的，不存在歧义。
+       */
+      side: 'start' | 'end' = 'end',
+    ) => {
       // 不冒泡：否则 .bp-el 的 pointerdown 会把这一下当成"拖整个元素"
       e.stopPropagation()
       e.preventDefault()
@@ -1717,6 +2036,14 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         .closest('.bp-tbl-size')
         ?.parentElement?.querySelector<HTMLElement>(`tr[data-row-index="${index}"]`)
       const startRowMm = finite(el.rows[index]?.heightMm, domTr ? domTr.offsetHeight / MM_TO_PX : 8)
+      /*
+       * ⚠️ 元素原点的**起始值**（`x` / `y`，mm）。
+       * `side === 'start'` 时要靠它反算"另一端不动"的原点位移 —— 见下面的 `originShift`。
+       * ⚠️ 取的是**按下那一刻**的值（不是 `el.x` 的实时值）：拖动过程中每帧都会 patch 文档，
+       *    用实时值会**增量累加**，快速拖动时会出现指数级的漂移。
+       */
+      const startXMm = finite(el.x)
+      const startYMm = finite(el.y)
       const mergeKey = `${axis}:${el.id}:${index}`
       let moved = false
 
@@ -1728,6 +2055,13 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         }
         const dMm = dPx * mmPerPx
         /*
+         * ⚠️ **两侧的"正方向"是相反的**：
+         *   · `end` 侧：往右/下拖 = 变大（`+dMm`）；
+         *   · `start` 侧：往左/上拖才是变大 ⇒ **取负**。
+         * 这样两条手柄的手感一致（"往外拉 = 变大"）。
+         */
+        const signed = side === 'start' ? -dMm : dMm
+        /*
          * 预览线 + 浮层：**每帧更新**（松手才写文档）。
          * 浮层里的像素值按 96dpi 的**打印像素**算（`mm × MM_TO_PX`）—— 那才是"这一行印出来多高"，
          * 而屏幕像素会随缩放变，拿它当读数会让人以为改一次大小值就变了。
@@ -1738,7 +2072,8 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
          *    判定函数只认 mm，与对齐线同一套纪律。
          * ⚠️ 邻居**排除自己**：不排除的话，拖动一开始就会「吸回自己原来的尺寸」，手感像拖不动。
          */
-        const rawMm = axis === 'col' ? startColMm + dMm : startRowMm + dMm
+        const baseMm = axis === 'col' ? startColMm : startRowMm
+        const rawMm = baseMm + signed
         const neighbors =
           axis === 'col'
             ? el.colWidthsMm.filter((_, i) => i !== index)
@@ -1747,22 +2082,60 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                 .map((r) => r.heightMm)
                 .filter((h): h is number => typeof h === 'number' && h > 0)
         const snappedMm = snapSizeToNeighbors(rawMm, neighbors, 6 * mmPerPx)
+        /*
+         * ⚠️ 行高掉到下限以下 ⇒ 换态成"自适应"（见函数头的说明）。
+         *    **但只允许 `end` 侧这么做**：从**上边框**往下拖到极矮时，
+         *    "这一行改由内容撑开"会让高度变成不可预测的值 ⇒ `originShift` 失去意义、表格会跳。
+         *    ⇒ `start` 侧一律钳到 MIN，不换态。
+         */
+        const toAuto = axis === 'row' && side === 'end' && snappedMm < MIN_ROW_MM
         const nextMm =
-          axis === 'col' ? Math.max(MIN_COL_MM, snappedMm) : Math.max(MIN_ROW_MM, snappedMm)
+          axis === 'col'
+            ? Math.max(MIN_COL_MM, snappedMm)
+            : Math.max(MIN_ROW_MM, snappedMm)
         setSizeGhost({
           axis,
           x: ev.clientX,
           y: ev.clientY,
           label: `${axis === 'col' ? '列宽' : '行高'} ${Math.round(nextMm * MM_TO_PX)}px`,
         })
+        /*
+         * ⚠️ **"另一端不动"的核心**：用**吸附/钳制之后**的 `nextMm` 反算实际增量，
+         *    再把这个增量**反向**加到元素原点上。
+         *
+         * 推导（以列为侧，`side='start'`）：列宽 `+Δ` ⇒ 总宽 `w` 也 `+Δ`（E-45：`w` = 列宽之和）；
+         * `x − Δ` ⇒ 右边界 = `(x−Δ) + (w+Δ)` = **`x + w`，与拖动前逐字相同** ✅
+         * 行同理：`y − Δ` 与"行高 +Δ"抵消，下边界不动 ✅
+         *
+         * ⚠️ 必须用 `nextMm` 而不是 `signed`：弱吸附和下限钳制都会改变最终值，
+         *    用原始 `signed` 会让右边界在吸附发生时**漂移**（"吸一下、边就错一点"）。
+         */
+        const delta = nextMm - baseMm
+        const originShift = side === 'start' ? -delta : 0
         /* 写入和浮层读数用**同一个** nextMm（上面算好的，含弱吸附）—— 两处各算一遍必然对不上 */
         if (axis === 'col') {
           const p = setColWidthPatch(el, index, round1(nextMm))
-          if (p) onMerge(el.id, p as Partial<AnyElement>, mergeKey)
+          if (p) {
+            onMerge(
+              el.id,
+              (side === 'start'
+                ? { ...p, x: round1(startXMm + originShift) }
+                : p) as Partial<AnyElement>,
+              mergeKey,
+            )
+          }
           return
         }
-        const p = setRowHeightPatch(el, index, snappedMm < MIN_ROW_MM ? undefined : round1(nextMm))
-        if (p) onMerge(el.id, p as Partial<AnyElement>, mergeKey)
+        const p = setRowHeightPatch(el, index, toAuto ? undefined : round1(nextMm))
+        if (p) {
+          onMerge(
+            el.id,
+            (side === 'start'
+              ? { ...p, y: round1(startYMm + originShift) }
+              : p) as Partial<AnyElement>,
+            mergeKey,
+          )
+        }
       }
 
       const onUp = (): void => {
@@ -1824,6 +2197,18 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     setDraft('')
   }, [])
 
+  /**
+   * ⚠️ **解析"格内子表的坐标"**（2026-10-17 第 5 步）：
+   *   `editingCellId` 允许是复合串 `"<cellId>@<r>,<c>"` —— 表示"子表的第 r 行第 c 列"。
+   *   ⚠️ 不带 `@` ⇒ 普通格（`r = -1`）⇒ **老行为逐字不变**。
+   */
+  const parseEditTarget = (raw: string | null): { cellId: string; r: number; c: number } | null => {
+    if (!raw) return null
+    const m = /^(.+)@(\d+),(\d+)$/.exec(raw)
+    if (!m) return { cellId: raw, r: -1, c: -1 }
+    return { cellId: m[1] as string, r: Number(m[2]), c: Number(m[3]) }
+  }
+
   const beginEditing = useCallback((elId: string, cellId: string | null, text: string) => {
     cancelledRef.current = false
     setEditingId(elId)
@@ -1834,22 +2219,40 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   const commitEdit = useCallback(
     (el: AnyElement) => {
       if (editingId !== el.id) return
-      const cellId = editingCellId
+      const target = parseEditTarget(editingCellId)
+      const cellId = target?.cellId ?? null
       if (cancelledRef.current) {
         cancelledRef.current = false
         stopEditing()
         return
       }
+      /* ⚠️ 先找"普通格"；找不到再看是不是"子表的某一小格"（复合坐标） */
+      const hitCell =
+        cellId && el.kind === 'table' ? el.rows.flatMap((r) => r.cells).find((c) => c.id === cellId) : undefined
       const prevNodes =
-        cellId && el.kind === 'table'
-          ? el.rows.flatMap((r) => r.cells).find((c) => c.id === cellId)?.nodes
-          : el.kind === 'text'
-            ? el.nodes
-            : undefined
+        hitCell && target && target.r >= 0
+          ? hitCell.subTable?.rows[target.r]?.cells[target.c]?.nodes
+          : hitCell
+            ? hitCell.nodes
+            : el.kind === 'text'
+              ? el.nodes
+              : undefined
       stopEditing()
       const next = textToNodes(draft, fields, prevNodes)
       // 原样关掉时短路：不写文档、不产生撤销记录（见 textToNodes 的注释）
       if (JSON.stringify(next) === JSON.stringify(prevNodes ?? [])) return
+      if (hitCell && target && target.r >= 0 && el.kind === 'table') {
+        /* ⚠️ **写回子表的那一小格**（复合坐标） */
+        const st = hitCell.subTable
+        if (!st) return
+        const subRows = st.rows.map((row, ri) =>
+          ri === target.r
+            ? { ...row, cells: row.cells.map((c2, ci) => (ci === target.c ? { ...c2, nodes: next } : c2)) }
+            : row,
+        )
+        onMerge(el.id, { rows: updateCell(el.rows, cellId as string, { subTable: { ...st, rows: subRows } }) })
+        return
+      }
       if (cellId && el.kind === 'table') {
         onMerge(el.id, { rows: updateCell(el.rows, cellId, { nodes: next }) })
         return
@@ -1863,6 +2266,36 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
   const inlineEditProps = (el: AnyElement) => ({
     value: draft,
     autoFocus: true,
+    /*
+     * ⚠️ **输入时按内容自动长高**（2026-10-17 用户报："编辑框无法显示所有内容"）。
+     *   `textarea` 的 `height:auto` **不会**按内容长高（那是 div 的行为）——
+     *   必须**手动**把 height 设成 `scrollHeight`。
+     *   ⚠️ 必须先设 `height:auto` 再读 `scrollHeight`：
+     *     否则元素只会"越来越高"，删字也不会缩回去（textarea 的经典坑）。
+     */
+    onInput: (ev: React.FormEvent<HTMLTextAreaElement>) => {
+      const t = ev.currentTarget
+      t.style.height = 'auto'
+      t.style.height = `${t.scrollHeight}px`
+    },
+    /*
+     * ⚠️⚠️ **挂载时也要按内容撑高**（2026-10-17 用户报：
+     *   「双击单元格编辑后，**编辑的区域太小**，文字显示不全」）。
+     *
+     * 上面 `onInput` 只在**输入时**触发 —— 双击打开、还没输入时，`textarea` 只有
+     *   CSS 给的默认高度（约 1.4em）⇒ **多行内容一打开就是被裁的** ✅
+     *
+     * ⚠️ 用 `requestAnimationFrame` 而不是同步执行：`ref` 回调发生在"挂载"当帧，
+     *   那时样式还没结算，`scrollHeight` 可能读到 0（尤其格子刚切到编辑态）。
+     * ⚠️ 仍然"先置 auto 再读" —— 与 `onInput` 同一套，避免只增不减。
+     */
+    ref: (ta: HTMLTextAreaElement | null) => {
+      if (!ta) return
+      requestAnimationFrame(() => {
+        ta.style.height = 'auto'
+        ta.style.height = `${ta.scrollHeight}px`
+      })
+    },
     onChange: (ev: React.ChangeEvent<HTMLTextAreaElement>) => setDraft(ev.target.value),
     onBlur: () => commitEdit(el),
     onKeyDown: (ev: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1895,6 +2328,20 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
    * 这与 `PendingMerge` 是同一条理由（见 MergeConfirm 的文件头）。
    */
   const [splitAsk, setSplitAsk] = useState<{ tableId: string; cellId: string } | null>(null)
+
+  /**
+   * 「行高 / 列宽」输入弹层（2026-10-13 用户需求：「单元格右键属性无法修改行高、列宽数据」）。
+   *
+   * ⚠️ 与 `splitAsk` **同一套模式**（state 持有目标 → 弹层 → 确认时回写）：
+   *    从**当前**文档重新定位表格，而不是把 `TableElement` 抓进 state ——
+   *    弹层开着的这段时间里表格可能已经被改过（面板输入框每一步都在 patch）。
+   * ⚠️ `kind` 决定改行还是改列、以及弹层的标题文案。
+   */
+  const [sizeAsk, setSizeAsk] = useState<{
+    tableId: string
+    cellId: string
+    kind: 'row' | 'col'
+  } | null>(null)
   /** 上一次拆分被护栏拒掉的原因（动作层的原话）；显示在弹层里，改个数字就能重试 */
   const [splitErr, setSplitErr] = useState<string | null>(null)
 
@@ -2005,7 +2452,6 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         { id: 'child:copy', label: '复制', hint: '供粘贴' },
         { id: 'child:cut', label: '剪切', hint: '取走它' },
         SEP,
-        { id: 'child:takeOut', label: '取出到画布', hint: '脱离表格自由摆放' },
         SEP,
         { id: 'child:remove', label: '移除格内元素', danger: true },
       ]
@@ -2076,6 +2522,78 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         { id: 'cell:colLeft', label: '在左侧插入列' },
         { id: 'cell:colRight', label: '在右侧插入列' },
         SEP,
+        /*
+         * ⚠️ **行高 / 列宽**（2026-10-13 用户需求：「单元格右键属性**无法修改行高、列宽数据**，增加该功能」）。
+         *
+         * 在这之前，改行高/列宽只有三条路：拖边框（要精确瞄 7px 的细条）、
+         * 顶部工具条的「表格尺寸」面板（只给**行列数**，不给尺寸）、
+         * 以及右侧面板里按「第 N 列」输数值（要先把面板滚到那一节）。
+         * ⇒ 右键在格子上直接改，是最短的那条路 —— 用户已经在格子上点了右键。
+         *
+         * ⚠️ 用 `…` 后缀：这个动作**会弹输入框**（和"插入行"这种立即生效的动作不同），
+         *    菜单文案要能预告这件事。
+         */
+        /*
+         * ⚠️ **行高 / 列宽 = 菜单内联输入**（2026-10-13 用户要求）：
+         *   「改为和右键修改**字号**的逻辑样式一样，**不要再额外弹出一个小窗**输入高宽值，
+         *     直接在右键菜单中修改，修改**实时反映**到表格中」。
+         *
+         * ⇒ 走 `it.input`（`bp-ctx__row--input`）那条路 —— 与「字号」项**同一套控件**：
+         *    点上下箭头或敲字**立刻** patch 文档（`onInput`）；失焦 / 回车时再 commit 一次收成一步撤销。
+         *
+         * ⚠️ 行高的第三态（`heightMm` 缺席 = "按内容自适应"）在这里表达为 **0**：
+         *    输入 0 就是"回到自适应"。不这么做的话，用户把行高设成 20 之后**没有路回到自动**。
+         * ⚠️ 列宽没有"自适应"这个态（恒是显式值）⇒ 下限直接给 `MIN_COL_MM`。
+         */
+        ...(loc && table && table.kind === 'table'
+          ? ([
+              {
+                id: 'cell:rowHeight',
+                label: '行高',
+                input: {
+                  value: typeof row?.heightMm === 'number' ? Math.round(row.heightMm * 10) / 10 : 0,
+                  min: 0,
+                  max: 500,
+                  step: 1,
+                  suffix: 'mm',
+                  onInput: (v: number) => {
+                    const p = setRowHeightPatch(table, loc.rowIdx, v <= 0 ? undefined : v)
+                    if (p) onMerge(table.id, p, `rh:${table.id}:${loc.rowIdx}`)
+                  },
+                  onCommit: (v: number) => {
+                    const p = setRowHeightPatch(table, loc.rowIdx, v <= 0 ? undefined : v)
+                    if (p) onMerge(table.id, p)
+                    onCommitEnd?.()
+                  },
+                },
+              },
+              ...(colIdxOfCell != null
+                ? [
+                    {
+                      id: 'cell:colWidth',
+                      label: '列宽',
+                      input: {
+                        value: Math.round((table.colWidthsMm[colIdxOfCell] ?? 10) * 10) / 10,
+                        min: MIN_COL_MM,
+                        max: 500,
+                        step: 1,
+                        suffix: 'mm',
+                        onInput: (v: number) => {
+                          const p = setColWidthPatch(table, colIdxOfCell, v)
+                          if (p) onMerge(table.id, p, `cw2:${table.id}:${colIdxOfCell}`)
+                        },
+                        onCommit: (v: number) => {
+                          const p = setColWidthPatch(table, colIdxOfCell, v)
+                          if (p) onMerge(table.id, p)
+                          onCommitEnd?.()
+                        },
+                      },
+                    } as CtxItem,
+                  ]
+                : []),
+            ] as CtxItem[])
+          : []),
+        SEP,
         { id: 'cell:mergeRight', label: '与右侧单元格合并' },
         { id: 'cell:mergeDown', label: '与下方单元格合并' },
         { id: 'cell:split', label: '拆分单元格', disabled: !canSplit },
@@ -2105,7 +2623,6 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
               /* 右键落在**格子**上（不是子元素本身）时也得能进去改它 —— 否则用户得先
                  精确点在图片上；图片旁边那片留白也会被当成"这一格" */
               { id: 'cell:editChild', label: '编辑格内元素', hint: '右侧面板' } as CtxItem,
-              { id: 'cell:takeOut', label: '取出到画布', hint: '放回画布' } as CtxItem,
               { id: 'cell:rmChild', label: '移除格内元素', danger: true } as CtxItem,
               SEP,
             ]
@@ -2200,7 +2717,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         id: 'gridStep',
         label: '网格间距',
         hint: `${grid.gridMm}mm`,
-        sub: GRID_STEPS.map((mm) => ({ id: `blank:grid:${mm}`, label: `${mm}mm`, checked: grid.gridMm === mm })),
+        sub: GRID_STEPS_MM.map((mm) => ({ id: `blank:grid:${mm}`, label: `${mm}mm`, checked: grid.gridMm === mm })),
       },
       {
         id: 'gridMargin',
@@ -2241,8 +2758,10 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
           actions.cut(childId)
           return
         }
-        if (id === 'child:takeOut') actions.takeOutChild(t.tableId, t.cellId)
-        if (id === 'child:remove') actions.removeChild(t.tableId, t.cellId)
+        /* ⚠️ **传 `t.childId`**（2026-10-16）：一格多个时取到的应是"你点的那个" */
+        if (id === 'child:takeOut') actions.takeOutChild(t.tableId, t.cellId, undefined, t.childId)
+        /* ⚠️ **传 t.childId**：一格多个时若删最后一个会删错（2026-10-16）*/
+        if (id === 'child:remove') actions.removeChild(t.tableId, t.cellId, t.childId)
         return
       }
 
@@ -2274,8 +2793,24 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
           onSelect(cellChildId(t.tableId, t.cellId))
           return
         }
-        if (id === 'cell:takeOut') return actions.takeOutChild(t.tableId, t.cellId)
-        if (id === 'cell:rmChild') return actions.removeChild(t.tableId, t.cellId)
+        if (id === 'cell:takeOut') {
+          /* ⚠️ 格级菜单：用"当前选中的那个子元素"（解不出来就退回老行为） */
+          const sel = parseCellChildId(selectedId)
+          const hint = sel && sel.tableId === t.tableId && sel.cellId === t.cellId ? sel.childId : undefined
+          return actions.takeOutChild(t.tableId, t.cellId, undefined, hint)
+        }
+        /*
+         * ⚠️⚠️ **「移除格内元素」= 清空整格**（2026-10-16 用户要求：
+         *   「右键单元格空白处，有个**移除格内元素**的选项，**当前点击无用**，
+         *     改为**点击后清空格内所有元素**」）。
+         *
+         * ⚠️ **"点击无用"的真因**：**这个 id 根本没有处理分支** ——
+         *   菜单里定义了项（见上面的 `{ id: 'cell:rmChild', ... }`），
+         *   但下面这串 `if (id === ...)` 里**漏了它** ⇒ 点击落到函数尾、什么都不做。
+         * ⚠️ 顺带把语义也改了：格级菜单本来就该是"清空这一格"，
+         *   而不是"猜一个子元素删掉"（那是子元素右键菜单的事）。
+         */
+        if (id === 'cell:rmChild') return actions.clearChildren(t.tableId, t.cellId)
         if (id === 'cell:rowAbove') return actions.insertRow(t.tableId, t.cellId, 'above')
         if (id === 'cell:rowBelow') return actions.insertRow(t.tableId, t.cellId, 'below')
         if (id === 'cell:colLeft') return actions.insertCol(t.tableId, t.cellId, 'left')
@@ -2288,6 +2823,15 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         }
         if (id === 'cell:split') {
           actions.splitCell(t.tableId, t.cellId)
+          return
+        }
+        /* 行高 / 列宽：只开弹层，**不在这一刻算行列号** —— 见 `sizeAsk` 的注释 */
+        if (id === 'cell:rowHeight' || id === 'cell:colWidth') {
+          setSizeAsk({
+            tableId: t.tableId,
+            cellId: t.cellId,
+            kind: id === 'cell:rowHeight' ? 'row' : 'col',
+          })
           return
         }
         if (id === 'cell:headerRow') {
@@ -2488,16 +3032,453 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
       const startX = ev.clientX
       const startY = ev.clientY
       let moved = false
+      /** ⚠️ 是否已"脱钩"（拖出格子足够远）—— 松手时据此决定走"取出/换格" */
+      let detached = false
       let lastCell: { tableId: string; cellId: string } | null = null
+
+      /*
+       * ⚠️ **"按下那一刻"的格内几何**（2026-10-13 新增，供"格内移动"用）。
+       *
+       * 为什么现在才需要它：在这之前格内元素**没有位置概念**（`x`/`y` 被定义为无意义），
+       * 拖动只可能是"拖到别处"（别的格子 / 画布）。现在有了 `cellPos` ⇒
+       * 拖到**同一格**里就该是"调整它在这一格内的位置"。
+       *
+       * ⚠️ 内容区宽 = `td` 的宽度**减去左右内边距**（padding 是格子属性，
+       *    从计算样式读，不能拿 `cell.paddingMm` 猜 —— 那还要考虑表格默认值）。
+       * ⚠️ 取的是**按下那一刻**的值：拖动中 `cellPos` 每帧都变，
+       *    用实时值算增量会**指数漂移**（和画布拖元素同一个坑）。
+       */
+      const tdEl = (ev.currentTarget as HTMLElement).closest('td')
+      const cellGeom = (() => {
+        if (!tdEl) return null
+        const r = tdEl.getBoundingClientRect()
+        const cs = window.getComputedStyle(tdEl)
+        const padL = parseFloat(cs.paddingLeft) || 0
+        const padT = parseFloat(cs.paddingTop) || 0
+        const padR = parseFloat(cs.paddingRight) || 0
+        const padB = parseFloat(cs.paddingBottom) || 0
+        return {
+          /** 内容区左边界（屏幕 px） */
+          left: r.left + padL,
+          /** 内容区上边界（屏幕 px） */
+          top: r.top + padT,
+          /** 内容区宽度（屏幕 px）—— `xPct` 的分母 */
+          width: Math.max(1, r.width - padL - padR),
+          /*
+           * ⚠️ **内容区高度（屏幕 px）—— 纵向钳制的分母**（2026-10-13 补）。
+           *
+           * 用户反馈：「元素在单元格内拖动时，**左右会被单元格本身限制，元素不会被裁切**，
+           *  但**上下拖动时，元素会被裁切限制**」——
+           *  两个方向行为不一致是错的（一个夹住、一个裁掉）。
+           *
+           * 根因：横向的钳制分母是**格宽**（模型里有 `colWidthsMm`）；
+           * 纵向我以为"没有分母"（行高是自适应的），于是退回靠 `<td>` 的 `overflow:hidden` 裁切。
+           * ⇒ 其实**拖动的这一刻行高是量得出来的**（格子已经渲染出来了）
+           *   ⇒ 拿它当分母，纵向也能"夹住"而不是"裁掉"。
+           * ⚠️ 只在**拖动开始时量一次**：拖动中山元素移动不影响行高（容器高 0），所以是稳定的。
+           */
+          /*
+           * ⚠️ **用整格高（不减内边距）** —— 因为 `y` 的原点已经是**边框内沿**
+           *   （holder 绝对定位在 `<td>` 的 padding box 顶）。
+           *   减掉 `padT/padB` 会让"往下拖"**提前一个内边距就停住** ——
+           *   正是用户报的「往上能贴上边框，但**往下拖又拖不下去了**」。
+           */
+          /*
+           * ⚠️ **用 `r.height`（border box），不要用 `clientHeight`**（2026-10-14 回退）。
+           *
+           * 我试过改用 `tdEl.clientHeight`（想排除 1px 边框、把"底边差 0.5mm"抹掉），
+           * **结果更糟**：用户实测「**底边彻底拖不下去了**，不论内边距多少都是这样」。
+           * ⚠️ `clientHeight` 是**取整**值、且不含边框，量出来的可用高**偏小** ⇒ `maxY` 变小 ⇒ 拖不到底。
+           * ⇒ **回退到 `r.height`**。
+           * ⚠️ 那 0.5mm 的边框误差（2×1px）**先接受** ——
+           *   它比"彻底拖不动"轻得多；要精确处理得把 `borderWidth` 读出来单独减，
+           *   而不是换一个口径更粗的量。
+           *   （教训：**"换一个 API"不等于"更精确"** —— 先确认新 API 的口径和你以为的一致。）
+           */
+          height: Math.max(1, r.height),
+        }
+      })()
+      const startPos = { xPct: childOffsetXPct(child), yMm: childOffsetYMm(child) }
+      /*
+       * ⚠️ **抓取偏移**（2026-10-13 修用户报的严重 bug）：
+       *   「把元素从单元格中拖动到画布中，**无法判断这个元素会出现在哪儿**」。
+       *
+       * 根因：取出时把**鼠标位置**直接当成了**元素的左上角**坐标传给 `takeOutChild`
+       * ⇒ 抓元素中间时元素会**跳一下**（左上角瞬间跑到鼠标处）。
+       * ⇒ 记下"按下点相对元素左上角的距离"，落点时减掉它，元素才真正**跟手**。
+       * ⚠️ 用子元素那个 `<span>` 的 rect（`currentTarget`）—— 它才是元素在屏幕上的实际框。
+       */
+      const childRect = (ev.currentTarget as HTMLElement).getBoundingClientRect()
+      const mmPerPxGrab = 1 / (MM_TO_PX * Math.max(scale, 0.05))
+      const grab = {
+        dxMm: (ev.clientX - childRect.left) * mmPerPxGrab,
+        dyMm: (ev.clientY - childRect.top) * mmPerPxGrab,
+      }
 
       const onMove = (mv: PointerEvent): void => {
         if (!moved) {
           if (Math.abs(mv.clientX - startX) + Math.abs(mv.clientY - startY) < 4) return
           moved = true
         }
-        setChildGhost({ x: mv.clientX, y: mv.clientY, label: elementLabel(child) })
         const hit = cellAtPoint(mv.clientX, mv.clientY)
-        lastCell = hit && hit.tableId !== table.id ? hit : null
+        /* ⚠️ 落在**同一格**内 ⇒ 不是"换格"，交给"格内移动"那条路（`lastCell` 保持 null） */
+        const sameCell = !!hit && hit.tableId === table.id && hit.cellId === cellId
+        lastCell = hit && !sameCell ? hit : null
+        /*
+         * ⚠️⚠️ **实时预览**（2026-10-13 用户反馈："拖动中间没有画面，即拖动的时候，
+         *   只能看到鼠标指针移过去，松开鼠标左键，元素**立刻闪现**过来了"）。
+         *
+         * 原来是**松手才写文档** ⇒ 整个拖动过程零反馈。
+         * ⇒ 改成**每帧写**：元素真的跟着鼠标走 —— 比"画一个 ghost 跟着鼠标"更真实
+         *   （ghost 只是一个标签，看不出缩放后的实际效果），也少一套临时状态。
+         * ⚠️ 每帧写必须带**同一个 `mergeKey`**，否则撤销栈会被每一帧塞一条
+         *   （拖一次产生上百步，"撤销"就废了）。
+         */
+        /*
+         * ⚠️⚠️ **"离格子多远"必须在 `if (sameCell)` 之外算**（2026-10-13 第 2 次返工）。
+         *
+         * 上一版把它写在 `if (sameCell && cellGeom)` 里面 ⇒
+         * **鼠标一出格子 `sameCell` 就变 false ⇒ 整块不执行 ⇒ `detached` 永远设不上**
+         * ⇒ 拖出去时只有文字胶囊（用户两次报"只有蓝色的文字标签过去"）。
+         *
+         * ⚠️ **这类 bug 的性质**：字段写在一个**永远不会执行到的分支**里。
+         *   读代码看不出来（每处都"看起来对"），必须**追一遍每条路径会不会执行到**。
+         */
+        const r0 = tdEl?.getBoundingClientRect()
+        let outside = 0
+        if (r0) {
+          const ox = Math.max(0, r0.left - mv.clientX, mv.clientX - r0.right)
+          const oy = Math.max(0, r0.top - mv.clientY, mv.clientY - r0.bottom)
+          outside = Math.hypot(ox, oy)
+        }
+        /*
+         * ⚠️⚠️ **"脱钩"的判据要包含"已经离开格子"**（2026-10-13 用户第 3 次反馈：
+         *   「拖动到边缘的时候，**先出现的是蓝色文字标签**，继续拖动**才会出现蓝色虚线框**，
+         *     **没有一开始就出现**，正常应该是这个虚线框**替代**现在的蓝色文字标签」）。
+         *
+         * 根因：这里原本只看"离格子多远 ≥ 18px"。
+         *   ⇒ 鼠标刚出格子时距离还不到 18px ⇒ **脱钩没触发** ⇒ 走了下面的文字胶囊分支
+         *     ⇒ 于是"先标签、后虚线框"。
+         * ⇒ 改成：**一旦不在格子里（`!sameCell`）就脱钩** ——
+         *   阻力（0.35 阻尼）仍然保留，但它的作用域是**格内推动**的手感，
+         *   不该决定"什么时候才让用户看见元素本体"。
+         */
+        /*
+         * ⚠️⚠️ **"脱钩"只由"累积的阻力"决定，不再"鼠标出格即脱钩"**（2026-10-15 用户反馈）。
+         *
+         * 用户原话：「之前我们设置了**拖动到单元格边框的时候，有个阻力的效果**，
+         *   现在这个效果好像没在了，导致在单元格内拖动的时候，
+         *   **很容易就拖出单元格或者拖动到其他单元格之中**」。
+         *
+         * 根因：上一版是 `if (!sameCell || outside * 0.35 >= 18)` ——
+         *   **`!sameCell` 一票通过** ⇒ 鼠标**一出格子（哪怕 1px）立刻脱钩**
+         *   ⇒ 下面那个 `0.35` 的阻尼**根本没机会生效**（它就是"阻力"）。
+         *
+         * ⚠️ **但不能简单删掉 `!sameCell`**：它是为"先标签、后虚线框"修的（第 3 次反馈）。
+         * ⇒ 调和：**只看累积阻力，但把阈值从 18px 降到 8px** ——
+         *   鼠标离开格子约 23px（8 ÷ 0.35）才脱钩 ⇒ **既有"推不动但在累积"的阻力手感，
+         *   又不会迟钝到"拖半天还不脱钩"**。
+         */
+        if (outside * 0.35 >= 8) detached = true
+
+        if (sameCell && cellGeom) {
+          /*
+           * ⚠️⚠️ **"吸附 + 阻力 + 脱钩"三段式**（2026-10-13 用户口径）：
+           *   「元素在单元格内拖动时，**触碰到四个边框就立刻吸附，并有一个阻力**，
+           *     继续沿着受阻的方向拖动，整个元素即可完成**移动到其他单元格或者拖出到画布**的操作；
+           *     此时该元素**不能闪现出现**，拖动的时候**依然要跟手移动**，
+           *     拖动到单元格外时，**样式应当在拖动过程中就变换**」。
+           *
+           * ⚠️ **阻力怎么表达**：鼠标在**格子外**的距离 × **阻尼系数**（0.35）——
+           *   手感是"推不动、但在累积"，而不是"一下就出去"。
+           * ⚠️ 越过阈值（18px）⇒ **脱钩**：ghost 换成"**渲染元素本体 + 画布样式**"。
+           *   这样"样式在拖动过程中就变"，不必等松手。位置 = **鼠标 − 抓取偏移**
+           *   （与 `takeOutChild` 的落点同算法 ⇒ 与最终落点一致，不跳）。
+           */
+          /* ⚠️ `detached` 的判定已移到 `if (sameCell)` **外面**了（见那段注释）—— 这里只看结果 */
+          if (detached) {
+            const pxPerMmNow = MM_TO_PX * Math.max(scale, 0.05)
+            setChildGhost({
+              x: mv.clientX - grab.dxMm * pxPerMmNow,
+              y: mv.clientY - grab.dyMm * pxPerMmNow,
+              label: elementLabel(child),
+              child,
+              /* 画布口径的宽（`w` 是"占格宽百分比"⇒ 换成 mm） */
+              wMm: Math.round(((cellWidthMm(table, cellId) * childWidthPct(child)) / 100) * 10) / 10,
+              hMm: childBoxHeightMm(child),
+            })
+          }
+          let dxPct = ((mv.clientX - startX) / cellGeom.width) * 100
+          let dyMm = (mv.clientY - startY) / (MM_TO_PX * Math.max(scale, 0.05))
+          /*
+           * ⚠️ **吸附继承画布的开关**。用户口径：「**继承画布中的吸附开关**，
+           *   如果画布全局开了吸附，就自动吸附到当前的网格；如果关闭了吸附，就可以完全自由拖动」。
+           *
+           * ⚠️ 吸附要在 **mm 空间**里做（网格是 mm 的），而 `xPct` 是**百分比** ⇒
+           *   先换算到 mm、吸附、再换算回去。直接在百分比上取整是错的：
+           *   同一个 1% 在不同宽度的格子里对应的 mm 数不同，"吸附到网格"就名不副实了。
+           */
+          if (grid.snapToGrid && grid.gridMm > 0) {
+            const cwMm = Math.max(1, cellWidthMm(table, cellId))
+            const mmPerPx = 1 / (MM_TO_PX * Math.max(scale, 0.05))
+            const xMm = (startPos.xPct / 100) * cwMm + (mv.clientX - startX) * mmPerPx
+            const yMmNow = startPos.yMm + dyMm
+            const sxMm = Math.round(xMm / grid.gridMm) * grid.gridMm
+            const syMm = Math.round(yMmNow / grid.gridMm) * grid.gridMm
+            dxPct = ((sxMm - (startPos.xPct / 100) * cwMm) / cwMm) * 100
+            dyMm = syMm - startPos.yMm
+          }
+          /*
+           * ⚠️⚠️ **横向夹在 `[0, 100 − w]`**（2026-10-13 用户报的 bug）：
+           *   「拖动移动时，可以把元素移动到**两个单元格之间，覆盖在这个单元格上**……
+           *     当拖动的元素**超过该单元格边界**时，应当出现**吸附到单元格**的动画」。
+           *
+           * 根因：这里原来的上限是 **200**（想给"往格外出一点"留余地）⇒
+           * 元素可以**跨出本格右边界、盖到旁边那一格上**。
+           * ⇒ 上限改成 `100 − 占格宽`（**元素右边界不得越过格内容区右边界**）——
+           *   拖到头就"贴"在格子右内边，这正是用户要的"吸附到单元格"。
+           * ⚠️ 上限**随 `w` 变化**：宽度 100% 时上限是 0（只能贴左，因为它本来就撑满）。
+           * ⚠️ `Math.min` 放在**吸附之后**：网格吸附可能把 x 推到越界的位置，夹回来才算数。
+           */
+          /*
+           * ⚠️ **右/下的上限放宽一个 pad**（2026-10-14 用户报：
+           *   「能拖到底边了，但**上左右三边无法紧贴**……右边却没有这种距离，
+           *    甚至可以拖动到单元格边框上」——
+           *   左/上的 0 = 边框内沿 ⇒ 能贴；
+           *   右/下的上限原来是“内容区宽/高”⇒ 停在“内容区边缘”，**离边框还差一个 pad**。
+           * ⇒ 四边对称：上限放到“**边框内沿**”= 内容区宽/高 **＋ 一个 pad**。
+           *   （pad 对应的百分比 = padMm ÷ 内容区宽 × 100）。
+           */
+          /*
+           * ⚠️⚠️ **钳制必须收回 `100 − w`**（2026-10-14 深夜，上一轮的"放宽 pad"是错的）。
+           *
+           * 上一轮为了让"右边能贴边框"放宽了上限，**结果超界的坐标（xPct + w > 100）
+           * 被直接写进了文档** —— 用户清单实测：`xPct = 64.748% + w = 38.7% = 103.45%` ❗
+           * ⇒ 渲染时元素右沿超出格子 1.6mm，且这个**脏数据会一直留在模板里**。
+           *
+           * ⇒ **钳制收回**。同时需要在 `coerceDoc` 里加一道**自愈**：
+           *   把已存的超界 `cellPos` 夹回合法范围（否则老用户的脏数据会一直渲染出界）。
+           *
+           * ⚠️ 教训：**钳制是"数据合法性"的一部分，不能为了让某个视觉效果好实现就放宽** ——
+           *   放宽后写进去的数据，渲染端、打印端、保存端都要能正确处理，否则就是脏数据源。
+           */
+          const maxX = Math.max(0, 100 - childWidthPct(child))
+          const nextX = Math.min(maxX, Math.max(0, Math.round((startPos.xPct + dxPct) * 10) / 10))
+          /*
+           * ⚠️ **纵向上限 = 内容区高 − 元素盒高**（2026-10-13 用户报：
+           *   「元素在单元格内拖动时，**左右会被单元格本身限制、不会被裁切**，
+           *    但**上下拖动时，元素会被裁切限制**」）。
+           *
+           * 横向早就有这个上限（`100 − 占格宽`）；**纵向原来没有** ——
+           * 我以为行高算不出来（自适应），于是靠 `<td>` 的 `overflow:hidden` 裁切兜底
+           * ⇒ 两个方向行为不一致：**左右"夹住"、上下"裁掉"**。
+           * ⇒ 现在用**拖动开始时量到的内容区高度**当分母，纵向也改成夹住。
+           * ⚠️ 下限 −10：`y=0` 是**内容区**顶部、离边框还差一个内边距 ——
+           *    用户要"贴紧上边框"就必须允许小幅负值（见 `childOffsetYMm` 的注释）。
+           * ⚠️ 两层 `Math.max(-10, …)`：`maxY` 本身可能小于 −10（元素比格子还高），
+           *    那时下限仍然让到 −10，不至于产生"下限 > 上限"的颠倒区间。
+           */
+          /*
+           * ⚠️ 纵向上限 = **"内容区容器"的高 − 元素盒高**（2026-10-14 与打印端的容器方案配套）。
+           *
+           * 打印端现在把格内子元素包进了一层"内容区容器"（四边内缩 `pad`，见 `render/html.ts`），
+           * 元素的 `top` 是**相对那个容器**的 ⇒ 所以这里钳制也必须是"**容器高**"，
+           * 否则 `y` 能一直加到"内容区高 − 盒高" ⇒ **元素冒出容器** ⇒ 又变成"压线"。
+           * ⚠️ 容器高 = `td 内容区高 − 2 × pad`。
+           *   `cellGeom.height` 量的是 `td` 的**内容区高**（已减过上下 padding）……
+           *   ⚠️ 注意：`cellGeom.height` 是按 `r.height` 量的（整格），这里再减 `2 × pad` 才是容器高。
+           */
+          /*
+           * ⚠️ **单元格级内边距优先**（2026-10-14，与 `<td>` 的渲染、以及打印端**同口径**）。
+           *   这一处原来只读表格级 `table.cellPaddingMm` ⇒ 用户在单元格上改内边距时
+           *   **渲染变了、钳制没变** ⇒ 钳制范围与渲染位置差一个 pad ⇒ "四边贴不齐"的又一个来源。
+           */
+          const padCell = findCell(table.rows, cellId)?.cell
+          const padPx = mmToPx(finite(padCell?.paddingMm, finite(table.cellPaddingMm, 1.5)))
+          /*
+           * ⚠️⚠️ **上限的"来源"必须和渲染端一致**（2026-10-15）。
+           *
+           * 渲染端（画布 td 与打印）用的是**模型值** `row.heightMm`；
+           * 而这里原来用 **DOM 实测**（`cellGeom.height`）—— 两个来源必然偶尔对不上
+           *   ⇒ 用户实测"拖到底了、但离底还差 1mm"（存进去的 19mm 超过了真实上限 18mm）。
+           * ⇒ **模型行高优先**（与渲染同源）；只有行高是**自适应**（缺席）时才退回 DOM 实测。
+           * ⚠️ 口径：`row.heightMm` 是 td 的 **border box 总高**（实测 box-sizing: border-box）
+           *   ⇒ **内容区高 = 行高 − 2×pad**。
+           * ⚠️ DOM 兜底那条 `(cellGeom.height − 2×pad)` **本来就是内容区高**，不用再减。
+           */
+          const padMmEff = finite(padCell?.paddingMm, finite(table.cellPaddingMm, 1.5))
+          const rowHmmModel = table.rows.find((rw) => rw.cells.some((x) => x.id === cellId))?.heightMm
+          const contentHmm =
+            typeof rowHmmModel === 'number' && rowHmmModel > 0
+              ? rowHmmModel - 2 * padMmEff
+              : (cellGeom.height - padPx * 2) / (MM_TO_PX * Math.max(scale, 0.05))
+          const maxY = cellGeom ? contentHmm - childBoxHeightMm(child) : 500
+          const rawY0 = Math.round((startPos.yMm + dyMm) * 10) / 10
+          const nextY = Math.min(
+            Math.max(0, maxY),
+            Math.max(0, Math.round((startPos.yMm + dyMm) * 10) / 10),
+          )
+          /*
+           * ⚠️ **"是否顶到边界"** —— 用来驱动"蓄力"动效（见 `childPush` 的注释）。
+           *   判据：**未夹紧的原始值**超出了合法区间（`[0, 上限]`）。
+           *   ⚠️ 必须用**原始值**判断，不能用 `nextX/nextY`（那两个已经被夹紧了，永远在区间内）。
+           */
+          const rawX = startPos.xPct + dxPct
+          /*
+           * ⚠️ **顶到了哪几条边** —— 驱动「被挤压的那条单元格边框」高亮（2026-10-15 用户澄清：
+           *   「**动效应该加在被挤压的那条边上，不是加在元素上**」）。
+           *   ⚠️ 用 **未夹紧的原始值**判断：`nextX/nextY` 已被夹紧 ⇒ 判断恒为 false。
+           */
+          const dirKey =
+            (rawX < 0 ? 'l' : '') +
+            (rawX > maxX ? 'r' : '') +
+            (rawY0 < 0 ? 't' : '') +
+            (rawY0 > maxY ? 'b' : '')
+          if (dirKey !== childPushRef.current) {
+            childPushRef.current = dirKey
+            setChildPush(
+              dirKey
+                ? {
+                    cellId,
+                    l: dirKey.includes('l'),
+                    r: dirKey.includes('r'),
+                    t: dirKey.includes('t'),
+                    b: dirKey.includes('b'),
+                  }
+                : null,
+            )
+          }
+          /*
+           * ⚠️⚠️ **拖动时顺便同步「对齐」**（2026-10-14 用户明确要求，且是"左边莫名很宽"的真凶）。
+             *
+             * 用户原话：「附件紧贴左侧 ⇒ 对齐自动切『左』；紧贴右侧 ⇒ 自动切『右』；
+             *   没有紧贴 ⇒ 保持『居中』。**这些也可以手动修改调整**」
+             * 并指出：「我之前总觉得**左边比较宽**，其实是因为我把附件拖到紧贴左边的时候，
+             *   **对齐处于『右』的状态**」——
+             *   ⇒ `childBoxLeftPct()` 在"没手动偏移"时会退回 `config.align`，
+             *     而 `align='right'` 会把元素**推到右边** ⇒ 用户以为拖到了左边，实际渲染在右边。
+             *
+             * ⇒ 在写 `cellPos` 的**同一处**顺手把推断出的 `align` 也写进去：
+             *   · 阈值：`x ≤ 2%` ⇒ 左、`x + w ≥ 98%` ⇒ 右、其余 ⇒ 中；
+             *   · ⚠️ 只在 `attach` 上写（别的 kind 没有 `align` 这个配置项）；
+             *   · ⚠️ 用**同一个 mergeKey** ⇒ 和位置一起收成**一步撤销**（不会多出一堆步）。
+             *   · ⚠️ 用户手动改 `align` 之后**仍会生效** —— 直到他**再次拖动**位置
+             *     （那本来就是"重新决定对齐"的动作，与用户说的"也可以手动修改"不冲突）。
+             */
+            /*
+             * ⚠️⚠️ **吸附 + 定位辅助线**（2026-10-16 用户要求：
+             *   「附件、图片等在单元格中拖动时，也**有定位辅助线**出现，方便判断是否居中」+
+             *   「定位辅助线要**有一定的吸附作用**」）。
+             *
+             * 参考线：横向 **内容区左沿 / 水平中线 / 右沿**；纵向 **上沿 / 垂直中线 / 下沿**。
+             * 阈值：横向 **1.5%**、纵向 **1.5mm** —— 太小吸不住、太大"抢鼠标"。
+             * ⚠️ 只吸**位置**、不改尺寸（尺寸归锚点管）。
+             * ⚠️ 状态放**独立 state**（`childSnap`），**不跟"被挤压边高亮"（`childPush`）混** ——
+             *   语义不同（一个"顶到边界"、一个"对齐到参考线"），合并会出现"两个都对但只显示一个"。
+             */
+            const SNAP_PCT = 1.5
+            const SNAP_MM = 1.5
+            const wPctForSnap = childWidthPct(child)
+            const snapXs = [0, Math.max(0, (100 - wPctForSnap) / 2), Math.max(0, 100 - wPctForSnap)]
+            let snapX = nextX
+            let lineX: number | null = null
+            for (const c of [snapXs[2], snapXs[1], snapXs[0]]) {
+              if (Math.abs(nextX - c) <= SNAP_PCT) {
+                snapX = Math.round(c * 10) / 10
+                /* 线画在"被对齐的那条边/中线"上：左对齐看左边、居中看中线、右对齐看右边 */
+                lineX = c + (c === snapXs[1] ? wPctForSnap / 2 : c === snapXs[0] ? 0 : wPctForSnap)
+                break
+              }
+            }
+            const contentHmmSnap =
+              typeof rowHmmModel === 'number' && rowHmmModel > 0 ? rowHmmModel - 2 * padMmEff : cellGeom ? contentHmm : 0
+            const hMmForSnap = childHeightMm(child) ?? 0
+            const snapYs = [
+              0,
+              Math.max(0, (contentHmmSnap - hMmForSnap) / 2),
+              Math.max(0, contentHmmSnap - hMmForSnap),
+            ]
+            let snapY = nextY
+            let lineY: number | null = null
+            if (contentHmmSnap > 0) {
+              for (const c of [snapYs[2], snapYs[1], snapYs[0]]) {
+                if (Math.abs(nextY - c) <= SNAP_MM) {
+                  snapY = Math.round(c * 10) / 10
+                  lineY = c + (c === snapYs[1] ? hMmForSnap / 2 : c === snapYs[0] ? 0 : hMmForSnap)
+                  break
+                }
+              }
+            }
+            /* ⚠️ 独立 state（见上面的注释）：只在"吸附目标变了"时才 setState（拖动每帧都 set 会卡） */
+            const snapKey = `${lineX ?? ''}:${lineY ?? ''}@${cellId}`
+            if (snapKey !== childSnapRef.current) {
+              childSnapRef.current = snapKey
+              setChildSnap(
+                lineX === null && lineY === null
+                  ? null
+                  : { cellId, lineX, lineY },
+              )
+            }
+            const nextW = childWidthPct(child)
+            const autoAlign: 'left' | 'center' | 'right' =
+              snapX <= 2 ? 'left' : snapX + nextW >= 98 ? 'right' : 'center'
+            /*
+             * ⚠️ **四种元素共用这套对齐**（2026-10-14 用户要求："都遵循同一套规则"）：
+             *   · **附件**用 `config.align`（`AttachmentPrintConfig`）；
+             *   · **图片 / 二维码 / 条形码**用元素自己的 `align`（`types.ts` 的 `CellChildAlign`）。
+             *   ⇒ 拖到贴边时**自动写入**；用户手动改过也保留（直到他**下次再拖位置**）。
+             */
+            const isAttach = child.kind === 'attach'
+            const curAlign = isAttach
+              ? child.config.align
+              : (child as { align?: 'left' | 'center' | 'right' }).align
+            const alignPatch =
+              curAlign !== undefined && curAlign !== autoAlign
+                ? isAttach
+                  ? { config: { ...child.config, align: autoAlign } }
+                  : { align: autoAlign }
+                : null
+            actions.patchCellChild(
+              table.id,
+              cellId,
+              alignPatch
+                ? { cellPos: { xPct: snapX, yMm: snapY }, ...alignPatch }
+                : { cellPos: { xPct: snapX, yMm: snapY } },
+              `cpos:${table.id}:${cellId}:${child.id}`,
+              /* ⚠️ 一格可能有多个子元素 ⇒ **必须指定改哪一个** */
+              child.id,
+            )
+        } else if (detached) {
+          /*
+           * ⚠️⚠️ **脱钩后 ghost 必须继续跟着鼠标走**（2026-10-13 第 2 次返工的关键一步）。
+           *
+           * 上一版只在 `if (sameCell)` 里设 ghost ⇒ 鼠标一出格子就**不再更新位置** ⇒
+           * 那个"元素本体"会**停在原地不动**（看起来就是"本体没跟过来"）。
+           * ⇒ 位置 = **鼠标 − 抓取偏移**，与 `takeOutChild` 的落点**同一个算法**（松手不跳）。
+           */
+          const pxPerMmNow = MM_TO_PX * Math.max(scale, 0.05)
+          setChildGhost({
+            x: mv.clientX - grab.dxMm * pxPerMmNow,
+            y: mv.clientY - grab.dyMm * pxPerMmNow,
+            label: elementLabel(child),
+            child,
+            /* 画布口径的宽（`w` 是"占格宽百分比"⇒ 换成 mm） */
+            wMm: Math.round(((cellWidthMm(table, cellId) * childWidthPct(child)) / 100) * 10) / 10,
+            hMm: childBoxHeightMm(child),
+          })
+        } else {
+          /*
+           * ⚠️ **不再有文字胶囊**（2026-10-13 用户明确：
+           *   「正常应该是这个**虚线框替代**现在的蓝色文字标签」）。
+           *   拖出格子 / 拖向别的格子，一律走上面的 `detached` 分支 ——
+           *   **元素本体 + 画布样式**，比一个文字条更能让用户判断落点。
+           */
+          setChildGhost(null)
+          childPushRef.current = ''
+          setChildPush(null)
+        childSnapRef.current = ''
+        setChildSnap(null)
+        }
         onDropTargetChange?.(lastCell ? { kind: 'cell', cellId: lastCell.cellId } : null)
       }
 
@@ -2506,6 +3487,10 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         document.removeEventListener('pointerup', onUp)
         document.removeEventListener('pointercancel', onUp)
         setChildGhost(null)
+          childPushRef.current = ''
+          setChildPush(null)
+        childSnapRef.current = ''
+        setChildSnap(null)
         onDropTargetChange?.(null)
         if (!moved) {
           /*
@@ -2522,17 +3507,74 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
            * `onClick` 的 stopPropagation（见渲染处），两处必须成对，删一个就退化成原样。
            */
           onSelectCell(table.id, cellId)
-          onSelect(cellChildId(table.id, cellId))
+          /*
+           * ⚠️ **带上 `child.id`**（2026-10-16 放宽 `MAX_CELL_CHILDREN` 后必需）：
+           *   一格多个子元素时，只写 `child:<tableId>:<cellId>` 分不清点的是**哪一个**
+           *   ⇒ 面板会显示"第一个/某一个"的属性、右键删除也会删错。
+           * ⚠️ 老形式（不带第三段）仍然合法 ⇒ 其它按"这一格"选中的路径不受影响。
+           */
+          onSelect(cellChildId(table.id, cellId, child.id))
           return
         }
         const target = lastCell as { tableId: string; cellId: string } | null
-        if (target && !(target.tableId === table.id && target.cellId === cellId)) {
-          actions.moveChildToCell(table.id, cellId, target.tableId, target.cellId)
+        if (target) {
+          actions.moveChildToCell(table.id, cellId, target.tableId, target.cellId, child.id)
+          return
+        }
+        /*
+         * ⚠️⚠️ **落点仍在本格内 ⇒ 调整它在这一格里的位置**（2026-10-13 新增）。
+         *
+         * 判据用 `cellAtPoint`：落在本格就写 `cellPos`、落在纸上（格外面）才是"取出"。
+         * ⚠️ 顺序很重要 —— **必须先判"是否还在本格"**，否则"格内拖动"会走进 `takeOutChild`
+         *   （改之前就是这样：格内元素一拖就被取出到画布，因为格内也在纸上）。
+         *
+         * ⚠️ 位移换算：横向按**内容区宽的百分比**（与 `xPct` 同体系）、
+         *    纵向按 **mm**（与 `yMm` 同体系）。纵向要除掉 `scale` ——
+         *    屏幕 px 是缩放后的，而 mm 是纸张上的真实尺寸。
+         * ⚠️ 锚点取 `startPos`（按下那一刻）+ 位移，**不是** `childOffsetXPct(child) + 位移`：
+         *    后者在拖动中每次读到的都是上一帧写进去的值 ⇒ **增量累加** ⇒ 快速拖动会飞出去。
+         */
+        /*
+         * ⚠️ **已脱钩 ⇒ 优先走"取出 / 换格"**（三段式的收尾）。
+         *   此时用户已经把元素"推出"格子了，不该再要求"鼠标恰好落在格子外面"
+         *   —— 那正是之前"压在边框上却没被取出"的原因。
+         * ⚠️ 落点仍用 **鼠标 − 抓取偏移**，与拖动时 ghost 的位置**同一个算法**（不跳）。
+         */
+        if (detached) {
+          const target2 = lastCell as { tableId: string; cellId: string } | null
+          if (target2) {
+            actions.moveChildToCell(table.id, cellId, target2.tableId, target2.cellId, child.id)
+            return
+          }
+          const at2 = toContent(up.clientX, up.clientY)
+          if (at2?.onPaper) {
+            actions.takeOutChild(table.id, cellId, {
+              xMm: at2.xMm - grab.dxMm,
+              yMm: at2.yMm - grab.dyMm,
+            })
+          }
+          return
+        }
+        const hitEnd = cellAtPoint(up.clientX, up.clientY)
+        if (hitEnd && hitEnd.tableId === table.id && hitEnd.cellId === cellId && cellGeom) {
+          /*
+           * ⚠️ 位置**已经在 `onMove` 里逐帧写好了**（就是为了实时预览）⇒ 这里只**收成一步撤销**。
+           *    再写一次不但多余，还会因为"没带同一个 mergeKey"而多塞一条撤销记录。
+           */
+          onCommitEnd?.()
           return
         }
         const at = toContent(up.clientX, up.clientY)
-        if (at?.onPaper && !target) {
-          actions.takeOutChild(table.id, cellId, { xMm: at.xMm, yMm: at.yMm })
+        if (at?.onPaper) {
+          /*
+           * ⚠️ **落点要减掉抓取偏移**，否则元素"跳到鼠标处" —— 用户抓的是元素中间，
+           *    却把左上角放到了鼠标位置（"无法判断这个元素会出现在哪儿"，2026-10-13）。
+           * ⇒ 这样元素才是**跟着手**出去的。
+           */
+          actions.takeOutChild(table.id, cellId, {
+            xMm: at.xMm - grab.dxMm,
+            yMm: at.yMm - grab.dyMm,
+          })
         }
       }
 
@@ -2542,7 +3584,246 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
     },
     // ⚠️ `onSelect` / `onSelectCell` / `cellAtPoint` 是新增依赖：`useCallback` 漏依赖 = 闭包永远停在首次渲染，
     //    表现为"代码看起来完全正确但点击永不生效"（本项目在 `onCellPointerDown` 上刚栽过一次）。
-    [actions, cellAtPoint, onDropTargetChange, onSelect, onSelectCell, toContent],
+    [actions, cellAtPoint, onDropTargetChange, onSelect, onSelectCell, scale, toContent],
+  )
+
+  /**
+   * **格内元素的缩放手柄**（2026-10-13）：拖右下角的手柄改 `w`（占格宽 %）与 `h`（mm）。
+   *
+   * 用户原话：「单元格内的图片、二维码、附件等元素**无法通过手动缩放**，
+   * 参照**这些元素在画布中的逻辑**，可以手动缩放」。
+   *
+   * ⚠️ 与画布上拖元素手柄**同一套纪律**：
+   *   · 锚点取**按下那一刻**的 `w`/`h`（不是增量累加 —— 拖动中每帧都在 patch 文档，
+   *     读实时值会指数漂移）；
+   *   · 位移按 `scale` 反算 mm（屏幕 px 是缩放后的，`w`/`h` 是纸张上的真实尺寸）；
+   *   · 横向换算成百分比时**除以格内容宽**（`w` 是"占格宽"的百分比、不是 mm）。
+   *
+   * ⚠️ **每次都带上 `cellPos`**：否则"已定位的元素一缩放就跳回流式位置"——
+   *    因为 `patchCellChild` 是整体替换子元素对象的一部分，
+   *    `cellPos` 不传就保持原值（这里显式传是为了**语义清楚**，不是必需）。
+   *    ⚠️ 反过来说：**没定位过的元素缩放后也不该被定位** ——
+   *    所以这里传的 `cellPos` 只在**原本就有时**才给（见下面 `hadPos`）。
+   */
+  const onChildResizeDown = useCallback(
+    (
+      ev: ReactPointerEvent,
+      table: TableElement,
+      cellId: string,
+      child: AnyElement,
+      /**
+       * 拖的是**哪个锚点**（`nw` / `n` / `ne` / `w` / `e` / `sw` / `s` / `se`）。
+       *
+       * ⚠️ 为什么要 8 个方向而不是只做一个角（2026-10-13 用户要求：
+       *   「点击后应该在边框出现 **8 个锚点**，鼠标移动上去出现缩放的指针图标，按住左键进行缩放」）：
+       *   只给一个角的话，"往左扩"和"往上扩"这两个最自然的动作**做不到** ——
+       *   只能"往右下长大，再把位置挪回去"，两步且反直觉。
+       * ⚠️ 各方向的差别只在**改哪两条边**：`n` 改上边、`e` 改右边 …… 见下面的分解。
+       */
+      dir: 'nw' | 'n' | 'ne' | 'w' | 'e' | 'sw' | 's' | 'se',
+    ) => {
+      if (ev.button !== 0 || !actions) return
+      ev.stopPropagation()
+      ev.preventDefault()
+      const startX = ev.clientX
+      const startY = ev.clientY
+      const startW = childWidthPct(child)
+      const startH = childBoxHeightMm(child)
+      const hadPos = isChildPositioned(child)
+      const startPos = { xPct: childOffsetXPct(child), yMm: childOffsetYMm(child) }
+      const cwMm = Math.max(1, cellWidthMm(table, cellId))
+      /*
+       * ⚠️ **量出这一格的高度**（mm）—— 缩放的**纵向也必须夹住**
+       *   （2026-10-13 用户报：「点击单元格内元素的**上方/下方**三个锚点缩放，
+       *    元素的下半部分会**超出单元格**，即元素可以**向下无限拖大**」）。
+       *
+       * 根因：`onMove`（拖动）那条链我加了 `maxY` 夹住，但**缩放这条链漏了** ——
+       * 两个入口改同一份数据，只夹住一个 ⇒ 另一个照样越界。
+       * ⚠️ 量的是**整格高**（与拖动那条同口径：`y = 0` 是边框内沿）。
+       */
+      const tdElR = (ev.currentTarget as HTMLElement).closest('td')
+      /*
+       * ⚠️⚠️ **"可用高"必须减去上下内边距**（2026-10-15 用户报：
+       *   「设置了内边距后，**四个元素的底边都可以被拉出单元格区域**，
+       *     拉动上边也会导致底边超出单元格；**内边距为 0 就没有这个 bug**」）。
+       *
+       * 根因：`td.getBoundingClientRect().height` 是 **border box 高**（含上下 padding），
+       *   而元素只能用**内容区** ⇒ 不减 padding 就多出 `2×pad` 的可拉空间。
+       *   ⚠️ 这一处与渲染端的口径**不一致** —— 渲染端 `effectiveChildYMm` 是按
+       *     `行高 − 2×pad`（内容区）夹的，所以"拖得出去、但渲染时被夹回来" ⇒
+       *     用户看到的就是"能拉出单元格"。
+       * ⚠️ 内边距取**单元格级优先**（与 `<td>` 的 padding、拖动钳制、打印端**同一个来源**）。
+       */
+      const padMmHere = finite(
+        (table.kind === 'table' ? findCell(table.rows, cellId)?.cell : null)?.paddingMm,
+        finite(table.cellPaddingMm, 1.5),
+      )
+      const cellHmm = tdElR
+        ? tdElR.getBoundingClientRect().height / (MM_TO_PX * Math.max(scale, 0.05)) - 2 * padMmHere
+        : 0
+      /** 改哪两条边 —— 8 个方向只是这三种组合 */
+      const hitLeft = dir.includes('w')
+      const hitRight = dir.includes('e')
+      const hitTop = dir.includes('n')
+      const hitBottom = dir.includes('s')
+      let moved = false
+
+      const onMove = (mv: PointerEvent): void => {
+        if (!moved) {
+          if (Math.abs(mv.clientX - startX) + Math.abs(mv.clientY - startY) < 3) return
+          moved = true
+        }
+        const mmPerPx = 1 / (MM_TO_PX * Math.max(scale, 0.05))
+        /* 横向按"占格宽百分比"、纵向按 mm —— 与 `w`/`h`/`x`/`y` 各自的体系一致 */
+        const dxPct = ((mv.clientX - startX) * mmPerPx * 100) / cwMm
+        const dyMm = (mv.clientY - startY) * mmPerPx
+        let w = startW
+        let h = startH
+        let xPct = startPos.xPct
+        let yMm = startPos.yMm
+        /*
+         * ⚠️ **拖左边**时：宽度反向变化，**同时把左偏移推着走** —— 这样**右边界不动**，
+         *    手感才是"从左边拽"而不是"整体往右平移"。与表格列宽拖左外框是同一条纪律
+         *    （见 `onBorderPointerDown` 的 `originShift`）。
+         * ⚠️ 拖上边同理（`y` 跟着走、下边界不动）。
+         */
+        if (hitRight) w = startW + dxPct
+        if (hitLeft) {
+          w = startW - dxPct
+          xPct = startPos.xPct + dxPct
+        }
+        if (hitBottom) h = startH + dyMm
+        if (hitTop) {
+          h = startH - dyMm
+          yMm = startPos.yMm + dyMm
+        }
+        /*
+         * ⚠️⚠️ **四个"角落"锚点 = 等比缩放**（2026-10-16 用户要求：
+         *   「上下左右四个点可以随意修改，而拖动**四个角落点，应该是等比例缩放**」）。
+         *
+         * ⚠️ 判据：**同时命中横向与纵向**（`dir` 是两字母，如 `se` / `nw`）——
+         *   四边的锚点（`n`/`s`/`e`/`w`）**保持自由拉伸**，行为逐字不变。
+         *
+         * ⚠️ **基准比例必须在 mm 下算**：`w` 是"占内容区宽的百分比"、`h` 是 mm，
+         *   直接相除会得出一个**没有任何意义的数**（单位不一致）⇒ 先把 `w` 换算成 mm。
+         *
+         * ⚠️ **以"偏离起点更大"的那根轴为准**：用户往横向拉得狠就听横向、往纵向拉得狠就听纵向 ——
+         *   否则会出现"我明明在往右拉，它却先动高度"的别扭手感。
+         *
+         * ⚠️ **对角固定**：拖左边就推 `x`、拖上边就推 `y`（与上面"右/下边界不动"**同一条纪律**）。
+         *   不做这一步的话，等比缩放会以"左上角"为原点 ⇒ 拖左上角时元素会整体跑掉。
+         */
+        const isCorner = (hitLeft || hitRight) && (hitTop || hitBottom)
+        /* ⚠️ `cellWidthMm` 是**函数**（`cellWidthMm(table, cellId)`）⇒ 先算出这一格的**内容区宽**
+           （减掉左右内边距 —— `w` 的分母就是它，见 `cell-child.ts` 的口径注释）。 */
+        const contentWmmNow = Math.max(1, cellWidthMm(table, cellId) - 2 * padMmHere)
+        if (isCorner && startH > 0) {
+          /*
+           * ⚠️⚠️ **与顶层同一套修法**（2026-10-16）：用"相对起点的缩放因子"，
+           *   不要"选一根轴" —— 后者会让元素**突然放大、锚点脱离鼠标**。
+           * `k = max(w / startW, h / startH)` ⇒ 从 1 倍连续变化、跟手。
+           * ⚠️ 用的是**同轴比值**（百分比 / 百分比、mm / mm）⇒ 不需要换算成 mm；
+           *   下面那行 `contentWmmNow` 只在"写回百分比"时才用得到。
+           */
+          const kFromW = startW > 0 ? w / startW : 1
+          const kFromH = startH > 0 ? h / startH : 1
+          const kScale = Math.max(kFromW, kFromH)
+          w = startW * kScale
+          h = startH * kScale
+          if (hitLeft) xPct = startPos.xPct + (startW - w)
+          if (hitTop) yMm = startPos.yMm + (startH - h)
+        }
+        /* 夹住：宽度在 [MIN, 100]%、高度在 [2, 500]mm、位置不许为负（负了会被格子裁掉一半还找不回来） */
+        const clampedW = Math.min(100, Math.max(MIN_CELL_CHILD_PCT, Math.round(w * 10) / 10))
+        const clampedX = Math.round(Math.max(0, xPct) * 10) / 10
+        /* ⚠️ 纵向下限 0（ = 边框内沿，元素盒子的锚点就在它上面） */
+        const clampedY = Math.round(Math.max(0, yMm) * 10) / 10
+        /*
+         * ⚠️⚠️ **高度上限 = 格高 − 上偏移**（2026-10-13 用户报：
+         *   「点击**上方/下方**三个锚点缩放，元素的下半部分会**超出单元格** ——
+         *    元素可以**向下无限拖大**」）。
+         *
+         * 根因：`onMove`（拖动）那条链有 `maxY` 夹住，**缩放这条链漏了** ——
+         * 两个入口改同一份数据，只夹住一个 ⇒ 另一个照样越界。
+         * ⚠️ 用 `clampedY`（已被夹住的值）而不是原始 `yMm`：
+         *   拖**上边**锚点放大时 `y` 会变小（元素往下长），
+         *   拿未夹的 `y` 算上限会让区间算错。
+         * ⚠️ 下限保底 2mm：极小的格子也不至于算出负的上限。
+         */
+        const maxH = cellHmm > 0 ? Math.max(2, cellHmm - clampedY) : 500
+        const clampedH = Math.min(maxH, Math.max(2, Math.round(h * 10) / 10))
+        /*
+         * ⚠️ **尺寸被夹住时，位置也要跟着停**：拖左边把宽度夹在 MIN 之后，
+         *    如果 `x` 还在继续右移，元素就会"一边缩一边往右跑"。
+         *    ⇒ 用**实际生效的宽度差**反算 `x`（而不是用原始的 `dxPct`）。
+         */
+        /*
+         * ⚠️ 位置也**不许越出格内容区**（与"拖动移动"那条同一个上限 `100 − w`）：
+         *    拖左边把宽度拉大时 `x` 会被往回推，若不同步夹住，元素右边界就跨到隔壁格子上了
+         *    —— 那正是用户报的"覆盖在两个单元格之间"。
+         */
+        const maxX = Math.max(0, 100 - clampedW)
+        const rawX = hitLeft ? startPos.xPct + (startW - clampedW) : clampedX
+        const rawY = hitTop ? startPos.yMm + (startH - clampedH) : clampedY
+        const effX = Math.min(maxX, rawX)
+        /*
+         * ⚠️⚠️ **纵向下限 0、上限 `cellHmm − clampedH`**（2026-10-15 用户报：
+         *   「设置了内边距后，四个元素的**底边都可以被拉出单元格区域**；
+         *     **拉动上边也会导致底边超出单元格**」）。
+         *
+         * 根因：`y` 原来**只夹了下限 0、没有上限**。
+         *   · 拖**上边**锚点：`h = startH − dy`、`y = startY + dy`（底边本该不动），
+         *     但 `clampedH` 有 **2mm 下限** ⇒ 拖到极限后 `h` 停在 2，
+         *     而 `y` 还在继续增大 ⇒ **`y + h` 冲过内容区高** ❌
+         *   · 拖**下边**锚点：`y` 不动、`h` 增大，上限 `maxH = cellHmm − y` 本来是对的，
+         *     但 `Math.max(2, …)` 那条下限在"格子比 2mm 还小"时同样会顶穿。
+         * ⇒ **统一在最后夹一次 `y`**：保证 `y + h ≤ 内容区高`（内边距已经算进 `cellHmm`）。
+         * ⚠️ 与渲染端 `effectiveChildYMm`（按 `行高 − 2×pad` 夹）**同一口径**。
+         */
+        const maxY = Math.max(0, cellHmm > 0 ? cellHmm - clampedH : 500)
+        const effY = Math.min(maxY, Math.max(0, rawY))
+        /* ⚠️ 拖角/拖边都会"从流式变成已定位"（有位置才有 8 个锚点的意义）⇒ 一律写 cellPos */
+        void hadPos
+        /*
+         * ⚠️⚠️ **拖动大小 ⇒ 自动归「自由」**（2026-10-15 用户报：
+         *   「附件元素，我手动去**拖动边框修改大小**，尺寸模式**不会从原图跳转为自由**」）。
+         *
+         * 根因：格内元素的缩放走的是**这条 `onChildResizeDown`**（8 个锚点），
+         *   **跟顶层元素的 `onElementPointerDown` 是两条路** ——
+         *   我上一轮只改了顶层那条（`touchesAnyEdge`）⇒ 格内附件当然不动。
+         *   ⚠️ 而**图片"看起来生效了"**，是因为它没有 `sizeMode` 字段，
+         *     "自由"是**从 `h` 是不是具体值反推**的 —— 这里写了 `h` ⇒ 自动显示为自由。
+         * ⇒ 在这里也把 `sizeMode` 切到 `fixedBox`（**只对 `attach`**，别的 kind 没这个字段）。
+         */
+        actions.patchCellChild(
+          table.id,
+          cellId,
+          {
+            w: clampedW,
+            h: clampedH,
+            cellPos: { xPct: Math.round(Math.max(0, effX) * 10) / 10, yMm: Math.round(Math.max(0, effY) * 10) / 10 },
+            ...(child.kind === 'attach' && child.config.sizeMode !== 'fixedBox'
+              ? { config: { ...child.config, sizeMode: 'fixedBox' as const } }
+              : {}),
+          },
+          `csize:${table.id}:${cellId}:${child.id}`,
+          /* ⚠️ 同上：指定改哪一个 */
+          child.id,
+        )
+      }
+
+      const onUp = (): void => {
+        document.removeEventListener('pointermove', onMove)
+        document.removeEventListener('pointerup', onUp)
+        document.removeEventListener('pointercancel', onUp)
+        if (moved) onCommitEnd?.()
+      }
+
+      document.addEventListener('pointermove', onMove)
+      document.addEventListener('pointerup', onUp)
+      document.addEventListener('pointercancel', onUp)
+    },
+    [actions, cellWidthMm, onCommitEnd, scale],
   )
 
   /** Esc 取消选区。**先于**编辑器的 Esc（取消选中元素）处理，两件事同时发生也不冲突（都只是清状态） */
@@ -2661,7 +3942,40 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
           /* 图片默认可拖拽（HTML 规范）：浏览器自己起原生 dnd，我们的 pointermove 会话就不触发了
              ⇒ 表现为「格内图片拖不动」。自由层那张早加了 draggable={false}，格内这张漏了。 */
           draggable={false}
-          style={{ objectFit: child.fit === 'cover' || child.fit === 'fill' ? child.fit : 'contain' }}
+          /*
+           * ⚠️⚠️ **"原图"模式要按图片的固有尺寸画**（2026-10-15 用户报：
+           *   「图片在手动拖动边框修改大小后，会自动跳到自由，但此时**点击原图**，
+           *    虽说边框跳转回去了，但**明显不是原始尺寸**」）。
+           *
+           * 原来这里只有 `object-fit` ⇒ `.bp-el-cell__child-img` 的 CSS 是 `width/height:100%`
+           *   ⇒ **永远撑满元素框**，"原图"也撑满 ⇒ 看起来跟别的模式没区别。
+           * ⇒ `fit === 'natural'`（= 引用"原图"，由 `imageFillModeOf` 从 `h:'auto'` 反推）时：
+           *   `width/height: auto` ⇒ **让浏览器按图片固有尺寸画**；
+           *   `objectFit: 'none'` ⇒ **不缩放**；
+           *   `maxWidth: 100%` ⇒ **兜底**（比容器宽时仍要收住，避免溢出单元格）。
+           * ⚠️ 打印端本来就是按 `wPx`（图片原始 CSS 像素）算的（见 `render/html.ts` 的
+           *   `case 'original'`）—— 这一改让**画布与打印口径一致**。
+           */
+          style={
+            child.fit === 'natural'
+              ? { width: 'auto', height: 'auto', maxWidth: '100%', objectFit: 'none' }
+              : {
+                  objectFit: child.fit === 'cover' || child.fit === 'fill' ? child.fit : 'contain',
+                  /*
+                   * ⚠️ **`objectPosition` 要跟「对齐」走**（2026-10-16 用户报：
+                   *   「打印的图片一直都是默认对齐左边……**检查其他类似元素有没有同样的 BUG**」）。
+                   *   ⚠️ 画布端**两处都没有**这个属性 ⇒ `contain` 时图**永远居中**，
+                   *   **改「对齐」在画布上完全看不出变化**（打印端已修，这里补上）。
+                   *   ⚠️ 元素级 `align` 缺席 ⇒ 退回居中（与 CSS 默认一致）。
+                   */
+                  objectPosition:
+                    (child as { align?: 'left' | 'center' | 'right' }).align === 'left'
+                      ? 'left center'
+                      : (child as { align?: 'left' | 'center' | 'right' }).align === 'right'
+                        ? 'right center'
+                        : 'center center',
+                }
+          }
         />
       )
     }
@@ -2708,7 +4022,11 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
       )
     }
     if (child.kind === 'text') {
-      return <span className="bp-el-cell__child-text">{renderInline(child.nodes, fields, child.id)}</span>
+      return (
+        <span className="bp-el-cell__child-text">
+          {renderInline(child.nodes, fields, child.id, undefined, undefined, undefined, decoOf(child.style))}
+        </span>
+      )
     }
     if (child.kind === 'hline') {
       return (
@@ -2740,7 +4058,15 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         }
         return (
           <div className="bp-el-text" style={blockCss(el.style)}>
-            {renderInline(el.nodes, fields, el.id, pickFor(el.id, null))}
+            {renderInline(
+              el.nodes,
+              fields,
+              el.id,
+              pickFor(el.id, null),
+              el.style?.color,
+              undefined,
+              decoOf(el.style),
+            )}
           </div>
         )
       }
@@ -2780,12 +4106,27 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                 >
                   {row.cells.map((c) => {
                     const ci = row.cells.indexOf(c)
+                    /*
+                     * ⚠️ **网格列号**（2026-10-17）：`ci` 是**数组下标**，合并之后 ≠ 网格列号。
+                     *   选区（`selRange`）存的是网格坐标 ⇒ 判"这一格在不在选区里"必须用这个。
+                     */
+                    const colStart = row.cells
+                      .slice(0, ci)
+                      .reduce((a2, cc) => a2 + Math.max(1, Math.floor(finite(cc.colspan, 1))), 0)
                     /**
                      * ⚠️ 判据里多了 `childSel`：选中的是**这一格里的子元素**时，这一格也要亮 ——
                      * 子元素在视觉上就在格子里，格子不亮会让人以为"什么都没选中"。
                      * 复合 id 只在这里算一次（下面渲染子元素还要用同一个值）。
                      */
                     const childKey = cellChildId(el.id, c.id)
+                    /*
+                     * ⚠️ **"这一个子元素"被选中的判据**（2026-10-16）——
+                     *   3 段 id：`child:<tableId>:<cellId>:<childId>`。
+                     *   ⚠️ 必须**逐个子元素算**（每个 child 一次），所以放在 map 回调里。
+                     *   见上面 `className` 处的注释（为什么要与 `childSel` 分开）。
+                     */
+                    const thisChildSelOf = (cid: string): boolean =>
+                      selectedId === cellChildId(el.id, c.id, cid)
                     /*
                      * 这一格的**宽度（mm）** —— 只给格内码预览定尺寸用。
                      *
@@ -2815,7 +4156,21 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                         colSpan={Math.max(1, finite(c.colspan, 1))}
                         rowSpan={Math.max(1, finite(c.rowspan, 1))}
                         data-cell-id={c.id}
-                        className={`bp-el-cell${selected ? ' is-selected' : ''}${row.isHeader ? ' is-header' : ''}${isDropTarget ? ' is-drop-target' : ''}${inSel(el.id, r, ci, selRange) ? ' is-rsel' : ''}`}
+                        /*
+                         * ⚠️⚠️ **选区判断要用"网格列号 `col`"，不能用"数组下标 `ci`"**
+                         *   （2026-10-17 用户报："合并后选中被合并的单元格，**悬浮菜单没有恢复的选项**"）。
+                         *
+                         * 根因：`selRange` 存的是**网格坐标**（`r1/c1/r2/c2`），
+                         *   而合并之后 `row.cells` 的**数组下标 ≠ 网格列号**（少了被合并掉的那些）⇒
+                         *   `is-rsel` 加不上 ⇒ 工具条靠 `td.is-rsel` 量位置**量不到** ⇒
+                         *   `barAt = null` ⇒ **整个浮动菜单不出现** ✅
+                         * ⚠️ `col` 是上面那圈 `for` 累加 `colspan` 算出来的**网格列号**，正好是同一口径。
+                         */
+                        className={`bp-el-cell${selected ? ' is-selected' : ''}${row.isHeader ? ' is-header' : ''}${isDropTarget ? ' is-drop-target' : ''}${inSel(el.id, r, colStart, selRange) ? ' is-rsel' : ''}${
+                          childPush && childPush.cellId === c.id
+                            ? ` is-push${childPush.l ? ' is-push-l' : ''}${childPush.r ? ' is-push-r' : ''}${childPush.t ? ' is-push-t' : ''}${childPush.b ? ' is-push-b' : ''}`
+                            : ''
+                        }`}
                         /* 按下即起"拖动扩选"（规格 四）。⚠️ 单元格从此不再兼任"拖整表"——
                            那个角色归表格手柄（规格 一），见 onCellPointerDown 的注释。 */
                         onPointerDown={(ev) => onCellPointerDown(ev, el, r, ci, c.id)}
@@ -2830,7 +4185,61 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                          */
                         style={{
                           ...cell(r, ci),
-                          padding: pad,
+                          /*
+                           * ⚠️⚠️ **单元格级内边距优先**（2026-10-14 修）。
+                           *
+                           * 用户报：「**不论内边距是多少，都依旧是上左右三边无法紧贴，底边可以紧贴**」——
+                           * "不论多少都一样" ⇒ 那个偏移**与内边距无关** ⇒ 查下来是：
+                           *   · **打印端**读 `cell.paddingMm`（**回退**表格默认）；
+                           *   · **画布端**只读 `el.cellPaddingMm`（**表格级**）⇒ **完全忽略单元格级内边距**。
+                           * ⇒ 用户在**单元格**上改内边距时，画布纹丝不动 ⇒ 表现"怎么改都一样"。
+                           * ⇒ 与打印端**逐字同口径**：单元格优先、表格兜底。
+                           */
+                          padding: mmToPx(finite(c.paddingMm, finite(el.cellPaddingMm, 1.5))),
+                          /*
+                           * ⚠️ **「被挤压的那条边」高亮**（2026-10-15 用户澄清：
+                           *   「**动效应该加在被挤压的那条边上，不是加在元素上**」）。
+                           *
+                           * ⚠️ 只把**阴影值**用 CSS 变量传进去（多边可以拼），
+                           *   **动画由  那个类负责** ——
+                           *   inline 的 box-shadow **没法做动画**（CSS 动画只能作用于样式表里的声明）。
+                           * ⚠️ 用  内阴影而**不是 border**：border 会改变盒模型尺寸，
+                           *   而这个文件里所有几何（命中测试/手柄落点/列宽占比）都按 border-box 读 rect。
+                           */
+                          ...(childPush && childPush.cellId === c.id
+                            ? ({
+                                '--push-shadow': [
+                                  childPush.l ? 'inset 3px 0 0 0 var(--accent)' : '',
+                                  childPush.r ? 'inset -3px 0 0 0 var(--accent)' : '',
+                                  childPush.t ? 'inset 0 3px 0 0 var(--accent)' : '',
+                                  childPush.b ? 'inset 0 -3px 0 0 var(--accent)' : '',
+                                ]
+                                  .filter(Boolean)
+                                  .join(', '),
+                              } as React.CSSProperties)
+                            : {}),
+
+                          /*
+                           * ⚠️⚠️ **`position: relative` 必须在这里**（2026-10-14）。
+                           *
+                           * 格内子元素是 `position: absolute`，它的 `left/top` 是**相对单元格内容区**算出来的
+                           * ⇒ 如果这一格**没有建立定位上下文**，绝对定位会去找**更外层的定位祖先**
+                           *   （`.bp-paper` / 版心之类）⇒ 元素会**跑到别的格子上或跨格**。
+                           * ⇒ 与打印端（`render/html.ts` 的 `<td>`）**同一口径**。
+                           */
+                          position: 'relative',
+                          /*
+                           * ⚠️ **这里不能有 `overflow: hidden`**（2026-10-13 用户第 2 次反馈后删掉）：
+                           *   「元素**向上**拖动会被切掉大概一半，**向下**拖动也会被裁切一点点」。
+                           *
+                           * 上一轮我加裁切，是因为"纵向没有分母、算不出来"。**那个判断是错的** ——
+                           * 拖动那一刻格子已经渲染出来，内容区高度**量得出来**
+                           * （见 `onChildPointerDown` 的 `cellGeom.height`）。
+                           * ⇒ 纵向改成**夹住**之后，元素永远待在内容区内，**根本不需要裁**；
+                           *   留着裁切只会制造"向上被切一半"这种诡异现象
+                           *   （`y` 允许负值时元素跑到内边距里，就被裁了）。
+                           * ⚠️ 两端必须一致：`render/html.ts` 的 `<td>` 同样**不加**。
+                           */
                           ...(c.style ? textCss({ ...el, style: c.style }) : null),
                           ...(c.style?.vAlign === 'middle'
                             ? { verticalAlign: 'middle' as const }
@@ -2847,12 +4256,56 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                           ev.stopPropagation()
                           onSelect(el.id)
                           onSelectCell(el.id, c.id)
+                          /*
+                           * ⚠️⚠️ **只有"点在空白处"才清掉行内节点的选中**（2026-10-17）。
+                           *
+                           * 用户报过两个相反的问题，这条是它们的**折中点**：
+                           *   1️⃣ 「选了格内字段后，点单元格空白处，右侧还是字段面板」
+                           *      —— 因为 `selectedNode` 是独立状态，`<td>` 的点击没清它；
+                           *   2️⃣ 「选择没办法选中格内元素了」
+                           *      —— 我上一版在 `<td>` 里**无条件** `onSelectNode(null)`，
+                           *         而**点 chip 时它的 `onClick` 不 `stopPropagation`**（这是有意的，
+                           *         见 `renderInline` 里那条注释）⇒ 冒泡到 `<td>` ⇒ **刚选中的又被清掉** ❌
+                           *
+                           * ⇒ 判据：**事件目标是不是落在 `.bp-chip` 里**（字段/系统变量节点）。
+                           *    · 是 ⇒ 保留节点选中（让节点那层说了算）；
+                           *    · 否（格子空白/纯文字）⇒ 清掉，切回"这一格"的面板。
+                           * ⚠️ 用 `closest` 而不是 `===`：chip 内部还有 `.bp-chip__text` 那一层。
+                           */
+                          const t = ev.target as HTMLElement | null
+                          if (!t?.closest?.('.bp-chip')) onSelectNode?.(null)
                         }}
                         onDoubleClick={(ev) => {
                           ev.stopPropagation()
                           beginEditing(el.id, c.id, nodesToText(c.nodes))
                         }}
                       >
+                        {/*
+                          ⚠️ **定位辅助线**（2026-10-16 用户要求："拖动时有定位辅助线 +
+                            要有一定的吸附作用"）。
+                          ⚠️ 画在 `<td>` 里：`left` 用**百分比**（横向）、`top` 用 **mm**（纵向）——
+                            与"格内元素定位"**同一套单位口径**（横向%，纵向 mm）。
+                          ⚠️ `pointer-events: none`（CSS 里）⇒ 不会挡住拖动/点击。
+                          ⚠️ 只在"正在吸附的那一格"显示（`childSnap.cellId === c.id`）。
+                        */}
+                        {childSnap && childSnap.cellId === c.id ? (
+                          <>
+                            {childSnap.lineX !== null ? (
+                              <span
+                                className="bp-snap-line bp-snap-line--v"
+                                style={{ left: `${childSnap.lineX}%` }}
+                                aria-hidden
+                              />
+                            ) : null}
+                            {childSnap.lineY !== null ? (
+                              <span
+                                className="bp-snap-line bp-snap-line--h"
+                                style={{ top: `${childSnap.lineY}mm` }}
+                                aria-hidden
+                              />
+                            ) : null}
+                          </>
+                        ) : null}
                         {cellEditing ? (
                           <textarea className="bp-inline-edit bp-inline-edit--cell" {...inlineEditProps(el)} />
                         ) : empty && !(c.children && c.children.length > 0) && selected ? (
@@ -2866,6 +4319,8 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                               （"图片在上、说明文字在下"是这类格子的通行排版，见 TableCell.children 的注释）。
                             */}
                             {(c.children ?? []).slice(0, MAX_CELL_CHILDREN).map((child) => {
+                              /* ⚠️ **这一个子元素**是否被选中（3 段 id）—— 锚点/描边只认它 */
+                              const thisChildSel = thisChildSelOf(child.id)
                               const pct = childWidthPct(child)
                               /*
                                * ⚠️ 与**打印端同口径**：`childBoxHeightMm` 把 `h:'auto'` 也当成默认高
@@ -2873,10 +4328,157 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                                * 这一条必须两边一致 —— 否则就是"画布看着 18mm、打印出来把行撑破"。
                                */
                               const boxH = childBoxHeightMm(child)
+                              /*
+                               * ⚠️ **已手动定位 ⇒ 绝对定位；没定位 ⇒ 维持流式**（2026-10-13）。
+                               * 这是"老模板零影响"的开关：`cellPos` 缺席就是原来那条路。
+                               * ⚠️ 与打印端**同一份口径**（`lib/cell-geometry.ts`），两端必须逐字一致。
+                               */
+                              const positioned = isChildPositioned(child)
+                              /*
+                               * ⚠️ **`boxed` = "要不要把元素装进一个精确定尺寸的盒子"**（2026-10-13 重构）。
+                               *
+                               * 两种情况都要：
+                               *   · **已定位** ⇒ 盒子提供绝对定位的坐标系与尺寸；
+                               *   · **选中但未定位** ⇒ 也要盒子 —— 否则**锚点没有参照物**，
+                               *     只能靠算坐标 ⇒ 算出来的和画出来的对不上
+                               *     （用户报的「点击后**不会出现**锚点」「锚点**不贴边**」就是它）。
+                               * ⚠️ 代价：选中未定位的元素时它从"流式"变成"绝对定位" ⇒ 视觉上可能微跳一下。
+                               *    这是**刻意的取舍**：不这么做，锚点就没有可靠的边可以贴。
+                               */
+                              const boxed = positioned || childSel
+                              const xp = childOffsetXPct(child)
+                              /*
+                               * ⚠️⚠️ **行高直接用作用域里的 `row`**（2026-10-15 修）。
+                               *
+                               * 我昨天写成 `el.rows.find(rw => rw.cells.some(x => x.id === c.id))` ——
+                               * **多此一举，而且查不到**（`el` 在这一层可能已被遮蔽），
+                               * 于是传进去的是 `undefined` ⇒ `effectiveChildYMm` 走"不夹"分支 ⇒
+                               * 用户实测 `topStyle = 19.4996mm`（上限本该 18.1）⇒ **压根没夹**。
+                               * ⇒ 现在的外层就是 `el.rows.map((row, r) => …)`（3517 行）⇒ **直接用它**。
+                               */
+                              const yp = effectiveChildYMm(
+                                child,
+                                typeof row.heightMm === 'number' ? row.heightMm : undefined,
+                                /* ⚠️ 单元格级内边距优先（与 <td> 的 padding、打印端同源）*/
+                                finite(c.paddingMm, finite(el.cellPaddingMm, 1.5)),
+                              )
+                              /*
+                               * ⚠️⚠️ **横向一律用 mm，不要用百分比**（2026-10-14 第 2 次对齐，与打印端同口径）。
+                               *
+                               * 用户报：「能拖到底边了，但**拖不到左边和上边**（总隔一点），
+                               *   而**右边没有距离、甚至能拖到单元格边框上**」。
+                               * 根因：**横向的 `left: X%`，其分母是"包含块的 padding box 宽"
+                               *   （= 内容区宽 + 左右内边距）**，而 `X` 是按**内容区**算的
+                               *   ⇒ **越靠右偏得越多**（`X=0` 时不偏 ⇒ "左边看着还行"）。
+                               *   纵向用的是 mm（绝对单位）⇒ 不吃这个亏 ⇒ 四边行为不一致。
+                               * ⇒ 与打印端**逐字同口径**：`xMm = xPct% × 内容区宽`、`wMm = w% × 内容区宽`。
+                               *   ⚠️ `pad` 的偏移仍由下面的 `margin` 承担（等价于打印端的"内容区容器"）。
+                               */
+                              const cwMm = Math.max(
+                                1,
+                                cellWidthMm(el, c.id) - 2 * finite(c.paddingMm, finite(el.cellPaddingMm, 1.5)),
+                              )
                               return (
+                                <>
+                                {/*
+                                  ⚠️ **定位容器**（2026-10-13）。已定位时它撑住行高（`y + h`），
+                                  否则子元素绝对定位后就没人给高度、**格子会塌**（旧设计拒绝绝对定位的
+                                  理由正是这个，现在靠这层容器解决）。与打印端逐字对应。
+                                  ⚠️ 未定位时它是**无样式的普通块**（`display: block` 由 CSS 给）⇒
+                                  与加它之前逐字等价。
+                                */}
+                                <span
+                                  className="bp-el-cell__holder"
+                                  style={{
+                                    display: 'block',
+                                    /*
+                                     * ⚠️⚠️ **holder 就是"元素盒子"本身**（2026-10-13 第 2 次重构）。
+                                     *
+                                     * 宽高与偏移**全部按元素**给 —— 这样锚点用 `0/50/100%` 定位
+                                     * 就直接贴**元素**四周。
+                                     * ⚠️ 上一版 holder 是 `width:100%`（**整格宽**）⇒ 锚点贴到了
+                                     *   **单元格**四周（用户报："8 个锚点紧贴**单元格**四周，而不是元素四周"）。
+                                     *
+                                     * ⚠️⚠️ **一律绝对定位，不看是否选中/已定位**：
+                                     *   上一版是"`boxed` 才绝对定位"（`positioned || childSel`）⇒
+                                     *   **每点一次元素就切换一次定位模式** ⇒ 行高**来回跳**
+                                     *   （用户报："拖进格子后单元格被撑大，**点击该元素后立刻恢复正常**，
+                                     *     点别处又再次被撑大"）。
+                                     *   ⇒ 模式必须**与选中状态无关**，否则"选中"这个动作会改变布局。
+                                     * ⚠️ 代价：未定位的元素**也不占行高**了（它 `x=y=0`，视觉上仍贴左上）。
+                                     *   这与用户选的"#5-A 缩放不影响行高"是同一条口径。
+                                     */
+                                    position: 'absolute',
+                                    /* ⚠️ 横向用 mm（与打印端同口径）—— 见上面 `cwMm` 的注释 */
+                                    /*
+                                     * ⚠️ **元素级 `align` 优先于所在单元格的对齐**（2026-10-15 补齐）。
+                                     *   打印端早就这么读了（`render/html.ts` 的 `ownAlign ?? cell.style?.align`），
+                                     *   **画布端只读了 `c.style?.align`** ⇒ 用户在属性面板/拖动时设的元素级对齐
+                                     *   **只在打印里生效、画布上看不到** —— 又一处只做了一半。
+                                     *   ⚠️ 都没有 ⇒ 退回单元格的 `style.align`（老模板行为不变）。
+                                     */
+                                    left: `${
+                                      Math.round(
+                                        ((childBoxLeftPct(child, (child as { align?: 'left' | 'center' | 'right' }).align ?? c.style?.align) /
+                                          100) *
+                                          cwMm) *
+                                          100,
+                                      ) / 100
+                                    }mm`,
+                                    top: `${yp}mm`,
+                                    /*
+                                     * ⚠️⚠️ **与打印端的"内容区容器"等价的偏移**（2026-10-14，成对改动）。
+                                     *
+                                     * 打印端把格内子元素包进了一层"内容区容器"（top/left = pad）⇒
+                                     *   元素的 yMm/xMm 是**相对内容区**的。
+                                     * 画布端没有那层容器 ⇒ 若不加这个 margin，
+                                     *   同一个 yMm 在画布上会**偏高一个 pad**（用户实测："上下贴紧、左右正常"）。
+                                     * ⚠️ **成对改动**：钳制 maxY 也要按"容器高"算（见 onChildPointerDown）。
+                                     */
+                                    /*
+                                     * ⚠️⚠️ **必须与 `<td>` 的 `padding` 用同一个值**（2026-10-14，控制台实测抓到的）。
+                                     *
+                                     * 实测数据：`td 的 padding = "0px"`，而这里的 `margin = "5.66929px"`（= 1.5mm）——
+                                     *   ⇒ **内边距设成 0 时，`margin` 还留着表格级的 1.5mm** ⇒ 画布上永远差 1.5mm 贴不上。
+                                     * 根因：`<td>` 的 `padding` 上一轮已改成"**单元格优先**"，
+                                     *   而这里用的还是 `<table>` 那一层的 `pad`（**只读表格级**）——
+                                     *   **同一个量被读了两遍、读的还是两份数据**（今天第 3 次栽在这上面）。
+                                     * ⇒ 就地按"单元格优先"算，与 `<td>` 的 `padding` **逐字同源**。
+                                     */
+                                    marginLeft: `${
+                                      mmToPx(finite(c.paddingMm, finite(el.cellPaddingMm, 1.5)))
+                                    }px`,
+                                    marginTop: `${
+                                      mmToPx(finite(c.paddingMm, finite(el.cellPaddingMm, 1.5)))
+                                    }px`,
+                                    width: `${Math.round(((pct / 100) * cwMm) * 100) / 100}mm`,
+                                    height: `${boxH}mm`,
+                                    /*
+                                     * ⚠️⚠️ **这条 margin 已删**（2026-10-14）。
+                                     *
+                                     * 它是"用 margin 补偿原点"的补丁：让 holder 整体偏移 `pad`。
+                                     * **后果**：**右/下能压到边框（超出内容区）、左/上永远差一个 pad** ——
+                                     *   补偿的方向是"整体推"，不是"原点挪"，所以四边行为必然不对称。
+                                     *
+                                     * ⚠️ **正确做法（打印端同款）**：外层包一个"内容区容器"，
+                                     *   子元素相对它定位 ⇒ 原点天然是"内容区"、内边距天然生效。
+                                     *   本地已验证四角都能贴（见提交说明），此处保持原点 = 边框内沿、
+                                     *   由容器负责内缩 —— **两层结构各司其职，不再互相补偿**。
+                                     */
+                                  }}
+                                >
                                 <span
                                   key={child.id}
-                                  className={`bp-el-cell__child${childSel ? ' is-selected' : ''}`}
+                                  /*
+                                   * ⚠️⚠️ **锚点/描边只看"这一个子元素"被不被选中**（2026-10-16 修 #1/#4）。
+                                   *   原来用的是 `childSel`（**格级**）⇒ 两个后果：
+                                   *     · 点击某个子元素后，`selectedId` 是 3 段 id、而 `childSel` 比的是 2 段
+                                   *       ⇒ **永远不相等** ⇒ 锚点不出现、面板也停在第一个元素；
+                                   *     · 右键**整格**时选中的是 2 段 id ⇒ **那格所有子元素都亮**（看着像"全选中了"）。
+                                   *   ⇒ 用 `thisChildSel`（`child:<t>:<c>:<id>`）精确到"这一个"。
+                                   * ⚠️ `childSel`（格级）**保留** —— 它管的是"绝对定位/容器"那套，语义没变。
+                                   */
+                                  className={`bp-el-cell__child${thisChildSel ? ' is-selected' : ''}`}
                                   /* 规格 六：「单元格内的元素可以再拖出来，回到画布自由层」——
                                      按下即起一条拖动会话（见 onChildPointerDown） */
                                   /* 绿色描边 + 右上角类型角标（CSS 用 attr(data-kind) 画） */
@@ -2890,13 +4492,27 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                                    * 而"点了没反应"比"没有这个控件"更坏（用户会以为插件坏了）。
                                    */
                                   style={{
-                                    width: `${pct}%`,
-                                    /* ⚠️ 盒子**始终**有高度 + 裁切（2026-09-24 第四批 ④）——
-                                       这就是"不把单元格撑变形"的那一刀，与打印端 `renderCellContent` 逐字对应 */
-                                    height: `${boxH}mm`,
+                                    /*
+                                     * ⚠️ **铺满 holder**（holder 现在**就是元素盒子**）——
+                                     * 子元素自己不再定位、也不再算宽高（那两件事都由 holder 承担）。
+                                     * ⚠️ 顺带根治了"选中态改变布局"：以前这里在
+                                     *   `position:absolute`（已定位）与 `margin:auto`（流式）之间切换，
+                                     *   **每点一次元素都会重排一次** ⇒ 行高来回跳。
+                                     * ⚠️ 水平对齐（`cell.style.align`）暂时由 holder 的 `left` 承担 ——
+                                     *   未定位时 `left = 0`（靠左），与以前的默认行为一致。
+                                     */
+                                    width: '100%',
+                                    height: '100%',
                                     overflow: 'hidden',
+                                    /*
+                                     * ⚠️ **正被拖出（已脱钩）时本体淡出**（2026-10-13 用户报：
+                                     *   「元素样式**还留在单元格里**，不会随着鼠标指针过去」）。
+                                     *    位置由 `.bp-child-ghost-body` 表达 ⇒
+                                     *    本体不淡出的话，屏幕上会同时出现"两个它"。
+                                     */
+                                    opacity: childGhost?.child?.id === child.id ? 0.25 : undefined,
                                   }}
-                                  title={`${elementLabel(child)} · 单击选中，可拖到别的格子或拖出到画布`}
+                                title={`${elementLabel(child)} · 单击选中，可拖到别的格子或拖出到画布`}
                                   onPointerDown={(ev) => onChildPointerDown(ev, el, c.id, child)}
                                   /*
                                    * ⚠️ 必须吃掉 click：`<td>` 的 onClick 会把选中打回整表
@@ -2911,21 +4527,105 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                                     /* 先选中再弹菜单：菜单里「编辑属性」要对准这一格里的那个元素，
                                        而不是上一个被选中的东西 */
                                     onSelectCell(el.id, c.id)
-                                    onSelect(childKey)
+                                    /*
+                                     * ⚠️⚠️ **必须带 `child.id`（3 段）**（2026-10-16 第二次修）：
+                                     *   写 2 段的 `childKey`（格级）时，面板解不出"点的是哪一个"
+                                     *   ⇒ **永远显示第一个元素**（用户报："面板显示第一个增加的元素"）✅
+                                     */
+                                    onSelect(cellChildId(el.id, c.id, child.id))
                                     setCtx({
                                       x: ev.clientX,
                                       y: ev.clientY,
-                                      target: { kind: 'child', tableId: el.id, cellId: c.id },
+                                      target: { kind: 'child', tableId: el.id, cellId: c.id, childId: child.id },
                                     })
                                   }}
                                 >
                                   {renderCellChild(child, cellBoxMm)}
                                 </span>
+                                {/*
+                                  ⚠️ **缩放手柄**（2026-10-13 用户需求：格内元素"可以手动缩放"）。
+                                  选中时出现在子元素的右下角。
+
+                                  ⚠️ 放在 **holder 层**而不是子元素层：子元素盒子有 `overflow:hidden`
+                                  （"不把单元格撑变形"那一刀），手柄贴边会被裁掉一半、只剩几 px 能点。
+                                  ⚠️ 只在**已定位**时给手柄：未定位时子元素横向由 `margin:auto`
+                                  决定位置（可能居中/靠右），`left: calc(x% + w%)` 算出来的角是错的。
+                                  未定位时改尺寸走右侧面板的「占格宽 / 高」。
+                                  ⚠️ 位置：横向 `calc(偏移% + 占格宽%)`（两个百分比直接相加）、
+                                  纵向 `偏移mm + 盒高mm`（两个 mm 直接相加）。
+                                */}
+                                {/*
+                                  ⚠️⚠️ **锚点要跟 `thisChildSel`（3 段）走，不是 `childSel`（格级）**
+                                  （2026-10-16 第二次修）：用格级条件时，点选写的是 3 段 id、
+                                  这里比的是 2 段 ⇒ **永不相等** ⇒ **点一个子元素不出现锚点** ✅
+                                  （而右键整格时选中的是 2 段 id ⇒ **那格所有子元素都亮** —— 正是用户描述的现象。）
+                                */}
+                                {/*
+                                  ⚠️ **缩放手柄只给"该缩放的 4 种"**（2026-10-16 用户要求：
+                                  · 所有格内元素都**可自由拖动**；
+                                  · 但**只有附件/图片/码可自由缩放** —— `hline`/`text` 只拖不缩）。
+                                  ⚠️ 判据取**唯一来源** `SCALABLE_CELL_KINDS`（在 `cell-child.ts`）。
+                                */}
+                                {thisChildSel && SCALABLE_CELL_KINDS.includes(child.kind) ? (
+                                  <>
+                                    {/*
+                                      ⚠️ **8 个锚点**（2026-10-13 用户要求："点击后应该在边框出现 8 个锚点，
+                                      鼠标移动上去出现**缩放的指针图标**，按住左键进行缩放"）。
+                                      ⚠️ 只做一个角是不够的："往左扩 / 往上扩"这两个最自然的动作会做不到
+                                      （只能"往右下长大、再把位置挪回去"）。
+                                      ⚠️ 位置用 `calc(偏移% + 占格宽% × 系数)` 算：
+                                      横向两个百分比可以直接相加；纵向 `y + h × 系数` 是 mm 相加。
+                                      ⚠️ 光标由内联 `cursor` 给（8 个方向各不相同），不是靠 8 个 CSS 类。
+                                    */}
+                                    {(
+                                      [
+                                        ['nw', 0, 0, 'nwse-resize'],
+                                        ['n', 0.5, 0, 'ns-resize'],
+                                        ['ne', 1, 0, 'nesw-resize'],
+                                        ['w', 0, 0.5, 'ew-resize'],
+                                        ['e', 1, 0.5, 'ew-resize'],
+                                        ['sw', 0, 1, 'nesw-resize'],
+                                        ['s', 0.5, 1, 'ns-resize'],
+                                        ['se', 1, 1, 'nwse-resize'],
+                                      ] as const
+                                    ).map(([d, fx, fy, cur]) => (
+                                      <span
+                                        key={d}
+                                        className="bp-cellchild-h"
+                                        role="separator"
+                                        aria-label={`拖动调整格内元素大小（${d}）`}
+                                        title="拖动调整大小"
+                                        data-dir={d}
+                                        style={{
+                                          /* ⚠️ 相对 holder（= 元素盒子本身）⇒ **永远贴边**，不用算坐标。
+                                             锚点算坐标会与元素的**实际渲染位置**对不上
+                                             （`margin:auto`、内容按 `contain` 缩过）——
+                                             那正是用户报的"锚点不贴着元素四周，下方特别明显"。 */
+                                          left: `${fx * 100}%`,
+                                          top: `${fy * 100}%`,
+                                          cursor: cur,
+                                        }}
+                                        onPointerDown={(ev) => onChildResizeDown(ev, el, c.id, child, d)}
+                                      />
+                                    ))}
+                                  </>
+                                ) : null}
+                                </span>
+                                </>
                               )
                             })}
                             {(c.children?.length ?? 0) > 0 && c.nodes.length === 0
                               ? null
-                              : renderInline(c.nodes, fields, c.id, pickFor(el.id, c.id))}
+                              /* ⚠️ 传"这一格"的颜色 → 元素颜色作兜底（见 renderInline 的注释） */
+                              : renderInline(
+                                  c.nodes,
+                                  fields,
+                                  c.id,
+                                  pickFor(el.id, c.id),
+                                  c.style?.color ?? el.style?.color,
+                                  c.wrap,
+                                  decoOf(c.style ?? el.style),
+                                )}
                           </>
                         )}
                       </td>
@@ -2945,7 +4645,19 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
             alt=""
             draggable={false}
             /* 与打印端同一套取值：fill/cover 原样，其余（含未设）退回 contain */
-            style={{ objectFit: el.fit === 'cover' || el.fit === 'fill' ? el.fit : 'contain' }}
+            /*
+             * ⚠️ 同上：**顶层图片的对齐也要落到 `object-position`**（2026-10-16）。
+             *   否则用户改「对齐」在画布上看不出任何变化（打印端已修）。
+             */
+            style={{
+              objectFit: el.fit === 'cover' || el.fit === 'fill' ? el.fit : 'contain',
+              objectPosition:
+                (el as { align?: 'left' | 'center' | 'right' }).align === 'left'
+                  ? 'left center'
+                  : (el as { align?: 'left' | 'center' | 'right' }).align === 'right'
+                    ? 'right center'
+                    : 'center center',
+            }}
           />
         )
       case 'hline': {
@@ -3366,6 +5078,42 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                   }}
                 />
               ))}
+              {/*
+                ⚠️⚠️ **两条外框手柄放在最后**（2026-10-13，顺序是刻意的）。
+                
+                用户反馈："表格的**第一行、第一列**无法用鼠标拖动缩放，其他行、其他列倒是正常"。
+                探针实测证明**内线是好的**（拖第 1 列右沿、第 1 行下沿都能改）——
+                用户拖不动的是**表格的左外框 / 上外框**，那两条边上原本**没有手柄**。
+                
+                ⚠️ **为什么排最后而不是最前**：`colHandleHit(id, idx)` / `rowHandleHit(id, idx)`
+                  这类按**下标**取手柄的代码（e2e、探针）都建立在"第 i 条 = 第 i 个边界"上。
+                  插在最前会让下标整体错位、**把既有断言全部改义**。
+                  ⇒ 排在末尾：`0..n-1` 仍是各列右边界 / 各行下边界，外框是**追加的**那一条。
+                ⚠️ 交叉点上的优先级**不靠顺序、靠 CSS 的 `z-index: 1`**（见 `editor.css` 的 `--start`）：
+                  否则上外框横穿每一条列内线，交叉点上会命中列手柄、拖 dy 毫无反应。
+                ⚠️ 位置：左外框 `left: 0`、上外框 `top: 0`，**都不加 translate(-50%)** ——
+                  这两条边正好压在元素边界上，居中会有一半伸到元素外（能否点到取决于外层裁剪，太脆）。
+                
+                ⚠️ 语义（与 Excel 一致）：拖左外框 = 改**第 1 列列宽**，且**右边界不动**；
+                  拖上外框 = 改**第 1 行行高**，且**下边界不动**。
+                  这一点能成立是因为本项目有 **E-45 约束（列宽之和 = 元素总宽）**：
+                  "改列宽 + 反向挪 x" 的净效果就是"左边动、右边不动"。推导见
+                  `onBorderPointerDown` 里 `originShift` 的注释。
+              */}
+              <span
+                role="separator"
+                aria-label="第 1 列左边框（表格左外框），左右拖动调第 1 列列宽"
+                title="拖动调第 1 列列宽（表格左外框）"
+                className="bp-tbl-size__col bp-tbl-size__col--start"
+                onPointerDown={(ev) => onBorderPointerDown(ev, el, 'col', 0, 'start')}
+              />
+              <span
+                role="separator"
+                aria-label="第 1 行上边框（表格上外框），上下拖动调第 1 行行高"
+                title="拖动调第 1 行行高（表格上外框）"
+                className="bp-tbl-size__row bp-tbl-size__row--start"
+                onPointerDown={(ev) => onBorderPointerDown(ev, el, 'row', 0, 'start')}
+              />
             </div>
           ) : null}
           {isOob ? <span className="bp-el-oob" aria-hidden /> : null}
@@ -3853,6 +5601,12 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
       {cellSel && selRange && barAt && actions ? (
         <CellRangeBar
           cellCount={rangeArea(selRange)}
+          /* 与动作层共用一份判据：跨表头 / 跨标题列的合并要提前置灰并说清原因 */
+          mergeBlockReason={(() => {
+            const found = readBand(doc, bandOf(cellSel.tableId)).find((e) => e.id === cellSel.tableId)
+            if (!found || found.kind !== 'table') return '找不到这张表'
+            return mergeRangeBlockReason(found, selRange)
+          })()}
           canSplit={(() => {
             const found = readBand(doc, bandOf(cellSel.tableId)).find((e) => e.id === cellSel.tableId)
             if (!found || found.kind !== 'table') return false
@@ -3920,10 +5674,100 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
           })()
         : null}
       {childGhost ? (
-        <span className="bp-child-ghost" style={{ left: childGhost.x + 12, top: childGhost.y + 12 }}>
-          {childGhost.label}
-        </span>
+        childGhost.child && childGhost.wMm != null && childGhost.hMm != null ? (
+          /*
+           * ⚠️ **拖出格子的那一刻就画"元素本体"**（2026-10-13 用户口径：
+           *   「元素**不能闪现出现**，拖动的时候**依然要跟手移动**，用户可以**实时看到元素的状态**，
+           *    拖动到单元格外时，**样式应当在拖动过程中就变换**」）。
+           *
+           * ⚠️ 位置 = **鼠标位置 − 抓取偏移**（与 `takeOutChild` 的落点同一个算法）——
+           *   不这么算，元素会在鼠标左上角出现（用户报过"无法判断会出现在哪"）。
+           * ⚠️ 尺寸按**画布口径**（mm）：它已经不在格子里了。
+           * ⚠️ 用 `renderCellChild` 渲染（与格内同一套内容渲染），
+           *   但外壳用**画布样式**（虚线蓝框）⇒ "样式在过程中就变"。
+           */
+          <span
+            className="bp-child-ghost-body"
+            style={{
+              left: childGhost.x,
+              top: childGhost.y,
+              /*
+               * ⚠️⚠️ **尺寸必须乘 `scale`**（2026-10-13 用户报：
+               *   「这个虚线框元素本体**比实际元素小得多**，导致**很难计算偏移量**，
+               *     **方向应该是对的**」）。
+               *
+               * 根因：ghost 是 `position: fixed` ⇒ **不在纸张的 `transform: scale()` 里**
+               *   ⇒ 它上面的尺寸**不会跟着画布缩放**，而画布上的元素**会**。
+               *   ⚠️ 而且我原来宽用 `px`（`mmToPx`，不含 scale）、高用 `mm`（固定单位）
+               *     ⇒ **两根轴的单位口径都不一样** ⇒ 宽高比也是错的。
+               * ⇒ 统一：**都换算成 px，并乘 `scale`** ⇒ 与画布上元素的视觉尺寸一致。
+               */
+              width: `${mmToPx(childGhost.wMm) * scale}px`,
+              height: `${mmToPx(childGhost.hMm) * scale}px`,
+            }}
+          >
+            {renderCellChild(childGhost.child, childGhost.wMm)}
+          </span>
+        ) : (
+          <span className="bp-child-ghost" style={{ left: childGhost.x + 12, top: childGhost.y + 12 }}>
+            {childGhost.label}
+          </span>
+        )
       ) : null}
+      {/*
+        「行高 / 列宽」的输入弹层（2026-10-13 用户需求）。
+
+        ⚠️ 行列号**在这一刻才算**（不在右键那一刻算）：
+          弹层开着的这段时间里表格可能已经被改过（面板里每敲一次数字就 patch 一次），
+          把 `rowIdx/colIdx` 抓进 state 会拿一个**过期的行号**去改。
+          ⇒ 与 `splitAsk` 同一套纪律：**从当前文档重新定位**。
+
+        ⚠️ 列号必须用 `colStart`（摊平后的**网格**列号），不能用 `row.cells` 的数组下标 ——
+          span 模型下两者不是一回事（这个坑项目里踩过三次）。
+      */}
+      {sizeAsk
+        ? (() => {
+            const t = readBand(doc, bandOf(sizeAsk.tableId)).find((e) => e.id === sizeAsk.tableId)
+            if (!t || t.kind !== 'table') return null
+            const loc = findCell(t.rows, sizeAsk.cellId)
+            if (!loc) return null
+            const g = (tableGrid(t.rows, t.colWidthsMm.length)[loc.rowIdx] ?? []).find(
+              (x) => x?.cell.id === sizeAsk.cellId,
+            )
+            if (!g) return null
+            const isRow = sizeAsk.kind === 'row'
+            return (
+              <CellSizeDialog
+                kind={sizeAsk.kind}
+                indexLabel={String((isRow ? loc.rowIdx : g.colStart) + 1)}
+                currentMm={
+                  isRow
+                    ? typeof t.rows[loc.rowIdx]?.heightMm === 'number'
+                      ? (t.rows[loc.rowIdx]?.heightMm as number)
+                      : null
+                    : (t.colWidthsMm[g.colStart] ?? null)
+                }
+                onReset={
+                  isRow
+                    ? () => {
+                        const p = setRowHeightPatch(t, loc.rowIdx, undefined)
+                        if (p) onMerge(t.id, p)
+                        setSizeAsk(null)
+                      }
+                    : undefined
+                }
+                onConfirm={(mm) => {
+                  const p = isRow
+                    ? setRowHeightPatch(t, loc.rowIdx, mm)
+                    : setColWidthPatch(t, g.colStart, mm)
+                  if (p) onMerge(t.id, p)
+                  setSizeAsk(null)
+                }}
+                onCancel={() => setSizeAsk(null)}
+              />
+            )
+          })()
+        : null}
       {/*
         「拆分单元格」的输入弹层（第 7 条）。输入框的**下限**取自目标格自己当前占的行列数 ——
         比它小没有意义（"1 行拆成 1 行"什么都没发生），直接把下限摆进输入框，用户不必先试一次才知道。

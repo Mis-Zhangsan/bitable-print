@@ -48,6 +48,11 @@ export interface IRFontStyle {
   bold?: boolean
   italic?: boolean
   underline?: boolean
+  /**
+   * 下划线线型（Word 的 `w:u/@w:val` 归并成两档）。
+   * 只有 `underline === true` 时有意义；缺省按实线。
+   */
+  underlineStyle?: 'solid' | 'dashed'
   strike?: boolean
   color?: string
   /** 高亮 / 底纹（`w:highlight` 或 `w:shd`） */

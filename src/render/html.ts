@@ -32,6 +32,8 @@ import type {
   TableElement,
   TextStyle,
 } from '../lib/types'
+/* 表格 span 摊平（判断"表头行里有没有跨出表头区的合并格"，见 `spanCrossesHead`） */
+import { tableGrid } from '../lib/table-grid'
 import {
   DEFAULT_PRINT_TIME_FORMAT,
   DEFAULT_TODAY_FORMAT,
@@ -59,7 +61,19 @@ import {
  * 格内子元素的尺寸口径 —— 与画布（`components/editor/cell-child.ts`）**共用同一份实现**。
  * 下沉到 `lib/` 就是为了让渲染引擎可以引用它，而不必反向 import UI 层。
  */
-import { childBoxHeightMm, childBoxWidthMm, childHeightMm, childWidthPct } from '../lib/cell-geometry'
+import {
+  childBoxAlign,
+  childBoxLeftPct,
+  childBoxHeightMm,
+  childBoxSpanMm,
+  childBoxWidthMm,
+  childHeightMm,
+  childOffsetXPct,
+  childOffsetYMm,
+  effectiveChildYMm,
+  childWidthPct,
+  isChildPositioned,
+} from '../lib/cell-geometry'
 import type { PageModel, RenderContext, RenderWarning, ResolvedImage } from './context'
 import { imageKey } from './context'
 import { barcodeSvg, isCode128Encodable, qrCodeSvg, QR_MAX_BYTES, utf8ByteLength } from './code-elements'
@@ -164,6 +178,24 @@ function pxPt(pt: number): string {
 /** 文本框通用布局声明：保留换行、允许长词断行 */
 const TEXT_FLOW = 'white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere'
 
+/**
+ * 文本装饰 → CSS 声明（`textCss` / `inlineCss` / 单元格 `<td>` **三处共用**）。
+ *
+ * `underlineStyle: 'dashed'` = 下划虚线，用来拼"填空线"（`经办人：_ _ _ _`）。
+ * ⚠️ 只有 `underline` 也开着时才生效 —— 线型脱离了下划线本身没有意义。
+ * ⚠️ 顺序不能反：`text-decoration` 简写会把 `text-decoration-style` 重置成 solid，
+ *    所以线型必须**写在它后面**。
+ */
+function decoDecl(s: TextStyle): string[] {
+  const deco: string[] = []
+  if (s.underline) deco.push('underline')
+  if (s.strike) deco.push('line-through')
+  if (!deco.length) return []
+  const out = [`text-decoration:${deco.join(' ')}`]
+  if (s.underline && s.underlineStyle === 'dashed') out.push('text-decoration-style:dashed')
+  return out
+}
+
 function textCss(style: TextStyle | undefined, over: string[] = []): string {
   const s = style ?? {}
   const parts: string[] = []
@@ -172,10 +204,7 @@ function textCss(style: TextStyle | undefined, over: string[] = []): string {
   parts.push(`font-size:${pxPt(s.fontSizePt ?? DEFAULT_FONT_PT)}`)
   if (s.bold) parts.push(`font-weight:${BOLD_FONT_WEIGHT}`)
   if (s.italic) parts.push('font-style:italic')
-  const deco: string[] = []
-  if (s.underline) deco.push('underline')
-  if (s.strike) deco.push('line-through')
-  if (deco.length) parts.push(`text-decoration:${deco.join(' ')}`)
+  parts.push(...decoDecl(s))
   parts.push(`color:${s.color ?? DEFAULT_COLOR}`)
   if (s.background) parts.push(`background:${s.background}`)
   parts.push(`text-align:${s.align ?? 'left'}`)
@@ -219,10 +248,7 @@ function inlineCss(style: TextStyle | undefined): string {
   if (typeof s.fontSizePt === 'number') parts.push(`font-size:${pxPt(s.fontSizePt)}`)
   if (s.bold) parts.push(`font-weight:${BOLD_FONT_WEIGHT}`)
   if (s.italic) parts.push('font-style:italic')
-  const deco: string[] = []
-  if (s.underline) deco.push('underline')
-  if (s.strike) deco.push('line-through')
-  if (deco.length) parts.push(`text-decoration:${deco.join(' ')}`)
+  parts.push(...decoDecl(s))
   if (s.color) parts.push(`color:${s.color}`)
   if (s.background) parts.push(`background:${s.background}`)
   if (typeof s.lineHeightPt === 'number') parts.push(`line-height:${pxPt(s.lineHeightPt)}`)
@@ -267,6 +293,7 @@ function resolveField(fieldId: string | null, fieldName: string, scope: RenderSc
       elementId: scope.elementId,
       recordId: scope.record?.recordId,
     })
+
     return ''
   }
   const meta = ctx.fieldMap.get(fieldId)
@@ -348,12 +375,34 @@ function resolveSysVar(node: InlineSysVar, scope: RenderScope, ctx: RenderContex
   }
 }
 
+/**
+ * 行内 **inline-block** 需要自己画的装饰（父级的 `text-decoration` 进不去 atomic inline）。
+ *
+ * 只有"**关掉自动换行**的字段"才是 `inline-block`（`wrap === false`）。父级的下划线
+ * 会在它那里**断**，所以自己补一遍 —— 与画布端 `chipDeco` 同一件事、同一口径。
+ *
+ * 节点自己设过装饰就以它为准（`inlineCss` 已经输出过）；返回一串**以 `;` 结尾**的声明。
+ */
+function inheritDecoDecl(own: TextStyle | undefined, outer: TextStyle | undefined): string {
+  if (own?.underline !== undefined || own?.strike !== undefined) return ''
+  if (!outer || (!outer.underline && !outer.strike)) return ''
+  const parts = decoDecl(outer)
+  return parts.length > 0 ? `${parts.join(';')};` : ''
+}
+
 /** 行内节点 → HTML。所有用户可见文本一律 escapeHtml */
 export function renderInline(
   nodes: InlineNode[] | undefined,
   scope: RenderScope,
   ctx: RenderContext,
   warnings: RenderWarning[],
+  /**
+   * 外层的样式（单元格 / 文本元素）。
+   *
+   * ⚠️ 只用于给 **inline-block** 补画装饰：普通行内 `<span>` 会自然继承父级的
+   * `text-decoration`，而 `display:inline-block` 的（关掉自动换行的字段）不会。
+   */
+  outerStyle?: TextStyle,
 ): string {
   if (!nodes || nodes.length === 0) return ''
   let out = ''
@@ -377,7 +426,22 @@ export function renderInline(
           fMeta && fieldMeta(fMeta.type).renderKind === 'checkbox'
             ? checkboxHtml(isCheckedValue(scope.record?.fields?.[n.fieldId ?? '']), n.style)
             : escapeHtml(resolveField(n.fieldId, n.fieldName, scope, ctx, warnings))
-        out += `<span style="${attr(inlineCss(n.style))}">${inner}</span>`
+        /*
+         * ⚠️ **自动换行开关**（2026-10-17 用户要求：开 ⇒ 换行；关 ⇒ 裁切）。
+         *
+         * 默认（`wrap !== false`）沿用外层 `TEXT_FLOW`（`pre-wrap`）⇒ **与原来一致**；
+         * `wrap === false` ⇒ 强制**不换行 + 裁切**（`overflow:hidden` 需要块级容器才生效，
+         *   所以外面套一层 `inline-block` —— 行内 `<span>` 的 `overflow` 是无效的）。
+         */
+        const wrapCss = n.wrap === false
+          ? 'display:inline-block;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:clip;vertical-align:bottom;'
+          : ''
+        /*
+         * ⚠️ `wrap === false` ⇒ 上面的 span 变成 `inline-block`，父级的下划线/删除线会在它那里**断**
+         * （CSS 装饰进不去 atomic inline）。自己补一遍；普通 span 不补 —— 它会自然继承，补了会变粗。
+         */
+        const decoCss = n.wrap === false ? inheritDecoDecl(n.style, outerStyle) : ''
+        out += `<span style="${attr(wrapCss + decoCss + inlineCss(n.style))}">${inner}</span>`
         break
       }
       case 'sysvar':
@@ -412,6 +476,14 @@ export interface AttachmentLayoutResult {
   html: string
   /** 内容高度（mm），调用方可直接用于测量校验 */
   heightMm: number
+  /**
+   * ⚠️ **内容实际宽度（mm）**（2026-10-15）。
+   *
+   * 为什么需要：之前外面那层容器**写死用元素框宽 ** ⇒ 用户在自由里拉大过尺寸后，
+   *   切到原图/适配仍被那层容器撑成那个大小（用户报：不论选什么都按选区大小打印）。
+   * ⇒ 现在容器用**真实内容宽**，并把它报给调用方（需要时可按内容度量）。
+   */
+  widthMm: number
   warnings: RenderWarning[]
 }
 
@@ -441,12 +513,33 @@ export function layoutAttachmentGroup(
   config: AttachmentPrintConfig,
   containerWidthMm: number,
   scope: RenderScope,
+  /**
+   * ⚠️ **"图片在框内的落点"提示**（2026-10-14 用户要求）。
+   *
+   * **背景**：用户把附件框摆到格子右侧时，`contain` 的图片**默认居中** ⇒
+   *   框贴右了、图没贴 ⇒ 右边留一段空白（画布上看不出来，因为那边画的是"铺满整框"的占位盒）。
+   * 原来只能靠用户手动设 `config.align`；**用户要求"按元素框在格子里的位置自动决定"**。
+   *
+   * ⇒ 调用方（格内子元素那条路，知道元素的 `cellPos`）算出 `'left' | 'center' | 'right'` 传进来；
+   *   **拿不到时退回 `config.align`** ⇒ 顶层元素/老路径的行为**逐字不变**。
+   */
+  boxAlignHint?: 'left' | 'center' | 'right',
+  /**
+   * ⚠️ **这一格的"内容区"尺寸（mm）**（2026-10-15）。
+   *
+   * **只有"适配"模式需要它** —— 用户口径：「适配 = **依据单元格大小**进行留白/变形/裁切」，
+   *   而"自由 = 按**附件框**"。⚠️ 格内渲染时 `scope` 被换成了**元素自己**的尺寸
+   *   （`widthMm: cellWidthMm, heightMm: childBoxHeightMm(child)`）
+   *   ⇒ 不额外传"单元格尺寸"，两种模式会**完全一样**（这正是用户报的 bug）。
+   * ⚠️ **顶层附件没有单元格** ⇒ 不传 ⇒ 退回元素框（行为不变）。
+   */
+  cellBoxMm?: { w: number; h: number },
 ): AttachmentLayoutResult {
   const warnings: RenderWarning[] = []
   const W = Math.max(0, finite(containerWidthMm))
   // ① 用户显式选了"不打印附件" ⇒ 输出空。这是**选择**，不是"没内容"，所以不给占位框。
   if (config.mode === 'none' || W <= 0) {
-    return { html: '', heightMm: 0, warnings }
+    return { html: '', heightMm: 0, widthMm: 0, warnings }
   }
   /*
    * ② 字段里**没有附件** ⇒ 给占位框（2026-09-24 第四批第 1 / 5 条）。
@@ -457,7 +550,7 @@ export function layoutAttachmentGroup(
    *    否则行的测量高度会与画布上看到的不一致（那会变成"画布≠打印"）。
    */
   if (items.length === 0) {
-    return { html: placeholderHtml('附件', '本条记录没有附件'), heightMm: 10, warnings }
+    return { html: placeholderHtml('附件', '本条记录没有附件'), heightMm: 10, widthMm: W, warnings }
   }
 
   /**
@@ -484,7 +577,7 @@ export function layoutAttachmentGroup(
           )}</div>`,
       )
       .join('')
-    return { html: body, heightMm: Math.max(lineH, names.length * lineH), warnings }
+    return { html: body, heightMm: Math.max(lineH, names.length * lineH), widthMm: W, warnings }
   }
 
   const gapX = Math.max(0, finite(config.gapXMm, 2))
@@ -542,31 +635,21 @@ export function layoutAttachmentGroup(
     const ratio = wPx > 0 && hPx > 0 ? hPx / wPx : 0.75
     let wMm: number
     let hMm: number
-    switch (config.sizeMode) {
-      case 'fixedBox': {
-        /**
-         * **固定宽高**（2026-09-20 用户新增）：框由元素自己的 w×h 决定，图片按 `fit` 放进去。
-         * 与 `fixedHeight`（只定高、宽按比例）的区别就在这里：**宽也由框说了算**。
-         * 尺寸直接取容器（= 元素框宽）与 `scope.heightMm`（= 元素框高）。
-         */
-        wMm = W
-        hMm = Math.max(1, finite(scope.heightMm, finite(config.fixedHeightMm, 40)))
-        break
-      }
-      case 'fixedHeight': {
-        hMm = Math.max(1, finite(config.fixedHeightMm, 40))
-        wMm = ratio > 0 ? hMm / ratio : hMm
-        break
-      }
-      case 'fitCell':
-      case 'original':
-      default: {
-        // 原图尺寸 = 按 CSS 像素 → mm 的等比尺寸（与浏览器直接渲染 <img> 一致）
-        wMm = wPx > 0 ? pxToMm(wPx) : Math.min(W, 40)
-        hMm = wMm * ratio
-        break
-      }
-    }
+      /*
+       * ⚠️⚠️ **三模式已废弃 —— 现在一律"按选区大小"**（2026-10-15 用户定案）。
+       *
+       * 用户原话：「**不再需要原图、适配、自由选项，直接按照选区大小去渲染**，
+       *   渲染方式还是留白、变形、裁切，**让用户自己去调整选区大小**就行」。
+       *
+       * ⇒ 语义只剩一句：**框 = 选区（元素框 `w` × `h`）；图按 `fit` 装进这个框**。
+       *   这等价于原来"自由（fixedBox）"的行为，但**不再需要用户选模式**。
+       *
+       * ⚠️ 旧字段 `sizeMode` / `fixedHeightMm` 仍然**能读**（老模板不会崩），
+       *   但**不再影响尺寸** —— 尺寸只由"选区"（`W` / `scope.heightMm`）决定。
+       *   面板上也已经不再暴露"尺寸模式"。
+       */
+      wMm = Math.max(1, W)
+      hMm = Math.max(1, finite(scope.heightMm, finite(config.fixedHeightMm, 40)))
     // 约束一：绝不能超过容器宽度（F4-14：超出容器时按较小比例缩放）
     let scale = 1
     if (wMm > W) scale = Math.min(scale, W / wMm)
@@ -595,9 +678,24 @@ export function layoutAttachmentGroup(
       })
     }
 
-    // F4-21：有效 DPI 校验（矢量图不参与）
+    /*
+     * F4-21：有效 DPI 校验（矢量图不参与）。
+     *
+     * ⚠️⚠️ **必须用"每张实际分到的宽"，不是"框宽"**（2026-10-16 修）。
+     *   三模式废弃后"框 = 选区" ⇒ 并排多张时 `wMm` 仍是**选区宽**（如 100mm），
+     *   而每张实际只占约 `(100 − gap) / n` ⇒ **DPI 被算小一半** ⇒ 误报"清晰度不足"。
+     * ⚠️ 这里**不把校验挪到分行之后**（那要跨作用域搬 30 行，风险收益不成比例）——
+     *   改为**就地折算**：
+     *     · `wrap`（每张一行）⇒ 就是 `W`；
+     *     · `maxPerRow > 0` ⇒ `(W − (n−1)×gapX) / n`；
+     *     · 其余（inline 自动换行，列数要等排版完才知道）⇒ **保守按 `W`**
+     *       （宁可漏报，也不要**冤枉报** —— 告警可信才有意义）。
+     */
     if (!isVectorImage(it.name, it.mime) && wPx > 0) {
-      const dpi = wPx / (wMm / 25.4)
+      const perRow = config.flow === 'wrap' ? 1 : finite(config.maxPerRow, 0) > 0 ? Math.min(8, Math.floor(finite(config.maxPerRow, 0))) : 0
+      const slotWmm =
+        perRow === 1 ? W : perRow > 1 ? Math.max(1, (W - (perRow - 1) * Math.max(0, finite(config.gapXMm, 2))) / perRow) : W
+      const dpi = wPx / (Math.min(wMm, slotWmm) / 25.4)
       if (dpi < finite(config.minDpi, 150)) {
         warnings.push({
           kind: 'image-low-dpi',
@@ -615,9 +713,67 @@ export function layoutAttachmentGroup(
           config.fileNameWithExt === false ? stripExt(it.name) : it.name,
         )}</div>`
       : ''
-    const img = `<img src="${attr(it.url)}" style="position:absolute;left:0;top:0;width:${px(
-      wMm,
-    )};height:${px(hMm)};object-fit:${config.sizeMode === 'fixedBox' && (config.fit === 'cover' || config.fit === 'fill') ? config.fit : 'contain'};">`
+    /*
+     * ⚠️⚠️ **图片必须单独包一层 `overflow:hidden` 的裁切容器**（2026-10-13 用户诉求：
+     *   「保证打印图片的时候，图片**被严格限制在所设置的附件虚线框内**」）。
+     *
+     * 根因：原来这个 `<img>` 直接 `position:absolute` 挂在"图片格"里，而外层的图片格
+     *   （见下面 `flow` 的组装）**没有 `overflow:hidden`** ⇒
+     *   `cover` / `fill` 时图片按框尺寸铺满、**超出框的部分会画到框外面** ⇒
+     *   相邻的图会互相压、也会盖住表格边框。
+     * ⇒ **裁切容器只能包在图片这一层**：包到外层的话，会把框**下面**那行文件名一起裁掉
+     *   （文件名故意放在 `top: hMm`，就是"框外"的位置）。
+     * ⚠️ `width/height:100%` 让它铺满裁切容器（尺寸仍由外层图片格决定）。
+     */
+    /*
+     * ⚠️⚠️ **`fit`（留白/变形/裁切）在"适配"模式下也必须生效**（2026-10-15 用户报：
+     *   「**尺寸模式中的适配，三个填充方式都试了，打印出来都是原图的样式**」）。
+     *
+     * 根因：这里原来写的是
+     *     `config.sizeMode === 'fixedBox' && (fit === 'cover' || fit === 'fill')`
+     *   ⇒ **只有"自由（fixedBox）"才认 `fit`，其余一律 `contain`** ❗
+     *   而用户口径是「**适配**有三档填充；**自由**也有三档填充」——
+     *   ⇒ **两者都该认**。唯一不该认的是 **"原图"**（那时尺寸由图片本身决定，没有"框"可填）。
+     */
+    /*
+     * ⚠️ **三档填充在任何情况下都生效**（2026-10-15 重构后）：
+     *   "框 = 选区" ⇒ 永远有框可填，不再有"原图模式没有框"这种例外。
+     */
+    const fitCss = config.fit === 'cover' || config.fit === 'fill' ? config.fit : 'contain'
+    /*
+     * ⚠️ **`object-position` 要跟「对齐」走**（2026-10-14 用户报：
+     *   「格内附件会对齐上下左三边，但**不会对齐右边**，会距离一段距离，
+     *    哪怕在画布中已经紧贴着右边了」）。
+     *
+     * 根因：图片被 `contain` 装进"元素框"后，**默认居中**（`object-position: center`）——
+     *   而用户把元素框摆到了格子右侧，**框贴右了、图没贴**，
+     *   于是右边留出一段空白（左边同理，只是他先注意到右边）。
+     * ⚠️ 画布上看不出这个问题：那边画的是**占位盒**（铺满整框），本来就贴着框边。
+     * ⇒ 让图片在框内的落点**跟着对齐设置**：右对齐 ⇒ 贴框右；左对齐 ⇒ 贴框左。
+     * ⚠️ 只在 `contain` 下才有意义（`cover`/`fill` 本来就铺满整框）。
+     *   不过统一写上也无害 —— 另两种模式下 `object-position` 不影响结果。
+     */
+    /*
+     * ⚠️⚠️ **优先级：用户设过的对齐 > 自动位置推断**（2026-10-16 用户报：
+     *   「附件**铺满**后改对齐，打印确实变了，但**如果没有铺满，那么就只会永远对齐左边，
+     *    改了没用**」）。
+     *
+     * 我第一版修的是"铺满时别推 left"，但那**只解决了一半**：
+     *   没铺满且元素靠左（`xPct ≤ 2`）时，自动推断**仍然**给出 `left`，
+     *   而它 `?? config.align` 里排在**前面** ⇒ **又把用户设的中/右盖掉**。
+     *
+     * ⇒ 正确的关系是：**自动推断只是"用户没设过时的默认值"**，
+     *   一旦用户在面板上设了 `align`，就该**完全听用户的**（他改了没反应才是 bug）。
+     * ⚠️ `config.align === undefined` 才代表"没设过"（面板的 Seg 在没设过时显示 `?? 'left'`，
+     *   但**不会写回** ⇒ 字段保持 `undefined`）。
+     */
+    const effAlign = config.align ?? boxAlignHint
+    const objectPos =
+      effAlign === 'right' ? 'right center' : effAlign === 'left' ? 'left center' : 'center center'
+    const img =
+      `<div style="position:absolute;left:0;top:0;width:${px(wMm)};height:${px(hMm)};overflow:hidden;">` +
+      `<img src="${attr(it.url)}" style="width:100%;height:100%;display:block;object-fit:${fitCss};object-position:${objectPos}">` +
+      `</div>`
     flow.push({ wMm, hMm: hMm + nameH, html: img + nmLine })
   }
 
@@ -634,7 +790,7 @@ export function layoutAttachmentGroup(
     })
   }
 
-  if (flow.length === 0) return { html: '', heightMm: 0, warnings }
+  if (flow.length === 0) return { html: '', heightMm: 0, widthMm: 0, warnings }
 
   // ---- 分行：wrap = 每张独占一行；inline = 容器宽度内依次排列，放不下换行 ----
   const maxPerRow = config.flow === 'wrap' ? 1 : config.maxPerRow && config.maxPerRow > 0 ? Math.min(8, Math.floor(config.maxPerRow)) : null
@@ -672,8 +828,24 @@ export function layoutAttachmentGroup(
   }
   const heightMm = Math.max(0, y - gapY)
 
+  /*
+   * ⚠️⚠️ **容器的宽度要用"内容的实际宽度"，不是"元素框宽 `W`"**（2026-10-15 用户报：
+   *   「**原图模式，打印的时候也是按照附件选区框的大小来渲染的**；用户通过自由模式改动过选区大小后，
+   *    后续**不论选择原图还是适配，都是按照这个选区大小**来进行打印」）。
+   *
+   * 真根因：**图片本身按模式算对了**（`wMm`/`hMm`，见上面的 `switch`），
+   *   但**它外面这层容器一直写死 `W`**（= 元素框宽 = 用户在"自由"里拉过的那个宽度）
+   *   ⇒ 容器把整个版面撑成那个尺寸 ⇒ 用户看到的就是"不管选什么都按自由模式的尺寸"。
+   *
+   * ⇒ 改成**内容的最大宽**（单图 = 图片实际宽；多图 = 最宽那一项），
+   *   并**用 `W` 封顶**（绝不能超出容器 —— 与上面"约束一"同一口径）。
+   */
+  /*
+   * ⚠️ **容器宽度 = 选区宽 `W`**（2026-10-15 重构后：框就是选区，不再按内容宽收缩）。
+   *   （我一度改成"内容宽"，那是为"三模式"服务的；三模式已废弃，这条一并回退。）
+   */
   const container = `<div style="position:relative;width:${px(W)};height:${px(heightMm)};">${html}</div>`
-  return { html: container, heightMm, warnings }
+  return { html: container, heightMm, widthMm: W, warnings }
 }
 
 function stripExt(name: string): string {
@@ -731,11 +903,34 @@ function renderImage(el: Extract<AnyElement, { kind: 'image' }>, scope: RenderSc
    * 其余三种（fill/contain/cover）直接进 `object-fit`。
    * ⚠️ 不认识的取值一律退回 `contain`（老模板没有这个字段时的默认行为，不能改）。
    */
+  /*
+   * ⚠️⚠️ **`object-position` 要跟「对齐」走**（2026-10-16 用户报：
+   *   「当我把附件拉到铺满单元格后，打印的图片**一直都是默认对齐左边**……
+   *     修复这个 BUG，**同时检查其他类似元素有没有同样的 BUG**」）。
+   *
+   * ⚠️ 检查结果：**图片 / 二维码 / 条形码也有** —— 它们的 `<img>` 只有 `object-fit`，
+   *   而 CSS 默认 `object-position` 是 `center` ⇒ `contain` 时图**永远居中**，
+   *   **用户改「对齐」看不出任何变化**。
+   *
+   * ⇒ 按**元素级 `align`** 输出；没有（老模板）⇒ 退回居中，**行为逐字不变**。
+   *   ⚠️ 只在 `contain` 下才有可见效果（`cover`/`fill` 本来就铺满整框），统一写上无害。
+   * ⚠️ **必须在分支之前算**（两条 `return` 都要用）。
+   */
+  const alignOf = (el as { align?: 'left' | 'center' | 'right' }).align
+  /*
+   * ⚠️ **没设过对齐就不写这个属性**（2026-10-16）——
+   *   渲染自测有一条**刻意的护栏**：「fit 缺省时产物与历史完全一致」⇒
+   *   无条件写 `center center`（虽然是 CSS 默认值、**视觉等价**）会破坏它。
+   *   ⇒ 只有用户真的设了 `align` 才输出 ⇒ **老模板的 HTML 逐字不变**。
+   */
+  const objectPosStyle = alignOf
+    ? `object-position:${alignOf === 'left' ? 'left center' : alignOf === 'right' ? 'right center' : 'center center'};`
+    : ''
   if (boxH === null || (el.fit !== 'contain' && el.fit !== 'cover' && el.fit !== 'fill')) {
     const fit = el.fit === 'cover' || el.fit === 'fill' ? el.fit : 'contain'
-    return `<img src="${src}" style="width:100%;height:auto;display:block;object-fit:${fit};">`
+    return `<img src="${src}" style="width:100%;height:auto;display:block;object-fit:${fit};${objectPosStyle}">`
   }
-  return `<img src="${src}" style="width:100%;height:${px(boxH)};display:block;object-fit:${el.fit};">`
+  return `<img src="${src}" style="width:100%;height:${px(boxH)};display:block;object-fit:${el.fit};${objectPosStyle}">`
 }
 
 // ============================================================
@@ -982,7 +1177,32 @@ function attachmentItemsFor(fieldId: string | null, scope: RenderScope, ctx: Ren
   if (!fieldId || !scope.record) return []
   const resolved = ctx.images.get(imageKey(scope.record.recordId, fieldId))
   if (resolved && resolved.length > 0) {
-    return resolved.map((r: ResolvedImage) => ({
+    /*
+     * ⚠️⚠️ **顺序必须以"记录里附件的原始顺序"为准**（2026-10-16 用户报：
+     *   「对于有多个图片的附件，**打印的图片不一定是第一张图片**」—— 配合"只打印第一张"，
+     *   有时出来的不是用户看到的那张）。
+     *
+     * 根因：这里是**预取结果**，而预取是**并发下载**的 ⇒ `ctx.images` 里的顺序是
+     *   "**任务完成的顺序**"，与用户看到的第一张无关。
+     *   （下面那条回退分支用 `record.fields[fieldId]`，顺序是对的 —— 两条分支不一致。）
+     * ⇒ 按原始列表的 `token` **重排**；对不上号的（理论上不该有）**追加在后面**，不丢。
+     */
+    const rawList = scope.record.fields[fieldId]
+    const order = Array.isArray(rawList)
+      ? rawList.map((v) => (typeof (v as { token?: unknown })?.token === 'string' ? (v as { token: string }).token : ''))
+      : []
+    const byToken = new Map(resolved.map((r: ResolvedImage) => [r.token, r]))
+    const ordered: ResolvedImage[] = []
+    for (const t of order) {
+      const hit = byToken.get(t)
+      if (hit) {
+        ordered.push(hit)
+        byToken.delete(t)
+      }
+    }
+    /* 预取里多出来的（原始列表对不上）追加在后面 —— 宁可多显示，也不要静默丢图 */
+    for (const r of resolved) if (byToken.has(r.token)) ordered.push(r)
+    return ordered.map((r: ResolvedImage) => ({
       token: r.token,
       name: r.name,
       url: r.url,
@@ -1020,6 +1240,16 @@ function renderCellContent(
    *   · 二维码被画成表宽那么大，溢出格子后被裁掉 ⇒ 用户看到的是"完全不显示"。
    */
   cellWidthMm: number,
+  /** 单元格**上内边距**（mm）—— 纵向偏移要减掉它，否则贴不紧上边框（见下方 `abs` 的注释） */
+  padMm: number,
+  /**
+   * ⚠️ 这一行的**行高**（mm）—— **`row.heightMm` 本身就是「内容区高」**（2026-10-15 新增）。
+   *
+   * 用来给 `yMm` 夹上限（`effectiveChildYMm`）。**不加的话纵向能穿出单元格** ——
+   * 用户实测「上/左/右留空隙、**只有底边能贴**」正是它（横向有真上限、纵向的上限是 500 ≈ 不夹）。
+   * ⚠️ 自适应行高（`heightMm` 缺席）时传 `undefined` ⇒ **不夹**（没有分母）。
+   */
+  rowHeightMm: number | undefined,
 ): string {
   /*
    * ⚠️ 单元格里的**块级子元素**（`TableCell.children`，规格 六）必须在这里渲染 ——
@@ -1028,7 +1258,9 @@ function renderCellContent(
    *    直接复用 `renderElement`（元素级渲染器），各 kind 的分支只有一份实现。
    *    顺序与画布一致：**先子元素、后 nodes**（图片在上、说明文字在下）。
    */
-  const childHtml = (cell.children ?? [])
+  /* ⚠️ **2026-10-17 回退**：打印端的子表渲染已移除（用户选 ② 真拆）。 */
+
+  const childRaw = (cell.children ?? [])
     .map((child) => {
       /*
        * ⚠️ 每个子元素单独造一个 scope：把 `widthMm` / `heightMm` 换成**它在格子里的实际尺寸**。
@@ -1073,17 +1305,153 @@ function renderCellContent(
        * 所以一张 800×1200 的竖图进格子只会占 18mm 高，而不是把整行撑到上百毫米。
        * 内容怎么适应这个盒子由元素自己的 `fit` 决定（图片 / 附件默认 `contain` = 等比、不拉伸）。
        */
-      const boxStyle = `width:${round3(childWidthPct(child))}%;height:${px(childBoxHeightMm(child))};overflow:hidden;`
-      return `<div style="${boxStyle}">${r.html}</div>`
+      /*
+       * ⚠️ **水平对齐**（2026-10-13 用户反馈："单元格内的二维码、图片元素，没办法靠右、居中摆放，
+       *    默认靠左，**改了属性设置也无效**"）。
+       *
+       * 根因：这个盒子以前只有 `width` / `height` / `overflow` —— **一个字都没有关于"摆哪边"**。
+       * 而用户改的是**单元格**的「水平对齐」（`cell.style.align`），那份设置此前只作用于
+       * **文字**（`<td>` 的 `text-align`），**格内的块级子元素完全没读它** ⇒ 永远靠左。
+       *
+       * ⚠️ 取值口径**不在这里定义** —— 走 `lib/cell-geometry.ts` 的 `childBoxAlign()`，
+       *    与画布端（`Canvas.tsx` 的 `.bp-el-cell__child`）**共用同一份**。
+       *    这条和 `childWidthPct` / `childBoxHeightMm` 是同一个纪律：
+       *    **凡是两端都要算的东西，"家"只有一个**（否则迟早"画布居中、打印靠左"）。
+       */
+      /*
+       * ⚠️ **已手动定位 ⇒ 绝对定位；没定位 ⇒ 维持流式**（2026-10-13）。
+       *
+       * 这是"老模板零影响"的开关：`cellPos` 缺席就是原来那条路（逐字不变）。
+       *
+       * ⚠️⚠️ 绝对定位必须**再包一层定位容器**，否则格子会塌 ——
+       *    旧设计拒绝绝对定位的理由正是"没人给高度"（见 types.ts）。
+       *    容器高 = `childBoxSpanMm` = `y + h` ⇒ 子元素虽然绝对定位，
+       *    **容器仍占 `y + h` 的高度** ⇒ 行高照旧被撑住。
+       *      ⚠️ 这一层与画布端**必须逐字一致**，否则"画布上好好的、打印出来行高不对"。
+       */
+      /*
+       * ⚠️ **一律绝对定位**（2026-10-13 第 2 次重构，与画布端逐字同口径）。
+       *
+       * 旧版是"`positioned` 才绝对定位、否则流式 + `margin:auto`" ⇒
+       * **每点一次元素就切换一次定位模式** ⇒ 行高来回跳
+       * （用户报："拖进格子后单元格被撑大，点击该元素后立刻恢复正常"）。
+       * ⇒ 模式必须**与选中状态无关**。
+       *
+       * 现在：外层容器 = **元素盒子本身**（`left/top/宽/高` 全部按元素给），
+       *     子元素铺满它（`100%`）—— 那两件事都由容器承担。
+       */
+      const geom = 'width:100%;height:100%;overflow:hidden;'
+      /*
+       * ⚠️ **外层容器 = 元素盒子本身**（2026-10-13 第 2 次重构，与画布端 `.bp-el-cell__holder` 逐字同口径）：
+       *    `left/top/width/height` **全部按元素**给 ⇒ 锚点用 `0/100%` 就能贴**元素**四周
+       *    （旧版容器是 `width:100%` 整格宽 ⇒ 锚点贴到了**单元格**四周）。
+       * ⚠️ 绝对定位 ⇒ **不占文档流高度**（用户要的"不撑行高"）。
+       * ⚠️ **不再有"未定位走流式"的分支**：那会让"选中/未选中"切换定位模式 ⇒ 行高来回跳
+       *    （用户报："拖进格子后单元格被撑大，点击该元素后立刻恢复正常"）。
+       */
+      /*
+       * ⚠️⚠️ **横向一律用绝对单位（mm），不要用百分比**（2026-10-14 用户指出的不对称）。
+       *
+       * 用户原话：「**为什么内边距在 1.5 的时候，附件依然可以紧贴着上下左三边呢，
+       *   唯独不可以紧贴在右边**？按照这个逻辑来讲，**是不是说明紧贴在上下左边是错误的**」
+       *   ⇒ **他的推理是对的 —— 这里就是真 bug，不是"右边差一点"这么简单。**
+       *
+       * 根因：**两根轴用了不同的单位**
+       *   · `top` 用 **mm**（绝对）⇒ 天然与内边距无关 ⇒ 落点精确；
+       *   · `left` / `width` 用 **%** ⇒ 绝对定位的百分比是相对**包含块的 padding box 宽**
+       *     （= 内容区宽 **＋左右内边距**），而**拖动时算 `xPct` 用的分母是"内容区宽"**
+       *     ⇒ **两个分母不一样**。`x = 0` 时恰好不偏（所以"左边看着是好的"），**越靠右偏得越多**。
+       *
+       * ⇒ 全部换成 mm：`cellWidthMm` 这里就是**内容区宽**（调用方已减过 `padMm * 2`）
+       *   ⇒ `xMm = (xPct/100) × 内容区宽`、`wMm = (w/100) × 内容区宽`。
+       *   **内边距设多少就留多少空隙**，与纵向行为完全一致（用户要的正是这个）。
+       */
+      /*
+       * ⚠️⚠️ **原点 = 边框内沿**（**回退了"加 pad"的补丁**，2026-10-14）。
+       *
+       * 我上一轮在这里加了 `padMm`（想法是"把原点从边框内沿挪到内容区"），
+       * **结果是引入更严重的问题**：
+       *   用户实测「内边距 1.5 时，**右下/左下两组的元素下半部分超出单元格、压线**」——
+       *   因为 `yMm` 的上限是按"**内容区高 − 框高**"夹出来的，
+       *   **再加一个 `pad` 就直接冒出去了**（而且 `overflow` 只裁"图片在框内"的部分，
+       *   裁不到"框本身超出单元格"）。
+       *
+       * ⇒ **先回退成"不加 pad"**（回到"边框内沿"原点，不会超出）。
+       * ⚠️ **正确做法**（下一轮做）：在 `<td>` 里**再包一层"内容区容器"**
+       *   （`position:relative`，尺寸等于内容区），让子元素**相对它**定位 ——
+       *   那样 `left/top` 天然以"内容区"为原点、**内边距天然生效、也不会冒出单元格**。
+       *   直接在坐标上加 pad 是"事后补偿"，会和"钳制上限"打架。
+       */
+      const contentWmm = Math.max(1, cellWidthMm)
+      /*
+       * ⚠️ **元素自己的 `align` 优先于"所在单元格的对齐"**（2026-10-14 用户要求：
+       *   「附件图片二维码条形码**都遵循同一套规则**，其他几个好像没有类似设置」）。
+       *   ⇒ 图片 / 二维码 / 条形码的接口各加了可选 `align`（`types.ts` 的 `CellChildAlign`）。
+       *   ⚠️ 都没有 ⇒ 退回单元格的 `style.align` ⇒ **老模板行为逐字不变**。
+       */
+      const ownAlign = (child as { align?: 'left' | 'center' | 'right' }).align
+      const effAlign = ownAlign ?? cell.style?.align
+      const xMm = Math.round(((childBoxLeftPct(child, effAlign) / 100) * contentWmm) * 100) / 100
+      const wMm = Math.round(((childWidthPct(child) / 100) * contentWmm) * 100) / 100
+      /*
+       * ⚠️⚠️ **"元素框"的宽高：附件在"非自由"模式下要跟着内容走**（2026-10-15 用户报：
+       *   「**原图模式，打印的时候也是按照附件选区框的大小来渲染的**……用户通过自由模式改动过
+       *    选区大小后，后续**不论选择原图还是适配，都是按照这个选区大小**打印。
+       *    ⇒ **两个模式纯属是一点用没有**」）。
+       *
+       * 根因链（**外面套了不止一层**，所以前面几次都没改到点上）：
+       *   1. 图片本身按模式算 —— `switch (config.sizeMode)` 里 `wMm`/`hMm` ✅ 对
+       *   2. 但它外面"附件组容器"写死了 `W`（元素框宽）—— 已修（用内容宽）✅
+       *   3. **最外层这个"元素框"仍然写死 `wMm` / `childBoxHeightMm(child)`**（都是"自由"的尺寸）❌
+       * ⇒ 现在：**附件且非"自由"** ⇒ 外层**不用固定宽高**（`width/height: auto`），
+       *   让**内层内容**（附件组容器：宽=内容宽、高=内容高）自己决定尺寸。
+       *
+       * ⚠️ 只对 `attach` 这么做：图片 / 二维码 / 条形码的"框"就是用户给的 `w`/`h`
+       *   （它们是**单张**，没有"组容器"这一层），改了语义会变。
+       * ⚠️ "自由（fixedBox）"模式保持原样 —— 那时 `w`/`h` 就是用户拉出来的尺寸，**必须尊重**。
+       */
+      /*
+       * ⚠️ **元素框 = 选区**（2026-10-15 重构后）—— 回退成固定宽高。
+       *   三模式已废弃 ⇒ 不再需要"让内容决定框的大小"。
+       */
+      const boxSize = `width:${px(wMm)};height:${px(childBoxHeightMm(child))};`
+      const abs = geom
+      return (
+        `<div style="position:absolute;left:${px(xMm)};` +
+        `top:${px(Math.max(0, effectiveChildYMm(child, rowHeightMm, padMm)))};` +
+        boxSize +
+        `">` +
+        `<div style="${abs}">${r.html}</div></div>`
+      )
     })
     .join('')
+  /*
+   * ⚠️⚠️ **"内容区容器"**（2026-10-14 定案，一次解决"内边距 + 四边一致 + 不超出"）。
+   *
+   * **问题**：`<td>` 带 `padding: pad`，而 CSS 绝对定位的 `left/top` 相对的是
+   *   **padding box 的**外沿**（= 边框内沿）**；
+   *   而格内子元素的 `xMm`/`yMm` 都是**按"内容区"量出来的** ⇒ **差一个 `pad`**。
+   *   用户实测「内边距 1.5 时，**左右生效、上下不生效**」正是两根轴原点不同的表现。
+   *
+   * ⚠️ **不能直接在坐标上加 `pad`** —— 我试过：它会和"拖动钳制（内容区高 − 框高）"打架，
+   *   元素**冒出单元格、压线**（用户实测）。
+   *
+   * ⇒ **正确做法：包一层"内容区容器"**（四边内缩 `pad`），让子元素**相对它**定位 ——
+   *   原点天然是"内容区"，内边距天然生效，且**不会冒出容器**。
+   *   ⚠️ 画布端（`.bp-el-cell__holder`）必须**逐字同口径**，否则又变成"画布打印不一致"。
+   *   ⚠️ 配套：拖动钳制要按"容器高"算（见 `onChildPointerDown` 里的 `maxY`）。
+   */
+  const childHtml = childRaw
+    ? `<div style="position:absolute;left:${px(padMm)};top:${px(padMm)};` +
+      `right:${px(padMm)};bottom:${px(padMm)};">${childRaw}</div>`
+    : ''
   if (cell.attachment) {
     if (cell.attachment.mode === 'none') {
       // F4-08：选择"不打印附件"时该字段输出空。
       // 但单元格里可能有其它内容（如"照片："这种前缀文字），只摘掉附件字段本身，不动其余节点。
       const fid = resolveCellAttachmentFieldId(cell, ctx)
       const kept = (cell.nodes ?? []).filter((n) => !(n.type === 'field' && n.fieldId === fid))
-      return childHtml + renderInline(kept, scope, ctx, warnings)
+      return childHtml + renderInline(kept, scope, ctx, warnings, cell.style)
     }
     const fieldId = resolveCellAttachmentFieldId(cell, ctx)
     const items = attachmentItemsFor(fieldId, scope, ctx)
@@ -1093,15 +1461,44 @@ function renderCellContent(
      * 于是格内附件的口径是"**宽度适配格子、高度等比**" —— 正是用户对
      * 「自适应单元格」的预期（2026-09-23 真机反馈第 1 条）。
      */
-    const res = layoutAttachmentGroup(items, cell.attachment, cellWidthMm, {
+    /*
+ * ⚠️ **把"单元格内容区"传给适配模式**（2026-10-15）：
+ *   宽 = `cellWidthMm`（调用方已经减过左右内边距）；
+ *   高 = `行高 − 2×上下内边距`（**`row.heightMm` 是 border box 总高**，实测过）。
+ *   行高缺席（自适应）⇒ 不传高 ⇒ 适配退回元素框（没有分母可用）。
+ */
+const cellContentHmm =
+  typeof rowHeightMm === 'number' && rowHeightMm > 0 ? rowHeightMm - 2 * padMm : undefined
+const res = layoutAttachmentGroup(
+  items,
+  cell.attachment,
+  cellWidthMm,
+  {
       ...scope,
       widthMm: cellWidthMm,
       heightMm: undefined,
-    })
+    },
+    /* 第 5 参 `boxAlignHint`：格内附件这条路径没算"框在格子里的落点提示" ⇒ 不传 */
+    undefined,
+    /* ⚠️ 第 6 参：**"适配"要用单元格内容区的尺寸**（不是元素框）—— 见 `cellBoxMm` 的注释 */
+    cellContentHmm === undefined ? undefined : { w: cellWidthMm, h: cellContentHmm },
+  )
     warnings.push(...res.warnings)
-    return childHtml + res.html
+    /*
+     * ⚠️⚠️ **附件格里"其它节点"也要打印**（2026-10-17 用户报：
+     *   「画布中该单元格内有**三个元素**，但实际**打印只有日期**被打印出来」）。
+     *
+     * 根因：这条分支原来 `return childHtml + res.html` —— **`cell.nodes` 整块被丢掉** ❌
+     *   于是"附件格"里除了附件组、别的文字/字段**一个都不印**（画布上却都画着）。
+     *   ⚠️ 而"日期"能印，是因为它被当成了附件组的字段（`resolveCellAttachmentFieldId` 的 fallback）。
+     *
+     * ⇒ 与普通路径**同一个口径**：把附件字段本身摘掉（它已经由附件组画了），
+     *   其余节点照常渲染。顺序与画布一致：**子元素（附件）在上、nodes 在下**。
+     */
+    const keptNodes = (cell.nodes ?? []).filter((n) => !(n.type === 'field' && n.fieldId === fieldId))
+    return childHtml + res.html + renderInline(keptNodes, scope, ctx, warnings, cell.style)
   }
-  return childHtml + renderInline(cell.nodes, scope, ctx, warnings)
+  return childHtml + renderInline(cell.nodes, scope, ctx, warnings, cell.style)
 }
 
 /**
@@ -1218,6 +1615,8 @@ function buildTableHtml(
         : 'border:none;'
 
   const colgroup = `<colgroup>${widths.map((w) => `<col style="width:${px(w)};">`).join('')}</colgroup>`
+  /* 摊平一次：后面判断"表头行里的格有没有跨出表头区"要用（`spanCrossesHead`） */
+  const spanGrid = tableGrid(el.rows, colCount)
 
   const renderRow = (ri: number): string => {
     const ref = refAt(ri)
@@ -1273,7 +1672,10 @@ function buildTableHtml(
         const cellSpan = Math.max(1, Math.floor(finite(cell.colspan, 1)))
         let cellW = 0
         for (let k = 0; k < cellSpan; k++) cellW += widths[colCursor + k] ?? 0
-        const inner = renderCellContent(cell, rowScope, ctx, warnings, Math.max(1, cellW - padMm * 2))
+        const inner = renderCellContent(
+          cell, rowScope, ctx, warnings, Math.max(1, cellW - padMm * 2), padMm,
+          typeof row.heightMm === 'number' ? row.heightMm : undefined,
+        )
         const bg = cell.style?.background ? `background:${cell.style.background};` : ''
         const cw = (cell.borders?.widthPt ?? borderW)
         const cc = cell.borders?.color ?? borderColor
@@ -1302,13 +1704,61 @@ function buildTableHtml(
          * 口径与 `textCss` 对齐：`bold ⇒ 700`、`italic`、`underline/strike` 合成 `text-decoration`。
          */
         const cs = cell.style ?? {}
-        const deco = [cs.underline ? 'underline' : '', cs.strike ? 'line-through' : ''].filter(Boolean).join(' ')
+        /* 与 `textCss` / `inlineCss` 共用 `decoDecl`（含下划虚线），三处口径必须一致 */
         const glyphCss =
           (cs.bold ? `;font-weight:${BOLD_FONT_WEIGHT}` : '') +
           (cs.italic ? ';font-style:italic' : '') +
-          (deco ? `;text-decoration:${deco}` : '')
+          decoDecl(cs)
+            .map((d) => `;${d}`)
+            .join('')
+        /*
+         * ⚠️ **这里不能加 `overflow:hidden`**（2026-10-13 用户第 2 次反馈后删掉）：
+         *   元素"向上被切一半、向下被裁一点点"就是它造成的。
+         *   纵向的钳制**算得出来**（拖动时量内容区高，见 `Canvas.tsx` 的 `cellGeom.height`）⇒
+         *   元素永远待在内容区内 ⇒ **不需要裁切**。与画布端**同一口径**。
+         */
+        /*
+         * ⚠️⚠️ **`position:relative` 不能少**（2026-10-14 用户报的严重 bug）：
+         *   「图片的渲染位置和它在画布中所在的单元格**严重不符**……
+         *    在同一个单元格内**稍微拖动一点**，预览和实际打印时就会**千差万别**，
+         *    会出现在**其他单元格**或者**覆盖在多个单元格之间**」。
+         *
+         * 根因：格内子元素是 `position:absolute`（定位到"单元格内容区"），
+         *   而 `<td>` **没有建立定位上下文** ⇒ 绝对定位会去找**更外层的定位祖先**
+         *   （`.bp-page` 之类）⇒ **`left/top` 一算就跑到别的格子去了**。
+         *   ⚠️ 在格内拖动一点点就让 `left/top` 变化 ⇒ 落点当然"千差万别"。
+         * ⇒ 由 `<td>` 承担定位上下文（两端同一口径：画布端 `<td>` 也要有）。
+         */
         return `<td${span}${rspan} style="${attr(
-          `${edgeCss}${rowH}${bg}padding:${px(padMm)};box-sizing:border-box;${vAlignCss(cell.style?.vAlign)}` +
+          /*
+             * ⚠️⚠️ **`overflow:hidden` + `max-height`**（2026-10-17 用户报：
+             *   「关掉自动换行后，打印**没有被裁切**，而是**单元格被拉长**了，导致打印不全」）。
+             *
+             * 根因：`tr` 的 `height` 是**最小高度**，`nowrap` 的长内容**把行撑起来** ⇒ 表格变高 ✅
+             * ⚠️ 不加 `overflow:hidden` 时 `td` 里的内容会"溢出但可见"（打印出来是糊的），
+             *   加了之后多出的部分**直接裁掉**（用户要求"直接裁切、不要省略号"）。
+             */
+            `${edgeCss}${rowH}${bg}padding:${px(padMm)};box-sizing:border-box;position:relative;` +
+            /*
+             * ⚠️ **`overflow:hidden` 交给 `autoSize` 管**（2026-10-17 用户报：
+             *   「开关'自适应宽高' ⇒ 开：**格子依旧按照尺寸裁切**」）。
+             *   原来它是**无条件**加的 ⇒ 自适应开着也照样裁 ⇒ 开了跟没开一样。
+             *
+             * ⚠️⚠️ **注释块后面绝对不能跟 `+`** —— 那是一个**一元加号**，
+             *   会把后面的字符串转成数字 `NaN`（本次就是这样炸的：
+             *   `/* … *\/ + \`${edgeCss}…\`` ⇒ `NaN` ⇒ 整条 `td` 样式变成 `"NaNoverflow:hidden;…"`，
+             *   自测当场红 5 条）。注释要么放在**上一行**、要么放在 `${}` 里。
+             */
+            `${cell.autoSize === true ? '' : 'overflow:hidden;'}` +
+            /* ⚠️ **自适应开 ⇒ 不加 `max-height`**（让行按内容长）；关 ⇒ 死守行高、超出裁掉 */
+            `${
+              cell.autoSize === true
+                ? ''
+                : typeof row.heightMm === 'number' && row.heightMm > 0
+                  ? `max-height:${px(row.heightMm)};`
+                  : ''
+            }` +
+            `${vAlignCss(cell.style?.vAlign)}` +
             `;font-family:${FONT_STACK};font-size:${pxPt(cell.style?.fontSizePt ?? DEFAULT_FONT_PT)}` +
             /*
              * ⚠️ **固定行距优先**（2026-10-02 项目体检 P1）。
@@ -1321,23 +1771,78 @@ function buildTableHtml(
                 ? pxPt(cell.style.lineHeightPt)
                 : finite(cell.style?.lineHeight, DEFAULT_LINE_HEIGHT)
             }` +
-            `;text-align:${cell.style?.align ?? 'left'}${glyphCss};${TEXT_FLOW}`,
-        )}">${inner}</td>`
+            `;text-align:${cell.style?.align ?? 'left'}${glyphCss};` +
+            /*
+             * ⚠️⚠️ **换行 / 自适应，读"单元格"上的开关**（2026-10-17 用户要求：
+             *   「自动换行的开关……**放在单元格的属性中**，额外再增加一个**单元格自适应宽高**的开关」）。
+             *
+             * · `wrap === false` ⇒ `nowrap`（并把 `TEXT_FLOW` 里的 `pre-wrap` 换成 `nowrap`）；
+             * · 其余 ⇒ 沿用 `TEXT_FLOW`（`pre-wrap`，历史行为）。
+             * ⚠️ 顺序：`cell.wrap` 优先，没有就退回"换行"。
+             */
+            (cell.wrap === false ? 'white-space:nowrap;' : TEXT_FLOW),
+        )}">${
+          /*
+           * ⚠️⚠️ **关"自适应"时，在 `td` 里包一层裁切框**（2026-10-17 用户实测：
+           *   「自动换行**开**、自适应**关** ⇒ 文字换行显示，**单元格被撑高**，不被裁切」）。
+           *
+           * 根因：**`td` 上的 `max-height` / `overflow:hidden` 在多数浏览器里不生效** ——
+           *   行高是 `tr` 说了算，`td` 拦不住内容把行撑高 ✅
+           * ⇒ 只有"里面再套一个定高 + `overflow:hidden` 的 `div`"才真的裁得住。
+           *
+           * ⚠️ **但有子元素（图片/附件/码）的格子不能包** —— 那层 `div` 会成为
+           *   子元素 `position:absolute` 的**新定位祖先**，打穿"格内绝对定位"那套口径。
+           *   好在那些格子本来就是"块级内容"，不靠文字换行，不包也不影响。
+           * ⚠️ 没有显式行高（自适应行）时**不包**：没有分母可裁，包了反而把内容压没。
+           */
+          cell.autoSize === true ||
+          !(typeof row.heightMm === 'number' && row.heightMm > 0) ||
+          (cell.children && cell.children.length > 0)
+            ? inner
+            : `<div style="max-height:${px(row.heightMm)};overflow:hidden;">${inner}</div>`
+        }</td>`
       })
       .join('')
     const rowStyle = typeof row.heightMm === 'number' && row.heightMm > 0 ? ` style="height:${px(row.heightMm)};"` : ''
     return `<tr${rowStyle}>${cells}</tr>`
   }
 
+  /*
+   * ⚠️⚠️ **thead / tbody 的边界会截断 rowspan**（2026-10-17 用户报：
+   *   「如果有合并的单元格，打印的时候格内内容会错位，而且表格边框也不会打印」）。
+   *
+   * HTML 规范：`rowspan` **不能跨行组边界**（thead / tbody / tfoot 各自是独立行组）。
+   * 用户的表头行里有一个"跨出表头区"的合并格（先合并、后设表头行 —— 护栏管不到存量模板），
+   * 浏览器就把 `rowspan="3"` **截成表头行数** ⇒ 合并凭空消失；而下面那些行，
+   * 本该"被覆盖"的那一列在 `row.cells` 数组里**本来就没有 td** ⇒ **整行少一格** ⇒
+   * 内容整体左移、右侧边框缺一条 —— 正是用户截图里的样子。
+   *
+   * ⇒ 检测到这种跨界合并时，**不拆 thead/tbody**，整表输出一个 `<tbody>`（表头行仍在最上面）。
+   *   跨页重复不依赖 `table-header-group`：`splitTable` 会在每个续排片段里**手动克隆表头**。
+   * ⚠️ 只在第一段（`from === 0`）处理 —— 续排片段从中间开始，表头是克隆的，
+   *   它自己的 rowspan 只能在本片段内表达（HTML 没有"跨片段合并"这种东西）。
+   */
+  const spanCrossesHead = (() => {
+    const n = Math.min(headerCount, el.rows.length)
+    if (from !== 0 || n <= 0) return false
+    for (let i = 0; i < n; i += 1) {
+      for (const g of spanGrid[i] ?? []) {
+        if (g && g.rowStart === i && g.rowStart + g.rowSpan > n) return true
+      }
+    }
+    return false
+  })()
+
   // 表头行的呈现规则：
   //  - 片段从第 0 行开始 → 自带原始表头行（可能只带一部分）；
   //  - 片段从中间开始 → repeatHeader 时克隆一份完整表头行（F2-29）。
   const headCount = from === 0 ? Math.min(to, headerCount) : repeat ? headerCount : 0
   const headHtml =
-    headCount > 0
+    headCount > 0 && !spanCrossesHead
       ? `<thead style="display:table-header-group;">${Array.from({ length: headCount }, (_, i) => renderRow(i)).join('')}</thead>`
       : ''
-  const bodyFrom = from === 0 ? Math.max(headerCount, from) : from
+  /* 表头里有跨界合并 ⇒ 表头行也交给 body（否则它们被 thead 截断，见 `spanCrossesHead`） */
+  const bodyFrom = spanCrossesHead ? from : from === 0 ? Math.max(headerCount, from) : from
   const bodyTo = to
   const bodyHtml =
     bodyTo > bodyFrom
@@ -1345,7 +1850,41 @@ function buildTableHtml(
       : ''
 
   const html =
-    `<table style="border-collapse:collapse;table-layout:fixed;width:${px(targetW)};${tableBorder}">` +
+    /*
+     * ⚠️⚠️ **`<table>` 上不能再写 `width: ${el.w}`**（2026-10-14 用户报的严重 bug）：
+     *   「画布中表格是满版的，打印出来却只有一条**细长条**」。
+     *
+     * 根因：**两端的总宽口径不同** ——
+     *   · **画布**（`Canvas.tsx:3404`）：逐列输出 `<col style="width:Xmm">`，**`<table>` 不设 width**
+     *     ⇒ 总宽 = **Σ列宽**；
+     *   · **打印**（这里）：`table-layout:fixed` + `width:${el.w}` ⇒ 总宽被**强行设成 `el.w`**，
+     *     列再按比例压 ⇒ 当 `el.w < Σ列宽` 时，**表格被压扁**，而画布仍是满版。
+     *
+     * ⇒ **去掉 `width`**，让表格按 `<col>` 自己算总宽 ⇒ **与画布逐字同口径** ⇒ 所见即所得。
+     * ⚠️ `table-layout:fixed` 保留：列宽仍由 `<colgroup>` 决定（没有它，列宽会被内容撑开）。
+     * ⚠️ `targetW` 仍然算着（下游用它做别的事），只是**不再写进表格的 width**。
+     */
+    /*
+     * ⚠️⚠️ **必须给 `<table>` 一个显式 `width`**（2026-10-17 用户报：
+     *   「字段值多长，宽就多大」—— **单元格被内容撑宽**）。
+     *
+     * 根因：`table-layout: fixed` **只在"表格宽度确定"时**才按 `<col>` 分配列宽。
+     *   一旦 `<table>` 没有 `width`（历史上一度去掉过，见下面那段的注释），
+     *   浏览器会退回 `auto` 宽度 ⇒ **按内容的 `min-content` 撑开** ⇒
+     *   `nowrap` 的长字段值**把整张表撑宽** ✅
+     *
+     * ⇒ 用 `<col>` 之和当总宽。这与"逐列 `<col width>` 才是唯一真相"的既定口径**不冲突**：
+     *   总宽不是新来源，而是**同一组数字的和**（同一份 `widths`）。
+     * ⚠️ 画布端（`Canvas.tsx`）同样"不设 width、按 col 算"—— 那边是 `div` 布局，
+     *   没有 `table-layout:fixed` 的这层陷阱，所以不需要跟。
+     */
+    `<table style="border-collapse:collapse;table-layout:fixed;` +
+    /* ⚠️ **过滤 NaN**（见上方注释）：非有限值按 0 计；全空则不输出 `width`（退回"按 col 算"） */
+    (() => {
+      const sum = widths.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0)
+      return sum > 0 ? `width:${px(sum)};` : ''
+    })() +
+    `${tableBorder}">` +
     colgroup +
     headHtml +
     bodyHtml +
@@ -1478,7 +2017,7 @@ export function renderElement(el: AnyElement, scope: RenderScope, ctx: RenderCon
   const sc: RenderScope = { ...scope, elementId: el.id }
   switch (el.kind) {
     case 'text': {
-      const flow = `<div style="${attr(textCss(el.style, [TEXT_FLOW]))}">${renderInline(el.nodes, sc, ctx, warnings)}</div>`
+      const flow = `<div style="${attr(textCss(el.style, [TEXT_FLOW]))}">${renderInline(el.nodes, sc, ctx, warnings, el.style)}</div>`
       return { html: flow, warnings }
     }
     case 'fieldBlock': {
@@ -1523,8 +2062,58 @@ export function renderElement(el: AnyElement, scope: RenderScope, ctx: RenderCon
       // 分页符本身不产出可见内容，只影响分页（由 layout 处理）
       return { html: '', warnings }
     case 'attach': {
-      const items = attachmentItemsFor(el.fieldId, sc, ctx)
-      const res = layoutAttachmentGroup(items, el.config, sc.widthMm, sc)
+      const all = attachmentItemsFor(el.fieldId, sc, ctx)
+      /*
+       * ⚠️ **只打印第一张 —— 现在是「默认开」**（2026-10-15 用户要求：
+       *   「把**"只打印第一张"设置为默认勾选**」）。
+       *
+       * 原来缺省为假 ⇒ 用户不改就是"全部打印"；而实际业务里绝大多数单据位
+       *   只放得下一张（用户反复报过"打印的图片似乎是随机的"）⇒ **默认开更贴合直觉**。
+       *
+       * ⚠️ 判定写成 **`!== false`** 而不是 `=== true`：这样
+       *   · `undefined`（老模板 / 从没设过）⇒ **默认开** ✅
+       *   · 显式 `false`（用户手动关掉）⇒ **尊重用户**：打印全部 ✅
+       * ⚠️ 这样**老模板的行为会变**（原来打全部、现在只打第一张）——
+       *   这是用户明确要求的默认值变更，且**在面板上可一键关掉**。
+       */
+      const items = el.config.onlyFirst !== false ? all.slice(0, 1) : all
+      /*
+       * ⚠️ **按"元素框在格子里的位置"自动决定图片贴哪边**（2026-10-14 用户要求）。
+       *
+       *   · 只在**格内子元素**上有意义 —— 那时 `cellPos` 才有值；
+       *   · **顶层元素**没有 `cellPos` ⇒ 传 `undefined` ⇒ 退回 `config.align`（**老路径行为逐字不变**）。
+       * ⚠️ 阈值：`xPct ≤ 2%` 视为贴左、`xPct + w ≥ 98%` 视为贴右、其余居中。
+       *   用百分比而不是 mm，是因为这里只知道 `sc.widthMm`（容器宽），
+       *   而 `2%` 在任何宽度的容器里都对应"视觉上贴边"。
+       */
+      const pos = (el as { cellPos?: { xPct?: number } }).cellPos
+      const wPctEl = childWidthPct(el as { w?: number | string })
+      /*
+       * ⚠️⚠️ **"铺满"时不再自动推"左"**（2026-10-16 用户报：
+       *   「当我把附件**拉到铺满单元格**后，打印的图片**一直都是默认对齐左边**，
+       *     即使把附件属性中的对齐改成中、右，依旧对齐左边；
+       *     我也尝试改了**单元格的对齐方式**，改成中、右，依旧对齐左边」）。
+       *
+       * 根因：`xPct <= 2 ⇒ 'left'` 这条判据在"铺满"时**必然成立**
+       *   （铺满 ⇒ `x = 0`、`w = 100`）⇒ `boxAlignHint` 恒为 `'left'`
+       *   ⇒ 而它**优先于** `config.align`（见同文件 `effAlign = boxAlignHint ?? config.align`）
+       *   ⇒ **用户在面板上改对齐怎么都不生效**。
+       *
+       * ⚠️ 而且这个 hint 在"铺满"时**本来就没有意义** ——
+       *   它的用途是"框明显贴左/贴右时，让**图在框内**也贴同一边"；
+       *   框已经占满整格时，图贴哪边应该**听用户的**。
+       * ⇒ 加两个前提：**`w < 98`（真的没铺满）**，且**只在真贴边时**给 hint；
+       *   **居中的情况不给**（退回 `config.align`，用户设置才生效）。
+       */
+      const boxAlignHint =
+        pos && typeof pos.xPct === 'number' && wPctEl < 98
+          ? pos.xPct <= 2
+            ? ('left' as const)
+            : pos.xPct + wPctEl >= 98
+              ? ('right' as const)
+              : undefined
+          : undefined
+      const res = layoutAttachmentGroup(items, el.config, sc.widthMm, sc, boxAlignHint)
       return { html: res.html, warnings: res.warnings }
     }
     case 'qrcode':

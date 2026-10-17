@@ -117,7 +117,16 @@ export const DEFAULT_GRID = {
 } as const
 
 /** 网格间距的候选档位（mm） */
-export const GRID_STEPS_MM = [1, 2, 2.5, 5, 10] as const
+/**
+ * ⚠️ **网格间距档位（全项目唯一来源）**。
+ *
+ * 2026-10-17 用户报：「右键画布空白处的**网格间距**没有 1mm 和 2.5mm 的选项，
+ *   但**右侧页面属性**中是有的 …… 感觉像是**两套逻辑**？」
+ *   —— **确实是两套**：`Canvas` 里另写了一个 `[2,5,10,20]`。
+ * ⇒ 现在只有这一份；右键菜单与页面属性都从这里取。
+ * ⚠️ 顺手加了 **0.5mm**（用户要求："顺便增加一个 0.5mm 的选项"）。
+ */
+export const GRID_STEPS_MM = [0.5, 1, 2, 2.5, 5, 10] as const
 
 /**
  * 页边距快捷档（mm）。
@@ -211,6 +220,17 @@ export interface ViewLayout {
 export type Align = 'left' | 'center' | 'right' | 'justify'
 export type VAlign = 'top' | 'middle' | 'bottom'
 
+/**
+ * 下划线线型。
+ *
+ * `solid`（缺省）= 实线；`dashed` = **虚线** —— 用来拼"填空线"
+ * （`经办人：_ _ _ _`）：给一段文字或空格加上它，文字下方就是一排短线，
+ * 字段插进来也骑在同一条线上（2026-10-17 用户要求）。
+ *
+ * ⚠️ 只有 `underline === true` 时才生效；单独设它没有任何视觉效果。
+ */
+export type UnderlineStyle = 'solid' | 'dashed'
+
 export interface TextStyle {
   fontFamily?: string
   /** 字号，单位 pt */
@@ -218,6 +238,8 @@ export interface TextStyle {
   bold?: boolean
   italic?: boolean
   underline?: boolean
+  /** 下划线线型：缺省视为 `solid` */
+  underlineStyle?: UnderlineStyle
   strike?: boolean
   color?: string
   /** 背景色（单元格底纹等） */
@@ -295,6 +317,13 @@ export interface InlineField {
   fieldTypeSnapshot?: number
   /** 该占位符的独立样式覆写 */
   style?: TextStyle
+  /**
+   * ⚠️ **是否自动换行**（2026-10-17 用户要求）。
+   * · `false` ⇒ **不换行**：超出单元格宽度的部分**裁切**；
+   * · `true` / 未设 ⇒ **自动换行**。
+   * ⚠️ **默认取"换行"**：与打印端的现有行为一致（老模板打印出来不会变样）。
+   */
+  wrap?: boolean
 }
 
 /**
@@ -381,6 +410,31 @@ export interface ElementBase {
   h: number | 'auto'
   style?: TextStyle
   locked?: boolean
+  /**
+   * **格内子元素的定位**（2026-10-13；只有"驻留在单元格里"的元素会用到）。
+   *
+   * 用户需求：「单元格内的图片、二维码、附件等元素**无法通过手动缩放**，
+   * 参照这些元素在画布中的逻辑，可以手动缩放，也可以**手动拖动调整位置**，也可以**预设位置**」。
+   *
+   * ⚠️⚠️ **为什么不复用 `x` / `y`**（本轮最关键的一个决策）：
+   *    `x`/`y` 在自由层是**版心坐标（mm）**，而格内想要的是"占格宽百分比 / mm"——
+   *    两套口径不同。更要命的是：**老模板里格内子元素的 `x`/`y` 是版心坐标**
+   *    （历史上被定义为"无意义"、所以没人清过，拖进格子时原样带进去，比如 x=150）。
+   *    若把 `x` 直接当百分比解释 ⇒ **老数据 150%** ⇒ 元素飞到格子外面。
+   *    而**没法靠数值区分**"老数据的 150"和"用户新设的 150%"。
+   *    ⇒ 所以**新开一个字段**：老模板没有它 ⇒ `undefined` ⇒ 走原来的流式布局 ⇒ **老数据零影响**
+   *      （本项目铁律：先不破坏老数据）。
+   *
+   * ⚠️ **缺席（`undefined`）= 未手动定位** ⇒ 维持原来的**流式**排布（靠左贴顶、
+   *    受单元格 `style.align` 影响）。一旦写入，这个子元素改为**绝对定位**。
+   *    ⇒ 两种模式可以共存：同一张表里有的格子流式、有的格子自由。
+   *
+   * ⚠️ 单位：`xPct` = **占单元格内容宽的百分比**（跟 `w` 同体系）、
+   *    `yMm` = **mm**（跟 `h` 同体系）。各自跟随所在轴的既有体系 ——
+   *    混用会让"格子变宽时元素的相对位置漂掉"。
+   * ⚠️ 只在**格内**有效；自由层元素带着它也没有意义（渲染端会忽略）。
+   */
+  cellPos?: { xPct: number; yMm: number }
 }
 
 /** 文本段落（可含行内字段占位符） */
@@ -435,6 +489,28 @@ export interface TableCell {
   colspan: number
   /** 跨行数，默认 1 */
   rowspan: number
+  /**
+   * ⚠️ **这一格是否自动换行**（2026-10-17 用户要求：从"字段属性"挪到"单元格属性"）。
+   * · `false` ⇒ **不换行**，超出宽度的部分**直接裁切**；
+   * · `true` / 未设 ⇒ 换行。
+   * ⚠️ 默认"换行"：与打印历史行为一致（老模板不变样）。
+   */
+  wrap?: boolean
+  /**
+   * ⚠️ **这一格是否"自适应宽高"**（2026-10-17 用户要求）。
+   * · `true` ⇒ 单元格**跟着格内元素/内容长大**（行高/列宽由内容决定）；
+   * · `false` / 未设 ⇒ **严格按设定尺寸**，超出的**直接裁切**（不撑格子）。
+   * ⚠️ 默认 `false`：表格是"按模板排好的版式"，默认让它保持固定尺寸。
+   */
+  autoSize?: boolean
+  /**
+   * ⚠️ **这一格内部的子表格**（2026-10-17，用户选 A）。
+   * · 缺省 ⇒ 老模板，渲染路径完全不变；
+   * · 有值 ⇒ 渲染成"格子里的一张表"，**小格可独立填内容/绑字段**。
+   * ⚠️ 与 `nodes` / `children` **互斥**：有子表时，本格自己的内容/子元素不使用
+   *   （拆分时会先确认没内容，见 `splitCellToGrid` 的护栏）。
+   */
+  subTable?: SubTable
   /** 单元格内容：行内节点数组；与 attachment 互斥 */
   nodes: InlineNode[]
   /**
@@ -461,7 +537,23 @@ export interface TableCell {
    *      | --- | --- | --- |
    *      | `w` | 宽度，mm | **占单元格内容宽度的百分比**（默认 100 = 撑满） |
    *      | `h` | 高度，mm / `'auto'` | **一样**：数字 = 固定高度（img 按 `fit` 适配这个盒子），`'auto'` = 由内容决定 |
-   *      | `x` / `y` | 版心内坐标，mm | **无意义**（子元素在单元格里走文字流，位置由单元格决定） |
+   *      | `x` | 版心内坐标，mm | **占单元格内容宽度的百分比**（默认 0 = 靠左）|
+   *      | `y` | 版心内坐标，mm | **mm**（默认 0 = 顶端）|
+   *
+   *      ⚠️ **`x` / `y` 从 2026-10-13 起生效**（用户反馈："单元格内的图片、二维码、附件等元素
+   *         **无法通过手动缩放**，参照这些元素在画布中的逻辑，可以手动缩放，也可以手动拖动
+   *         **调整位置**，也可以**预设位置**"）。
+   *
+   *      改之前这里写的是"`x`/`y` **无意义**（子元素走文字流，位置由单元格决定）"，
+   *      而当时的理由（"绝对定位就没人给高度、格子会塌掉"）**现在有解了**：
+   *        · `MAX_CELL_CHILDREN = 1`（一格最多一个子元素）⇒ **绝对定位不会互相重叠**；
+   *        · 两端都改成"**定位容器 + 绝对定位子元素**"，容器高度 = `max(y + h, 0)`
+   *          ⇒ **行高照样被子元素撑住**，塌不掉。
+   *
+   *      ⚠️ **`x` 用百分比、`y` 用 mm 不是随意定的**：各自跟随所在轴的既有体系 ——
+   *        宽度轴本来就是百分比（`w`），高度轴本来就是 mm（`h`）。
+   *        混用会让"格子变宽时子元素的相对位置漂掉"。
+   *      ⚠️ **默认值 0/0 ⇒ 与改之前逐字等价**（`left:0; top:0` = 现在的靠左贴顶）⇒ **老模板不受影响**。
    *
    *      为什么 `w` 用百分比而不是 mm：子元素在单元格里是**流式排版**（`display:block`），
    *      它的高度会撑起这一行 —— 若改成"格内绝对定位 + mm 尺寸"，单元格高度是自适应的，
@@ -475,6 +567,25 @@ export interface TableCell {
   style?: TextStyle
   /** 单元格内边距，mm */
   paddingMm?: number
+}
+
+/**
+ * ⚠️⚠️ **单元格内部的"子表格"**（2026-10-17，用户选 A："要能真真切切用到实际模板中"）。
+ *
+ * 为什么需要它：**标准 HTML 表格里，"一个格子内部分成 2×2、而外围表格不变"做不到** ——
+ *   `colspan/rowspan` 只能表达"这一格占了几行几列"，**不能自己再分**。
+ *   唯一的路是**在格子里真的放一张表**（CKEditor 5 也是这么做的）。
+ *
+ * ⚠️ **完全向后兼容**：`TableCell.subTable` 缺省 ⇒ **老模板的渲染路径一个字都不变**。
+ * ⚠️ 结构复用 `TableRow` / `TableCell`（**同一套类型**）⇒ 合并/拆分/内容/样式在两层通用。
+ * ⚠️ 目前**只做一层**（子表里不能再套子表）—— 与 CKEditor 的建议一致（"最多嵌套 2 层"），
+ *   也避免递归失控。
+ */
+export interface SubTable {
+  /** 子表格的行（每行的 `cells` 与顶层同构） */
+  rows: TableRow[]
+  /** 子表格的列宽（mm）；总和 = 宿主单元格的内容宽 */
+  colWidthsMm: number[]
 }
 
 export interface TableRow {
@@ -530,11 +641,23 @@ export interface TableElement extends ElementBase {
   rowsFromRecords?: boolean
 }
 
+/**
+ * ⚠️ **格内元素的水平对齐**（2026-10-14 用户要求：
+ *   「附件图片二维码条形码**都遵循同一套规则**，除了附件之外，其他几个好像没有类似设置」）。
+ *
+ * 附件那边用的是 `AttachmentPrintConfig.align`；这里抽成**共用别名**，
+ * 让图片 / 二维码 / 条形码也有同一套语义。
+ * ⚠️ **缺省** ⇒ 退回**所在单元格**的 `style.align`（老模板行为不变）。
+ */
+export type CellChildAlign = 'left' | 'center' | 'right'
+
 export interface ImageElement extends ElementBase {
   kind: 'image'
   /** 内嵌图片（固定图片，如公司 logo）。模板 JSON 内联存储，单张 ≤300KB */
   dataUrl: string
   fit?: ImageFill
+  /** 格内水平对齐（缺省 ⇒ 用所在单元格的对齐） */
+  align?: CellChildAlign
 }
 
 export interface HLineElement extends ElementBase {
@@ -601,6 +724,8 @@ export interface QrCodeElement extends ElementBase {
   foreground?: string
   /** 背景色。默认 #ffffff */
   background?: string
+  /** 格内水平对齐（缺省 ⇒ 用所在单元格的对齐） */
+  align?: CellChildAlign
 }
 
 /**
@@ -617,6 +742,8 @@ export interface BarcodeElement extends ElementBase {
   showText?: boolean
   foreground?: string
   background?: string
+  /** 格内水平对齐（缺省 ⇒ 用所在单元格的对齐） */
+  align?: CellChildAlign
 }
 
 // ============================================================
@@ -732,6 +859,18 @@ export interface AttachmentPrintConfig {
   flow: AttachmentFlow
   /** 每行最多图片数，1–8；null = 按容器宽度自动 */
   maxPerRow: number | null
+  /**
+   * **只打印第一张**（2026-10-14 用户要求）。
+   *
+   * 用户原话：「附件里存在多个图片时，打印的图片似乎是**随机的**，
+   *  我需要的效果是**只打印第一张图片**」。
+   *
+   * ⚠️ 缺省 = `false` ⇒ **老模板逐字不变**（仍然把全部附件都排出来），
+   *   所以加这个字段**不需要 schema 迁移**。
+   * ⚠️ 与 `maxPerRow` 的区别：`maxPerRow = 1` 是"每行一张"，
+   *   **多张仍然会打印、只是换行**；`onlyFirst` 才是"只留一张"。
+   */
+  onlyFirst?: boolean
   gapXMm: number
   gapYMm: number
   /**

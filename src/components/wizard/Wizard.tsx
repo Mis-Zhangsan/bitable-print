@@ -305,7 +305,7 @@ function WizardFooter({ w, panelOpen }: { w: W; panelOpen: boolean }) {
   return (
     <Foot
       back={{ label: '上一步', onClick: () => w.setStep(2) }}
-      note={working ? '正在准备…' : `共 ${w.render.doc?.pages.length ?? 0} 页 · 打印前会重新获取附件图片`}
+      note={working ? '正在准备…' : `共 ${w.render.doc?.pages.length ?? 0} 页 · 打印时复用已加载的图片`}
     />
   )
 }
@@ -2038,15 +2038,22 @@ function StepOutput({ w }: { w: W }) {
         </div>
       </section>
 
-      {working && (
+      {/*
+        ⚠️⚠️ **进度条只在"渲染真的在跑"时出现**（2026-10-14 用户报"卡在正在输出 16/16，很容易误导"）。
+
+        以前条件是 `working`（= `output.phase === 'working'` **或** `busy`）——
+        而"点打印"会把 `output.phase` 置成 `working`，此时**渲染早已完成**（`render.phase === 'ready'`）
+        ⇒ 于是：进度条还在、文案落到 else 显示"正在输出"、`done/total` 是 **16/16**
+        ⇒ **看上去就是"卡在 100%"**。
+
+        ⇒ 改成只看 `busy`（`render.phase` 是 `images`/`layout`）：**渲染跑完就不再显示进度条**。
+        ⚠️ `working` 仍然保留给"按钮禁用"用（那是对的）—— 两者语义不同，别合并。
+      */}
+      {busy && (
         <div className="wiz-progress">
           <span className="wiz-pulse" />
           <span className="wiz-progress-text">
-            {w.render.phase === 'images'
-              ? '正在重新获取附件图片'
-              : w.render.phase === 'layout'
-                ? '正在排版'
-                : '正在输出'}
+            {w.render.phase === 'images' ? '正在加载附件图片' : '正在排版'}
             {w.render.total > 0 ? ` ${w.render.done}/${w.render.total}` : '…'}
           </span>
           <div className="wiz-bar">
@@ -2055,7 +2062,15 @@ function StepOutput({ w }: { w: W }) {
         </div>
       )}
 
-      {w.output.message && (
+      {/*
+        ⚠️⚠️ **只在"真的出结果了"才显示这个框**（2026-10-14 用户报：
+        「卡在『正在输出 16/16』，这个很容易误导用户」）。
+
+        以前条件只有 `w.output.message` —— 而开始工作时就会先塞一句"正在准备打印…"
+        ⇒ **进度条还在转、下面却已经打勾说"完成"** ⇒ 用户完全看不懂（两个框自相矛盾）。
+        ⇒ 改成只在 `done` / `error` 两种**终态**才出现。
+      */}
+      {(w.output.phase === 'done' || w.output.phase === 'error') && w.output.message && (
         <div className={`wiz-alert ${w.output.phase === 'error' ? 'danger' : 'ok'}`} role="status">
           <span className="wiz-alert-icon" aria-hidden="true">
             {w.output.phase === 'error' ? '!' : '✓'}
@@ -2122,6 +2137,122 @@ function buildReport(w: W): string {
   for (const x of w.render.imageWarnings) lines.push(`- ${x.message}`)
   lines.push('', '## 图片加载失败')
   for (const x of w.render.imageFailures) lines.push(`- ${x.fieldName} / ${x.attachmentName}：${x.reason}`)
+  /*
+   * ⚠️⚠️ **把"图片预取统计"也打进清单**（2026-10-14）。
+   *
+   * 为什么要加：用户报「**从第 5 条记录起全部"图片加载失败"**」，
+   *   但上面那节「图片加载失败」**是空的** —— 说明**下载器认为没有失败**。
+   *   光看"失败列表"分不清下面三种情况：
+   *     · **没数据**：那些记录的附件字段是空的 / 没取到（`candidates` 会很小）
+   *     · **被过滤**：非图片 / 超过体积上限（`skipped*` 会 > 0）
+   *     · **真失败**：取链接 / 下载挂了（`failed` > 0）
+   *   ⇒ 把三个数摊开，一眼就能定方向，不用再靠猜。
+   */
+  const st = w.render.imageStats
+  if (st) {
+    lines.push(
+      '',
+      '## 图片预取统计',
+      `- 候选附件（记录里实际有的）：${st.candidates}`,
+      `- 实际下载任务：${st.images ?? 0}`,
+      `- 非图片跳过：${st.skippedNonImage ?? 0}`,
+      `- 超过体积跳过：${st.skippedTooLarge ?? 0}`,
+      `- 失败：${st.failed ?? 0}`,
+    )
+  }
+  /*
+   * ⚠️⚠️ **表格尺寸诊断**（2026-10-14）。
+   *
+   * 为什么加：用户报「格内附件**越往右下越偏**（左上角正确）」—— 那是"坐标被放大"的典型特征，
+   *   而这个放大系数就是 `k = 元素宽 w ÷ 列宽之和`（画布 `<table width:100%>` =
+   *   元素框宽，而 `<col>` 写的是原始 mm ⇒ `table-layout:fixed` 会按比例压缩列宽）。
+   *   `coerceDoc` 里已经加了"把 `w` 对齐成列宽之和"的自愈，但**它在不在生效、`k` 现在等于几，
+   *   用户那边看不到**。
+   * ⇒ 打到清单里：一眼就能判断"自愈生效没有 / 还是不是 1"。
+   *   ⚠️ 飞书里**调不出控制台**，所以"可见的输出"只有清单这一条路。
+   */
+  const diagTables = (w.doc
+    ? [...w.doc.bands.header, ...w.doc.bands.loop.elements, ...w.doc.bands.footer]
+    : []
+  ).filter((e) => e.kind === 'table') as Array<{ id: string; w?: number; colWidthsMm?: number[] }>
+  if (diagTables.length > 0) {
+    lines.push('', '## 表格尺寸诊断（k 应等于 1）')
+    for (const t of diagTables) {
+      const sum = (t.colWidthsMm ?? []).reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0)
+      const wv = Number.isFinite(t.w) ? (t.w as number) : 0
+      const k = sum > 0 ? Math.round((wv / sum) * 1000) / 1000 : NaN
+      lines.push(
+        `- 表格 ${t.id}：元素宽 w = ${wv}mm · 列宽之和 = ${Math.round(sum * 10) / 10}mm · 比值 k = ${
+          Number.isFinite(k) ? k : '—'
+        }`,
+      )
+      /*
+       * ⚠️ **格内元素的定位值**（2026-10-14）。
+       *
+       * 用户报「附件放**左上角**打印正确，越往**右下**偏得越厉害，还会超出单元格」，
+       * 而上一节的 `k` 已经是 1 ⇒ **排除了"列宽被缩放"**。
+       * ⇒ 那就要看**模型里存的 `cellPos`** 到底是多少：
+       *   · `xPct` 是"占格宽百分比"、`yMm` 是 mm；
+       *   · `w` 是"占格宽百分比"、`h` 是固定盒高（mm）。
+       * 拿到这些值，就能和"打印产物里的 left/top/width/height"逐个对照 ——
+       * **哪一环换算错了，一比就知道**，不用再猜。
+       */
+      type DiagChild = {
+        id: string
+        kind: string
+        w?: unknown
+        h?: unknown
+        cellPos?: { xPct?: number; yMm?: number }
+      }
+      const rows = (t as unknown as { rows?: Array<{ id?: string; heightMm?: number; cells?: Array<{ id: string; children?: DiagChild[] }> }> }).rows
+      /*
+       * ⚠️ **每一行的"声明行高"**（2026-10-14 加的，用来定位"画布上拖不到底边"）。
+       *
+       * 用户报：画布中附件**拖不到底边**（上/左/右能贴紧），而**打印时反而贴到底了**。
+       * 我的钳制用的是 `td` 的**实际渲染高**（`getBoundingClientRect`），
+       * 所以怀疑"`td` 的实际高 ≠ 画布上格子的视觉高"。
+       * ⇒ 这里把**声明行高**打出来：若它是空/0，说明行高**由内容撑**，
+       *   而格内元素是绝对定位（**不撑行高**）⇒ `td` 会很矮 ⇒ 钳制过早到底。
+       *   ⚠️ 飞书里调不出控制台，**只能靠清单**把这类"模型值"摊开。
+       */
+      /*
+       * ⚠️ **把"格内元素所在的行"也标出来**（2026-10-14 我读错过一次数据）。
+       *
+       * 我上一版只列了"每一行的声明行高"，**没标出元素在哪一行** ⇒
+       * 我拿 `row_u`（7mm）去解释一个其实躺在 **36.1mm** 那行里的元素，**得出完全错误的结论**。
+       * ⇒ 现在按"行 → 该行的格子 → 格内元素"的层级打印，**谁在哪一行一目了然**。
+       *   ⚠️ 飞书里调不出控制台，清单是唯一的"可见输出"，**它必须能自解释**。
+       */
+      for (const row of rows ?? []) {
+        lines.push(`  - 行 ${row.id ?? '?'}：声明行高 = ${row.heightMm ?? '（空 ⇒ 由内容撑）'}`)
+        for (const cell of row.cells ?? []) {
+          for (const ch of cell.children ?? []) {
+            if (ch.kind !== 'attach' && ch.kind !== 'image' && ch.kind !== 'qrcode' && ch.kind !== 'barcode')
+              continue
+            lines.push(
+              `      ↳ 格内元素 ${ch.id}（${ch.kind}）在格 ${cell.id}：` +
+                `w = ${String(ch.w)} · h = ${String(ch.h)} · cellPos = ${
+                  ch.cellPos ? `xPct ${ch.cellPos.xPct}% / yMm ${ch.cellPos.yMm}mm` : '（未定位）'
+                }`,
+            )
+          }
+        }
+      }
+      for (const row of rows ?? []) {
+        for (const cell of row.cells ?? []) {
+          for (const ch of cell.children ?? []) {
+            if (ch.kind !== 'attach' && ch.kind !== 'image' && ch.kind !== 'qrcode') continue
+            lines.push(
+              `  · 格内元素 ${ch.id}（${ch.kind}，所在格 ${cell.id}）：` +
+                `w = ${String(ch.w)} · h = ${String(ch.h)} · cellPos = ${
+                  ch.cellPos ? `xPct ${ch.cellPos.xPct}% / yMm ${ch.cellPos.yMm}mm` : '（未定位）'
+                }`,
+            )
+          }
+        }
+      }
+    }
+  }
   return lines.join('\n')
 }
 
