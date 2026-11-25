@@ -653,8 +653,32 @@ export type CellChildAlign = 'left' | 'center' | 'right'
 
 export interface ImageElement extends ElementBase {
   kind: 'image'
-  /** 内嵌图片（固定图片，如公司 logo）。模板 JSON 内联存储，单张 ≤300KB */
-  dataUrl: string
+  /**
+   * 内嵌图片（固定图片，如公司 logo）。
+   *
+   * ⚠️ **两种存法并存**（2026-10-19）：
+   *   · `dataUrl` —— 老模板 / 附件上传失败的降级路径，**内联**在模板 JSON 里；
+   *   · `fileToken` —— 新路径：图片传到飞书**附件字段**，这里只存 token。
+   *
+   * 为什么必须进化：模板 JSON 要塞进飞书**一个文本单元格**，上限 **10 万字、超出静默截断**。
+   * 而 base64 的字符数 ≈ 字节 × 4/3 —— 一张 300KB 的图就是 41 万字，**一张就把单元格撑爆**
+   * （用户报的"固定图片保存后消失"正是它）。走 token 之后模板只剩几十字节。
+   *
+   * ⚠️ 渲染优先级：`fileToken` 解析出的 URL 优先，取不到再退回 `dataUrl`
+   *    （见 `render/html.ts` 的 `renderImage` 与画布的 `useTemplateImageUrls`）。
+   */
+  dataUrl?: string
+  /** 飞书附件 token（走附件字段存图时使用） */
+  fileToken?: string
+  /**
+   * 附件元信息（2026-10-19）。
+   *
+   * ⚠️ **写附件字段时必须要完整对象**，SDK 的类型是
+   * `{ name, size, type, token, timeStamp }`（`IOpenAttachment`）——
+   * 只给 `token` 会被飞书**静默丢弃**（用户实测："模板图片字段里没有图片插入"）。
+   * `batchUploadFile` 只回 token，所以 name/size/type 要在上传那一刻记下来。
+   */
+  fileMeta?: { name: string; size: number; type: string }
   fit?: ImageFill
   /** 格内水平对齐（缺省 ⇒ 用所在单元格的对齐） */
   align?: CellChildAlign

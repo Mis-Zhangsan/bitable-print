@@ -236,11 +236,20 @@ export function effectiveChildYMm(
    *   元素穿出单元格 1mm 压线 —— 用户实测 `toB = 0.4mm` 而非 1.5mm 正是它）。
    */
   padMm = 0,
+  /**
+   * **行高不够时的缩放系数**（`1` = 不缩）。
+   *
+   * 用户口径（2026-10-19）：「缩小的时候，如果高宽的值不足以容纳格内的元素，
+   * 那就把格内元素也同步缩小吧」。
+   * ⚠️ 必须跟 `boxH` 一起缩：只缩盒子不让 `y` 跟着缩，元素会在缩小的行里"下沉"。
+   */
+  scale = 1,
 ): number {
-  const y = childOffsetYMm(child)
+  const k = Number.isFinite(scale) && scale > 0 ? scale : 1
+  const y = childOffsetYMm(child) * k
   if (typeof rowHeightMm !== 'number' || !Number.isFinite(rowHeightMm) || rowHeightMm <= 0) return y
   const contentH = rowHeightMm - 2 * Math.max(0, padMm)
-  const maxY = Math.max(0, contentH - childBoxHeightMm(child))
+  const maxY = Math.max(0, contentH - childBoxHeightMm(child) * k)
   return Math.min(y, maxY)
 }
 

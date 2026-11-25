@@ -21,6 +21,8 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
+  Fragment,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -81,6 +83,7 @@ import {
   MIN_COL_MM,
   MIN_ROW_MM,
   colEdgeFrac,
+  rowChildScale,
   scaleColWidths,
   scaleRowHeights,
   setColWidthPatch,
@@ -88,6 +91,13 @@ import {
 } from './table-actions'
 // 智能对齐线：判定是纯函数（全在 mm 空间，见 align-guides.ts 的文件头），画布只负责画
 import { buildDocRefs, computeGuides, dedupeGuides, type BoxMm, type GuideLine } from './align-guides'
+/*
+ * 模板图片（飞书附件）的临时链接表（2026-10-19）。
+ * 固定图片现在可以只存 `fileToken`（图片在附件里），渲染前由这里换成 URL。
+ * ⚠️ 链接 10 分钟过期 ⇒ 只做内存缓存，绝不写进模板。
+ */
+import { getTemplateImageUrls, subscribeTemplateImageUrls } from './template-image-store'
+import { docImageElements } from '../../lib/template-images'
 import { BAND_META, layoutBandBars, layoutBandGutters, type BandGeometry } from './band-bars'
 // 表格的悬浮操作层（表格手柄 / 行首列首「+」/ 边缘感应区）——纯展示 + 纯回调，见它的文件头
 import { TableAfford, tableAnchors } from './TableAfford'
@@ -497,6 +507,9 @@ export interface CanvasProps {
 // ============================================================
 // 样式小工具
 // ============================================================
+
+/** `useSyncExternalStore` 的服务端快照必须**引用稳定**，所以用模块级常量 */
+const EMPTY_IMAGE_URLS = new Map<string, string>()
 
 const FONT_STACKS: Record<string, string> = {
   system: 'var(--font-sans)',
@@ -1046,6 +1059,45 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
    * 编辑中：手柄全出（加号 / 行首列首 / 拖拽调尺寸），菜单换成编辑功能 + 「完成编辑」。
    * 这样平时是一块可移动的内容，点了编辑才是一张可改的表。
    */
+  /*
+   * 模板图片的临时链接（`fileToken → url`）。
+   * 固定图片走附件存时，元素里只有 token —— 渲染前必须先换成 URL，见 store 的文件头。
+   */
+  const tplImageUrls = useSyncExternalStore(subscribeTemplateImageUrls, getTemplateImageUrls, () => EMPTY_IMAGE_URLS)
+
+  /*
+   * ⚠️ 诊断（2026-10-19）：用户报"图片糊"时，先确认**画布到底拿到了什么**。
+   * 用 `warn` 而不是 `info`：控制台默认级别下 info 有可能被过滤掉，
+   * 之前那条 info 在用户机器上一次都没显示（无法区分"没执行"和"被过滤"）。
+   */
+  useEffect(() => {
+    const imgs = docImageElements(doc)
+    console.debug('[BP 模板图片] 画布挂载', {
+      images: imgs.length,
+      tokens: imgs.map((i) => i.fileToken ?? null),
+      names: imgs.map((i) => i.fileMeta?.name ?? null),
+      urlKeys: [...tplImageUrls.keys()],
+    })
+    // 只在挂载时看一次（后面每次渲染都打会淹掉控制台）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  /** 图片元素的最终 src：**token 链接优先**（原图），取不到退回内联的 dataUrl（老模板/降级） */
+  const imgSrcOf = (el: {
+    dataUrl?: string
+    fileToken?: string
+    fileMeta?: { name: string }
+  }): string => {
+    /*
+     * 三级：**token → 附件名 → 内联 dataUrl**。
+     * 中间那级是 2026-10-19 加的：`batchUploadFile` 返回的 token 与附件字段里最终存下的
+     * token 可能不是同一个值（飞书入库时会重写），只按 token 查会永远命中不了。
+     * 附件名是我们自己在保存时写进去的（`tplimg-<elementId>`，唯一），不受重写影响。
+     */
+    const byToken = el.fileToken ? tplImageUrls.get(el.fileToken) : undefined
+    const byName = el.fileMeta?.name ? tplImageUrls.get(el.fileMeta.name) : undefined
+    return byToken || byName || el.dataUrl || ''
+  }
+
   const [editTableId, setEditTableId] = useState<string | null>(null)
   /**
    * 把"退出表格编辑态"注册给宿主（2026-09-23 真机反馈第 5 条：全屏下 Esc 该**先退编辑**、
@@ -2088,11 +2140,18 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
          *    "这一行改由内容撑开"会让高度变成不可预测的值 ⇒ `originShift` 失去意义、表格会跳。
          *    ⇒ `start` 侧一律钳到 MIN，不换态。
          */
-        const toAuto = axis === 'row' && side === 'end' && snappedMm < MIN_ROW_MM
-        const nextMm =
-          axis === 'col'
-            ? Math.max(MIN_COL_MM, snappedMm)
-            : Math.max(MIN_ROW_MM, snappedMm)
+        /*
+         * ⚠️ **拖到极小不再换成"自适应"**（2026-10-19 用户报：
+         *   「一直拖动缩小的时候，画布中目测大小已经不变，但值会缩小为 0」）。
+         * 原来这里是 `snappedMm < MIN_ROW_MM ⇒ heightMm: undefined` —— 面板读出来是 0，
+         * 画布却按内容撑开 ⇒ 读数与实际彻底脱节。现在一律钳到下限，
+         * 换态只认"双击行边框"（显式 `undefined`）。
+         *
+         * 下限 = `max(1mm, 这一行/列里元素占用的尺寸)` —— 用户要求"不能比格内元素还小"。
+         */
+        /* 下限只有 1mm：装不下时元素会等比缩小（见 `rowChildScale`），不再"被元素顶住" */
+        const floorMm = axis === 'col' ? MIN_COL_MM : MIN_ROW_MM
+        const nextMm = Math.max(floorMm, snappedMm)
         setSizeGhost({
           axis,
           x: ev.clientX,
@@ -2126,7 +2185,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
           }
           return
         }
-        const p = setRowHeightPatch(el, index, toAuto ? undefined : round1(nextMm))
+        const p = setRowHeightPatch(el, index, round1(nextMm))
         if (p) {
           onMerge(
             el.id,
@@ -2176,6 +2235,18 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
       }
       // 分页符/锁定元素不可拖动（PRD F2-11）
       if (editing || el.locked || el.kind === 'pagebreak') return
+      /*
+       * ⚠️ **表格恢复"按住就拖"**（2026-10-19 第二轮）。
+       *
+       * 早上按用户要求把主体拖动去掉（怕和"直接拖行高列宽"打架），改成只有悬浮栏里的
+       * 「移动」图标能拖；用了一轮他反馈**还是想直接按住表格拖** ⇒ 加回来。
+       *
+       * ⚠️ 两个手势怎么共存：**尺寸手柄在 pointerdown 时 `stopPropagation`**
+       *    （见 `.bp-tbl-size` 的那几条），所以落在手柄上的按下不会走到这里 ——
+       *    拖宽高仍然优先，只有点在手柄以外的区域才是"拖整表"。
+       * ⚠️ 悬浮栏里的「移动」图标**保留**：它是"想明确移动"时的稳妥入口，
+       *    尤其表格很大、编辑区被裁切时，手柄/主体都可能点不到。
+       */
       beginSession(e, el, 'move', band)
     },
     [beginSession, editingId, onSelect, onSelectCell],
@@ -2552,16 +2623,18 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                 label: '行高',
                 input: {
                   value: typeof row?.heightMm === 'number' ? Math.round(row.heightMm * 10) / 10 : 0,
-                  min: 0,
+                  /* ⚠️ 最小 1mm（2026-10-19 用户口径："数值不能为 0，最小为 1"）。
+                     "自适应"的入口不再是"填 0"，而是**双击行边框**（见 `onSizeDoubleClick`）。 */
+                  min: 1,
                   max: 500,
                   step: 1,
                   suffix: 'mm',
                   onInput: (v: number) => {
-                    const p = setRowHeightPatch(table, loc.rowIdx, v <= 0 ? undefined : v)
+                    const p = setRowHeightPatch(table, loc.rowIdx, v)
                     if (p) onMerge(table.id, p, `rh:${table.id}:${loc.rowIdx}`)
                   },
                   onCommit: (v: number) => {
-                    const p = setRowHeightPatch(table, loc.rowIdx, v <= 0 ? undefined : v)
+                    const p = setRowHeightPatch(table, loc.rowIdx, v)
                     if (p) onMerge(table.id, p)
                     onCommitEnd?.()
                   },
@@ -2594,9 +2667,21 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
             ] as CtxItem[])
           : []),
         SEP,
-        { id: 'cell:mergeRight', label: '与右侧单元格合并' },
-        { id: 'cell:mergeDown', label: '与下方单元格合并' },
-        { id: 'cell:split', label: '拆分单元格', disabled: !canSplit },
+        /*
+         * ⚠️ **菜单里不再直接"合并"**（2026-10-19 用户要求）：
+         * 「取消合并单元格的这两个按钮，改为编辑表格，点击后进入表格编辑状态，
+         *   右侧的属性也同步切换到表格的属性编辑页」。
+         * 合并属于**表格结构**操作，放进"编辑表格"模式里做（那里有合并/居中/加粗的浮层），
+         * 右键菜单只留一个直达入口，免得一张菜单里既有"改这一格"又有"改整表"。
+         */
+        { id: 'cell:editTable', label: '编辑表格', hint: '增删行列 / 合并' },
+        /*
+         * ⚠️ **「拆分单元格」改名「恢复单元格」**（同一天）：
+         * 用户原话：「这个菜单中的'拆分单元格'只有在右键已经合并过的单元格才会生效，
+         *   所以名字改为'恢复单元格'」—— 名字要说出它真正的作用（取消合并），
+         * 而不是让人以为能把一个普通格切成 2×2（那是"编辑表格 → 拆分"里的活）。
+         */
+        { id: 'cell:split', label: '恢复单元格', disabled: !canSplit, hint: '拆回单格' },
         SEP,
         {
           id: 'cell:headerRow',
@@ -2817,8 +2902,15 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         if (id === 'cell:colRight') return actions.insertCol(t.tableId, t.cellId, 'right')
         if (id === 'cell:delRow') return actions.deleteRow(t.tableId, t.cellId)
         if (id === 'cell:delCol') return actions.deleteCol(t.tableId, t.cellId)
-        if (id === 'cell:mergeRight' || id === 'cell:mergeDown') {
-          actions.askMerge(t.tableId, t.cellId, id === 'cell:mergeRight' ? 'right' : 'down')
+        /*
+         * 「编辑表格」：进表格编辑态 + **把右侧面板切回表格属性**（2026-10-19）。
+         * 只 `setEditTableId` 的话，面板还停在"这一格"上 —— 用户点了"编辑表格"却看到
+         * 单元格属性，会以为点错了。
+         */
+        if (id === 'cell:editTable') {
+          onSelectCell(t.tableId, null)
+          onSelect(t.tableId)
+          setEditTableId(t.tableId)
           return
         }
         if (id === 'cell:split') {
@@ -3918,7 +4010,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
        * `<img src="">` 会塌成一条细线：宽度撑满、高度几乎为 0 ⇒ 用户看到的就是"格内图片是窄条"。
        * 而且细线意味着**点不中**，右键自然也就落到表格上去了（第 3 条那个"菜单还是表格设置"）。
        */
-      if (!child.dataUrl) {
+      if (!imgSrcOf(child)) {
         /*
          * ⚠️ 文案结构与其它三种**逐字对齐**（2026-09-24 第四批第 1 条「保持画风一致」）：
          * 标题（绿标）+ 主文案 + 副文案，**固定三行**。
@@ -3937,7 +4029,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
       return (
         <img
           className="bp-el-cell__child-img"
-          src={child.dataUrl}
+          src={imgSrcOf(child)}
           alt=""
           /* 图片默认可拖拽（HTML 规范）：浏览器自己起原生 dnd，我们的 pointermove 会话就不触发了
              ⇒ 表现为「格内图片拖不动」。自由层那张早加了 draggable={false}，格内这张漏了。 */
@@ -4327,7 +4419,15 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                                * （2026-09-24 第四批 ④「不把单元格撑变形」）。
                                * 这一条必须两边一致 —— 否则就是"画布看着 18mm、打印出来把行撑破"。
                                */
-                              const boxH = childBoxHeightMm(child)
+                              /*
+                               * ⚠️ **行高装不下时，元素跟着等比缩小**（2026-10-19 用户：
+                               *   「缩小的时候，如果高宽的值不足以容纳格内的元素，就把格内元素也同步缩小」）。
+                               * 不缩的话 `<tr height>` 会被内容撑住 —— 画布看着"行高没变"，
+                               * 打印却按真实行高裁掉，用户永远判断不了这一行到底多高。
+                               * 自适应行（没有 heightMm）不缩：它的高度本来就由内容决定。
+                               */
+                              const childK = rowChildScale(el, r)
+                              const boxH = childBoxHeightMm(child) * childK
                               /*
                                * ⚠️ **已手动定位 ⇒ 绝对定位；没定位 ⇒ 维持流式**（2026-10-13）。
                                * 这是"老模板零影响"的开关：`cellPos` 缺席就是原来那条路。
@@ -4361,6 +4461,8 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                                 typeof row.heightMm === 'number' ? row.heightMm : undefined,
                                 /* ⚠️ 单元格级内边距优先（与 <td> 的 padding、打印端同源）*/
                                 finite(c.paddingMm, finite(el.cellPaddingMm, 1.5)),
+                                /* 与 `boxH` 同一个系数 —— 只缩盒子不让 y 跟着缩，元素会在行里"下沉" */
+                                childK,
                               )
                               /*
                                * ⚠️⚠️ **横向一律用 mm，不要用百分比**（2026-10-14 第 2 次对齐，与打印端同口径）。
@@ -4379,7 +4481,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                                 cellWidthMm(el, c.id) - 2 * finite(c.paddingMm, finite(el.cellPaddingMm, 1.5)),
                               )
                               return (
-                                <>
+                                <Fragment key={child.id}>
                                 {/*
                                   ⚠️ **定位容器**（2026-10-13）。已定位时它撑住行高（`y + h`），
                                   否则子元素绝对定位后就没人给高度、**格子会塌**（旧设计拒绝绝对定位的
@@ -4611,21 +4713,48 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                                   </>
                                 ) : null}
                                 </span>
-                                </>
+                                </Fragment>
                               )
                             })}
                             {(c.children?.length ?? 0) > 0 && c.nodes.length === 0
                               ? null
-                              /* ⚠️ 传"这一格"的颜色 → 元素颜色作兜底（见 renderInline 的注释） */
-                              : renderInline(
-                                  c.nodes,
-                                  fields,
-                                  c.id,
-                                  pickFor(el.id, c.id),
-                                  c.style?.color ?? el.style?.color,
-                                  c.wrap,
-                                  decoOf(c.style ?? el.style),
-                                )}
+                              : (() => {
+                                  /* ⚠️ 传"这一格"的颜色 → 元素颜色作兜底（见 renderInline 的注释） */
+                                  const inline = renderInline(
+                                    c.nodes,
+                                    fields,
+                                    c.id,
+                                    pickFor(el.id, c.id),
+                                    c.style?.color ?? el.style?.color,
+                                    c.wrap,
+                                    decoOf(c.style ?? el.style),
+                                  )
+                                  /*
+                                   * ⚠️⚠️ **文字必须自己裁**（2026-10-19 用户实测：
+                                   *   「只要格内有手动输入的文本或普通字段，单元格在视觉上就不会缩小了，
+                                   *     怎么拖都不会小，但实际行高了列宽是缩小了的」）。
+                                   *
+                                   * 根因：`<tr height>` 只是**最小高度**，而 `td` 上的
+                                   * `max-height` / `overflow:hidden` 在 `table-cell` 上**不生效**
+                                   * ⇒ 文字把行撑住。（打印端早就踩过同一个坑，那里是套一层 div 解决的。）
+                                   *
+                                   * ⇒ 这里给**文字**单独套一层定高裁切框。
+                                   * ⚠️ **不能包住整个 td 的内容**：格内子元素是 `position:absolute`，
+                                   *    外层多一层定位祖先会让它们的落点全偏（见 `.bp-el-cell__holder` 的注释）。
+                                   * ⚠️ 只在"有显式行高 + 没开自适应"时裁；自适应行本来就该被内容撑高。
+                                   */
+                                  const rowH = typeof row.heightMm === 'number' && row.heightMm > 0 ? row.heightMm : null
+                                  if (rowH == null || c.autoSize === true) return inline
+                                  const padMm = finite(c.paddingMm, finite(el.cellPaddingMm, 1.5))
+                                  return (
+                                    <div
+                                      className="bp-cell-clip"
+                                      style={{ maxHeight: mmToPx(Math.max(0, rowH - padMm * 2)), overflow: 'hidden' }}
+                                    >
+                                      {inline}
+                                    </div>
+                                  )
+                                })()}
                           </>
                         )}
                       </td>
@@ -4641,7 +4770,7 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
         return (
           <img
             className="bp-el-image"
-            src={el.dataUrl}
+            src={imgSrcOf(el)}
             alt=""
             draggable={false}
             /* 与打印端同一套取值：fill/cover 原样，其余（含未设）退回 contain */
@@ -4881,6 +5010,32 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
              * 不拦的话点按钮会先冒泡到 `.bp-el` 的 pointerdown，触发"拖动整个表格"。
              */
             <div className="bp-table-bar" onPointerDown={(ev) => ev.stopPropagation()}>
+              {/*
+                ---- 移动表格（2026-10-19 用户要求）----
+                「把鼠标移动到表格上，会出现移动表格的光标，为了防止该功能和拖动表格宽高冲突，
+                  改为在…悬浮栏中增加一个移动的图标，按照该图标完成对表格的移动」。
+                ⇒ 表格主体**不再接受拖动**（`onElementPointerDown` 里对 table 直接 return），
+                  只有按住这个图标才会走画布既有的移动会话。
+              */}
+              <button
+                type="button"
+                className="bp-table-bar__btn is-icon"
+                title="按住拖动整个表格"
+                aria-label="按住拖动整个表格"
+                onPointerDown={(ev) => {
+                  ev.stopPropagation()
+                  beginSession(ev, el, 'move', band)
+                }}
+              >
+                {/* 四向箭头：通用的"移动"图形（项目不引图标库，自绘 SVG） */}
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden>
+                  <path
+                    d="M8 2.2v11.6M2.2 8h11.6M8 2.2 6.2 4M8 2.2 9.8 4M8 13.8 6.2 12M8 13.8l1.8-1.8M2.2 8 4 6.2M2.2 8 4 9.8M13.8 8 12 6.2M13.8 8 12 9.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
               {editTableId === el.id ? (
                 /*
                  * ---- 编辑态（真机反馈第 6 条）----
@@ -4963,6 +5118,10 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
                     title="进入表格编辑状态（增删行列、调尺寸、选格子合并）"
                     onClick={() => {
                       setEditTableId(el.id)
+                      /* ⚠️ 右侧属性同步切到**表格**属性页（2026-10-19 用户要求）——
+                         否则面板还停在"这一格"，用户会以为没进编辑态 */
+                      onSelectCell(el.id, null)
+                      onSelect(el.id)
                       /*
                        * 进编辑态时**把「表格尺寸」小窗一起打开**（真机反馈 2026-09-23 第 6 条）。
                        * 用户原话：「只有在刚拖表格进来时才需要显示表格右侧的行列设置小窗，
@@ -5016,7 +5175,6 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
               rowEdges={rowEdges}
               rowAnchorIds={tableAnchors(el).rowAnchorIds}
               colAnchorIds={tableAnchors(el).colAnchorIds}
-              onGripDown={(ev) => onElementPointerDown(ev, el, band)}
               insertRow={(where, cellId) => actions.insertRow(el.id, cellId, where)}
               insertCol={(where, cellId) => actions.insertCol(el.id, cellId, where)}
             />
@@ -5047,7 +5205,15 @@ export const Canvas = forwardRef<CanvasHandle, CanvasProps>(function Canvas(
             只在选中时才挂手柄的话，用户得先猜"要不要先点一下"。手柄本身只有 7px 宽、
             且自带 `col-resize/row-resize` 光标，悬停时出现不会抢走"点这一格"。
           */}
-          {editTableId === el.id && el.kind === 'table' ? (
+          {/*
+            ⚠️ **尺寸手柄不再要求先"编辑表格"**（2026-10-19 用户要求）：
+            「当前表格在画布中，需要点击编辑表格才允许拖动各行各列的宽高，
+              改为直接在画布中即可拖动宽高」。
+            ⇒ 条件从 `editTableId === el.id` 换成"悬停 or 选中"——与右上角悬浮栏同一口径。
+            手柄只有 7px 宽、自带 col/row-resize 光标，压在边框正中，
+            不会抢走"点这一格"（那条约束在下面 5070 行左右还写着）。
+          */}
+          {el.kind === 'table' && (hoverId === el.id || selected) ? (
             <div className="bp-tbl-size">
               {el.colWidthsMm.map((_, i) => {
                 const outer = i === el.colWidthsMm.length - 1

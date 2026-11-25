@@ -59,7 +59,13 @@ import { findCell, tableGrid, updateCell, type GridCell } from './table-query'
  */
 export { tableGrid } from './table-query'
 export type { GridCell } from './table-query'
-import { childHeightMm, childOffsetXPct, childOffsetYMm, childWidthPct } from '../../lib/cell-geometry'
+import {
+  childBoxHeightMm,
+  childHeightMm,
+  childOffsetXPct,
+  childOffsetYMm,
+  childWidthPct,
+} from '../../lib/cell-geometry'
 
 /**
  * 这一层要写回的补丁。
@@ -480,8 +486,13 @@ export function applySplitCell(el: TableElement, cellId: string): TableActionRes
 /** 拖列边框或改列宽输入框：列宽数组与元素总宽**必须同步**（类型注释里的约束，见 E-45） */
 export function setColWidthPatch(el: TableElement, colIdx: number, mm: number): Partial<TableElement> | null {
   if (colIdx < 0 || colIdx >= el.colWidthsMm.length) return null
+  /*
+   * ⚠️ **下限钳制放在这里**（2026-10-19）：面板输入 0 / 拖到负值都会经过这个函数。
+   * 下限只有 1mm —— 列变窄时元素按占格宽百分比自动跟着变窄，不需要被元素顶住。
+   * 原来这里**一个字都没钳**，所以右键菜单把列宽改成 0 会真的写进 0（画布上就"卡住不动"了）。
+   */
   const next = [...el.colWidthsMm]
-  next[colIdx] = mm
+  next[colIdx] = round1(Math.max(MIN_COL_MM, mm))
   return { colWidthsMm: next, w: round1(next.reduce((a, b) => a + b, 0)) }
 }
 
@@ -585,36 +596,77 @@ export function colEdgeFrac(colWidthsMm: readonly number[], i: number): number {
  * `undefined` 才是 `TableRow.heightMm` 的第三态（见 `types.ts:355`），也是可逆的那一态。
  */
 /**
- * 行高下限 = **24px**（用户规格 三："限制最小值：行高 ≥ 24px，列宽 ≥ 32px"）。
+ * 行高下限 = **1mm**（2026-10-19 用户口径：「数值不能为 0，最小为 1，手动拖拉最小值也为 1」）。
  *
- * 数值为什么是 mm：模型里行高列宽都存 mm（打印单位），而规格给的是**屏幕像素**。
- * 换算按 96dpi（CSS 标准）：24px = 24 ÷ 96 × 25.4 ≈ 6.35mm，取 6.4 留一点余量。
- * ⚠️ 改之前是 6mm（≈22.7px）—— 是一个"看着差不多"的手感值，不是任何规格要求的数。
+ * ⚠️ 之前是 6.4mm（规格里的 24px）—— 那条规格已被用户推翻：他要能把行压得很扁（做表头细线），
+ *    但**绝不能变成 0**（0 在模型里等于"自适应"，`: 0` 会让面板显示 0、画布却按内容撑开）。
+ * ⚠️ 行高真的装不下时，**格内元素会等比缩小**（见 `rowChildScale`）—— 不再"被元素顶住"。
  */
-export const MIN_ROW_MM = 6.4
+export const MIN_ROW_MM = 1
 
 /**
- * 列宽下限 = **32px**（同上）≈ 8.47mm，取 8.5。
+ * 列宽下限 = **1mm**（同上）。
  *
- * ⚠️ 2026-09-22 之前这里是 4mm（≈15px），而且**同一个量在这个文件里还有第二个定义**
- *    （`MIN_COL_MM_TABLE`，我给 insertColAt 写的时候另开的一份）。
- *    两个常量描述同一件事 ⇒ 迟早一个改了另一个没改。现在只留这一个，画布也从这里 import。
+ * ⚠️ 之前是 8.5mm（规格里的 32px），同样被 2026-10-19 的口径推翻。
  */
-export const MIN_COL_MM = 8.5
+export const MIN_COL_MM = 1
+
+/**
+ * 这一行的**元素缩放系数**：行高装不下格内元素时，元素整体等比缩小。
+ *
+ * 用户口径（2026-10-19）：「缩小的时候，如果高宽的值不足以容纳格内的元素，
+ * 那就把格内元素也同步缩小吧」。
+ *
+ * ⚠️ 为什么必须有它（用户实测的现象）：`<tr height>` 是**最小高度** ——
+ *   元素不缩的话，行会被内容撑住 ⇒ 画布上看着"行高没变"（其实是元素在撑），
+ *   而打印端按**真实行高**裁切 ⇒ **打印出来是空的**。
+ *   两端一旦分叉，用户就再也判断不了"这一行到底多高"。
+ *
+ * @returns `1`（装得下）/ `0<k<1`（按比例缩）；**自适应行**（没有 `heightMm`）恒为 1
+ */
+export function rowChildScale(el: TableElement, rowIdx: number): number {
+  const row = el.rows[rowIdx]
+  if (!row) return 1
+  const h = row.heightMm
+  /* 自适应行没有"分母" —— 行高本来就由内容决定，缩它等于自我循环 */
+  if (typeof h !== 'number' || !Number.isFinite(h) || h <= 0) return 1
+  const pad = Math.max(0, finite(el.cellPaddingMm, DEFAULT_CELL_PADDING_MM))
+  const contentH = h - pad * 2
+  /* 行高比上下内边距还小：缩到极限（2%），至少让用户看见"这一行被压扁了" */
+  if (contentH <= 0) return 0.02
+  let need = 0
+  for (const c of row.cells) {
+    for (const child of c.children ?? []) {
+      const bottom = childOffsetYMm(child) + childBoxHeightMm(child)
+      if (bottom > need) need = bottom
+    }
+  }
+  if (need <= 0) return 1
+  /* 容差 0.01mm：浮点噪声不该让元素忽大忽小 */
+  return need <= contentH + 0.01 ? 1 : Math.max(0.02, contentH / need)
+}
 
 /** 拖行边框。`mm === undefined` = 复位成自适应（双击行边框也走这里） */
 export function setRowHeightPatch(el: TableElement, rowIdx: number, mm: number | undefined): Partial<TableElement> | null {
   const row = el.rows[rowIdx]
   if (!row) return null
+  /*
+   * ⚠️ **只有 `undefined` 才代表"自适应"**（2026-10-19 改）。
+   *
+   * 原来写的是 `mm === undefined || mm < MIN_ROW_MM` ⇒ 拖到极小会**静默换态成自适应**，
+   * 面板上读出来是 0、画布上却按内容撑开 —— 用户报的「一直拖动缩小，画布目测不变但值缩成 0」
+   * 就是这条。现在小于下限只是**钳到下限**，换态只认显式的 `undefined`（双击复位）。
+   */
+  const floor = MIN_ROW_MM
   const rows = el.rows.map((r, i) => {
     if (i !== rowIdx) return r
-    if (mm === undefined || mm < MIN_ROW_MM) {
+    if (mm === undefined) {
       // 显式删掉这个键，而不是写 undefined —— JSON 序列化后两种写法不同，
       // 而"复位自适应"必须产出与从未设过行高的行**完全一样**的对象
       const { heightMm: _drop, ...rest } = r
       return rest as TableRow
     }
-    return { ...r, heightMm: round1(mm) }
+    return { ...r, heightMm: round1(Math.max(floor, mm)) }
   })
   return addTableHeightPatch(el, rows)
 }
@@ -781,6 +833,32 @@ export function cellContentHeightMm(el: TableElement, cellId: string): number | 
     finite(loc.cell.paddingMm, finite(el.cellPaddingMm, DEFAULT_CELL_PADDING_MM)),
   )
   return Math.max(0, h - pad * 2)
+}
+
+/**
+ * 设置**表格默认内边距** —— 同时**清掉所有单元格的覆写**。
+ *
+ * 用户口径（2026-10-19）：「表格属性中的内边距作用于整个表……谁后设置就覆盖前面设置的。
+ *   比如先设置的单个单元格的内边距，此时再设置整个表的内边距，那么该单元格的内边距就被覆盖更新」。
+ *
+ * ⚠️ 不清覆写的话，之前设过单元格内边距的格子会**一直压着整表值**
+ *   （渲染口径是 `cell.paddingMm ?? table.cellPaddingMm`）⇒ 改整表看起来"没生效"。
+ * ⚠️ 反方向的规则由 `updateCell` 天然满足：只写那一格，别的格一个字不动。
+ */
+export function setTablePaddingPatch(el: TableElement, mm: number): Partial<TableElement> {
+  const v = Math.max(0, Math.min(12, round1(finite(mm, DEFAULT_CELL_PADDING_MM))))
+  return {
+    cellPaddingMm: v,
+    rows: el.rows.map((r) => ({
+      ...r,
+      cells: r.cells.map((c) => {
+        if (c.paddingMm === undefined) return c
+        /* 解构删除，不留 `paddingMm: undefined` —— 与 `clearNodeStyles` 同一纪律 */
+        const { paddingMm: _drop, ...rest } = c
+        return rest as TableCell
+      }),
+    })),
+  }
 }
 
 /** 表格行列的下限：至少要留一行一列（否则表格就不存在了） */

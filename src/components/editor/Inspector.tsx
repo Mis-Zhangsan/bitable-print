@@ -81,6 +81,8 @@ import {
   type CapsuleOption,
 } from './Controls'
 import { clearNodeStyles } from './clear-node-styles'
+import { EMBED_IMAGE_MAX_BYTES, shrinkDataUrl } from '../../lib/image-shrink'
+import { templateImageFileName, uploadTemplateImageFiles } from '../../lib/template-images'
 import { IconBack, IconMerge, IconMinus, IconPlus, IconSplit, IconTrash, IconWarning } from './Icons'
 import { isCode128Encodable } from '../../render/code-elements'
 // `round1` 的规范实现（B 批收口：此前全项目 5 份副本、且不是同一种行为，见 round.ts 的文件头）
@@ -88,6 +90,8 @@ import { round1 } from './round'
 // 表格动作的规范实现（B 批提升：原来这些动作各自关在本文件的组件闭包里，
 // 顶栏的表格工具条是这些闭包的**兄弟**，够不到 —— 不提升就会各写一套。见 table-actions.ts 的文件头）
 import {
+  MIN_COL_MM,
+  MIN_ROW_MM,
   addColPatch,
   addRowPatch,
   applySplitCell,
@@ -96,6 +100,7 @@ import {
   delRowPatch,
   setColWidthPatch,
   setRowHeightPatch,
+  setTablePaddingPatch,
   tableGrid,
   cellWidthMm,
 } from './table-actions'
@@ -136,9 +141,6 @@ const GRID_OPTIONS: CapsuleOption<string>[] = GRID_STEPS_MM.map((v) => ({
   label: `${v} mm`,
   hint: v <= 1 ? '最细，适合标签纸' : v >= 10 ? '最粗，适合粗排' : undefined,
 }))
-
-/** 图片内嵌模板的上限（PRD F6-06 / D-6） */
-const IMAGE_MAX_BYTES = 300 * 1024
 
 export interface InspectorProps {
   doc: TemplateDoc
@@ -1384,7 +1386,22 @@ function TableAttrs(props: InspectorProps & { element: TableElement }) {
 
   return (
     <>
-      <Section title="结构">
+      {/*
+        ⚠️ **面板重排（2026-10-19 用户：「有些功能不够直观且混乱」）**。
+        原顺序是「结构（含表头/连续打印）→ 单元格 → 边框 → 列宽与行高」，
+        问题有三个：
+          ① 行高列宽在最后一节，离"增删行列"隔了两屏，而它们明明是同一件事；
+          ② "表头行 / 表头重复 / 连续打印" 三个开关和一段 5 行的说明挤在一起；
+          ③ 表格的「高度模式：自动」与行高的「填 0 = 自适应」两套说法并存，容易混。
+        ⇒ 按"用户改这张表时会想什么"重排：
+           行与列（结构与尺寸在一起）→ 表头 → 多记录连续打印 → 单元格 → 边框。
+      */}
+      <Section title="行与列">
+        {overflow ? (
+          <p className="bp-alert bp-alert--warn">
+            <IconWarning size={13} /> 列宽合计 {round1(totalColW)}mm 超过版心 {round1(props.layout.contentWMm)}mm，打印时将按比例压缩
+          </p>
+        ) : null}
         <div className="bp-btnrow" role="group" aria-label="行列增删">
           <button type="button" className="bp-minibtn" onClick={addRow} aria-label="增加一行">
             <IconPlus size={13} /> 行
@@ -1402,7 +1419,61 @@ function TableAttrs(props: InspectorProps & { element: TableElement }) {
         <p className="bp-hint">
           当前 {element.rows.length} 行 × {cols} 列
         </p>
-        <Field label="表头行" hint="首行作为表头，可加粗并每页重复">
+
+        <p className="bp-subhead">列宽</p>
+        <div className="bp-grid2">
+          {element.colWidthsMm.map((cw, i) => (
+            <Field key={i} label={`第 ${i + 1} 列`}>
+              <Num
+                value={cw}
+                /* 下限只有 1mm —— 列变窄时元素按占格宽百分比自动跟着变窄 */
+                min={MIN_COL_MM}
+                max={400}
+                step={1}
+                suffix="mm"
+                ariaLabel={`第 ${i + 1} 列宽`}
+                onChange={(v) => setColWidth(i, v)}
+              />
+            </Field>
+          ))}
+        </div>
+
+        <p className="bp-subhead">行高</p>
+        <div className="bp-grid2">
+          {element.rows.map((r, i) => (
+            <Field key={r.id} label={`第 ${i + 1} 行`}>
+              <Num
+                value={finite(r.heightMm, 0)}
+                /* 下限只有 1mm；0 仍然显示为"自动"。装不下时元素等比缩小 */
+                min={MIN_ROW_MM}
+                max={300}
+                step={1}
+                suffix="mm"
+                ariaLabel={`第 ${i + 1} 行高`}
+                onChange={(v) =>
+                  props.onMerge(
+                    element.id,
+                    { rows: element.rows.map((row, ri) => (ri === i ? { ...row, heightMm: v > 0 ? v : undefined } : row)) },
+                    `rh:${element.id}:${i}`,
+                  )
+                }
+              />
+            </Field>
+          ))}
+        </div>
+        {/*
+          ⚠️ 这两条是**同一件事**的两个说法，必须放在一起讲清楚（原来分散在两节里）：
+            · 行高的绝对下限是 1mm（不再有"拖到 0 变自适应"那种读数骗人的行为）；
+            · "按内容自适应"的入口是**双击那一行的下边框**（`onRowBorderReset`），
+              以及把行高值清成 0 再失焦。
+        */}
+        <p className="bp-hint">
+          最小 1mm。行高装不下格内元素时，元素会跟着等比缩小。想回到「按内容自适应」，双击那一行的下边框。
+        </p>
+      </Section>
+
+      <Section title="表头">
+        <Field label="表头行" hint="首行作为表头：加粗居中，打印时每页重复">
           <Switch
             checked={!!element.rows[0]?.isHeader}
             ariaLabel="首行作为表头"
@@ -1419,6 +1490,9 @@ function TableAttrs(props: InspectorProps & { element: TableElement }) {
             onChange={(v) => props.onMerge(element.id, { repeatHeader: v })}
           />
         </Field>
+      </Section>
+
+      <Section title="多记录连续打印">
         <Field label="连续打印" hint="多条记录排进同一张表：各条记录各占一行、表头只出一次">
           <Switch
             checked={!!element.rowsFromRecords}
@@ -1428,26 +1502,47 @@ function TableAttrs(props: InspectorProps & { element: TableElement }) {
           />
         </Field>
         {rowsFromRecordsOk ? (
-          <p className="bp-hint">
-            各条记录各占一行、表头只出一次。导出时按记录铺开；画布上仍按模板原样显示。
-            {loopEls.length > 1
-              ? '⚠️ 循环区里表格之外的其它元素只会按第一条记录渲染一次（排在表格下方）；想让它们每条记录都重复，请把那些元素移到「表尾区」。'
-              : ''}
-          </p>
+          /* ⚠️ 长说明收进 `<details>`：原来它是常显的 5 行正文，把整块面板顶得很高 */
+          <details className="bp-detail">
+            <summary>这个开关具体怎么工作</summary>
+            <p className="bp-hint">
+              各条记录各占一行、表头只出一次。导出时按记录铺开；画布上仍按模板原样显示。
+              {loopEls.length > 1
+                ? '⚠️ 循环区里表格之外的其它元素只会按第一条记录渲染一次（排在表格下方）；想让它们每条记录都重复，请把那些元素移到「表尾区」。'
+                : ''}
+            </p>
+          </details>
         ) : (
           <p className="bp-hint">开关不生效：{rowsFromRecordsWhy}</p>
         )}
       </Section>
 
       <Section title="单元格">
-        {/* 选中单元格后整个面板会换成"单元格属性"，所以这里永远走不到 cellPos 分支。
-            这儿的职责是**把用户指过去**：不给入口，用户根本不知道单元格能点。 */}
+        {/*
+          ⚠️ 这段是**用户点名要的说明**（2026-10-19）：
+          「提示用户[内边距]作用于该表的所有单元格，如果需要改动某个单元格的内边距，
+            让用户点击某个单元格后，在右侧属性的单元格样式中修改」。
+          措辞按"先说我管什么、再说想单独改去哪"的顺序 —— 比原来那句罗列型的说明更好用。
+        */}
         <p className="bp-hint">
-          在画布上点选某个单元格 → 面板会切到该单元格（改内容、绑字段、合并拆分、内边距、底纹）；
-          双击单元格可直接打字。选中后按 Esc 或点面包屑上的「表格」回到这里。
+          下面的「内边距」作用于<strong>整张表的所有单元格</strong>。
+          只想改某一格：在画布上点它 → 右侧面板会切到「单元格样式」→ 在那里改内边距
+          （它会覆盖表格的这个默认值；之后你再改表格的内边距，该格会被重新覆盖）。
         </p>
-        <Field label="内边距" hint="表格默认单元格内边距">
-          <Num value={finite(element.cellPaddingMm, 1.5)} min={0} max={12} step={0.5} suffix="mm" ariaLabel="表格默认单元格内边距" onChange={(v) => props.onMerge(element.id, { cellPaddingMm: v }, `cpad:${element.id}`)} />
+        <Field
+          label="内边距"
+          hint="作用于整张表；改了之后会**覆盖**所有单元格各自设过的内边距（谁后设谁赢）"
+        >
+          <Num
+            value={finite(element.cellPaddingMm, 1.5)}
+            min={0}
+            max={12}
+            step={0.5}
+            suffix="mm"
+            ariaLabel="表格默认单元格内边距"
+            /* ⚠️ 走 `setTablePaddingPatch`：写整表值 + **清掉所有单元格的覆写** */
+            onChange={(v) => props.onMerge(element.id, setTablePaddingPatch(element, v), `cpad:${element.id}`)}
+          />
         </Field>
       </Section>
 
@@ -1467,8 +1562,7 @@ function TableAttrs(props: InspectorProps & { element: TableElement }) {
         </Field>
         {/* 线宽与线色**不并排**：排成两列时每个控件只剩 ~58px，
             10 个色块（需要 ~167px）会被挤成一竖条 —— 用户原话是"线色的色板挤成一竖条、
-            与线宽不在一个视觉行上"。改成各自占一行后，色板一行放得下全部 10 个。
-            代价是线宽那行右侧空着，但"控件左边缘对齐成一条线"这条更值。 */}
+            与线宽不在一个视觉行上"。改成各自占一行后，色板一行放得下全部 10 个。 */}
         <Field label="线宽">
           <Num
             value={finite(element.border.widthPt, 0.75)}
@@ -1483,43 +1577,6 @@ function TableAttrs(props: InspectorProps & { element: TableElement }) {
         <Field label="线色">
           <ColorInput value={element.border.color} ariaLabel="框线颜色" onChange={(v) => props.onMerge(element.id, { border: { ...element.border, color: v } })} />
         </Field>
-      </Section>
-
-      <Section title="列宽与行高">
-        {overflow ? (
-          <p className="bp-alert bp-alert--warn">
-            <IconWarning size={13} /> 列宽合计 {round1(totalColW)}mm 超过版心 {round1(props.layout.contentWMm)}mm，打印时将按比例压缩
-          </p>
-        ) : null}
-        <div className="bp-grid2">
-          {element.colWidthsMm.map((cw, i) => (
-            <Field key={i} label={`第 ${i + 1} 列`}>
-              <Num value={cw} min={4} max={400} step={1} suffix="mm" ariaLabel={`第 ${i + 1} 列宽`} onChange={(v) => setColWidth(i, v)} />
-            </Field>
-          ))}
-        </div>
-        <div className="bp-grid2">
-          {element.rows.map((r, i) => (
-            <Field key={r.id} label={`第 ${i + 1} 行`}>
-              <Num
-                value={finite(r.heightMm, 0)}
-                min={0}
-                max={300}
-                step={1}
-                suffix="mm"
-                ariaLabel={`第 ${i + 1} 行高`}
-                onChange={(v) =>
-                  props.onMerge(
-                    element.id,
-                    { rows: element.rows.map((row, ri) => (ri === i ? { ...row, heightMm: v > 0 ? v : undefined } : row)) },
-                    `rh:${element.id}:${i}`,
-                  )
-                }
-              />
-            </Field>
-          ))}
-        </div>
-        <p className="bp-hint">行高填 0 表示自适应内容高度。</p>
       </Section>
     </>
   )
@@ -1815,7 +1872,7 @@ function CellPanel(props: InspectorProps & { element: TableElement; band: BandKe
 
 
       <Section title="单元格样式">
-        <Field label="内边距" hint="单元格内边距；留空则用表格的默认内边距">
+        <Field label="内边距" hint="只作用于这一格；之后若改了表格的内边距，这一格会被覆盖（谁后设谁赢）">
           <Num
             value={finite(cell.paddingMm, finite(element.cellPaddingMm, 1.5))}
             min={0}
@@ -2420,45 +2477,7 @@ function FieldBlockAttrs(props: InspectorProps & { element: Extract<AnyElement, 
 
 // ---- 图片 ----
 
-/**
- * 把图片压到 `limit` 字节以内（返回 dataURL + 实际字节数；压不动返回 null）。
- *
- * 为什么要有它（2026-09-23 真机反馈）：「固定图片元素……选择了图片后，图片不会显示，
- * 且属性里也依旧提示您还没有选择图片」。
- * 根因不是选图链路断了，而是**单张 300KB 的硬上限**：手机照片动辄 2–5MB ⇒ 被一句 toast 拒掉
- * （而这时页面刚好因为系统文件选择器退出了全屏，用户的注意力根本不在那条提示上）⇒ 读作"选了没用"。
- *
- * 策略：先把最长边限到 2400px，再从 JPEG 质量 0.85 往下试；四档都超就继续缩小最长边，最多 6 轮。
- * ⚠️ 一律转成 JPEG ⇒ **透明区会被填成白色**（打印本来就是印在白纸上，这个取舍可接受）；
- *    文件本来就小于上限的**不走这里**，PNG 的透明原样保留。
- */
-async function shrinkToLimit(
-  img: HTMLImageElement,
-  limit: number,
-): Promise<{ dataUrl: string; bytes: number } | null> {
-  const canvas = document.createElement('canvas')
-  const ctx = canvas.getContext('2d')
-  if (!ctx || !img.naturalWidth || !img.naturalHeight) return null
-  const longest = Math.max(img.naturalWidth, img.naturalHeight)
-  let maxEdge = Math.min(2400, longest)
-  const PREFIX = 'data:image/jpeg;base64,'
-  for (let round = 0; round < 6; round += 1) {
-    const scale = Math.min(1, maxEdge / longest)
-    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale))
-    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale))
-    /* 先铺白：JPEG 没有 alpha，不铺的话透明区会变成黑块 */
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
-    for (const q of [0.85, 0.7, 0.55, 0.4]) {
-      const dataUrl = canvas.toDataURL('image/jpeg', q)
-      const bytes = Math.round(((dataUrl.length - PREFIX.length) * 3) / 4)
-      if (bytes <= limit) return { dataUrl, bytes }
-    }
-    maxEdge = Math.round(maxEdge * 0.7)
-  }
-  return null
-}
+/* ⚠️ 压缩实现已下沉到 `lib/image-shrink.ts`（Word 导入那条路也要用，见那里的文件头） */
 
 function ImageAttrs(props: InspectorProps & { element: Extract<AnyElement, { kind: 'image' }> }) {
   const { element } = props
@@ -2475,7 +2494,7 @@ function ImageAttrs(props: InspectorProps & { element: Extract<AnyElement, { kin
      * ⚠️ 超限**不再拒绝**，改成自动压缩（见 shrinkToLimit 的文件头注释）。
      * 这里只记一下"要不要压"，真正的压缩在图片解码之后（需要 naturalWidth/Height）。
      */
-    const needShrink = file.size > IMAGE_MAX_BYTES
+    const needShrink = file.size > EMBED_IMAGE_MAX_BYTES
     const reader = new FileReader()
     reader.onload = () => {
       const url = typeof reader.result === 'string' ? reader.result : ''
@@ -2497,26 +2516,77 @@ function ImageAttrs(props: InspectorProps & { element: Extract<AnyElement, { kin
          * 高度被定成一个 100mm 的盒子 —— 用户只想**换张图**，尺寸却自己变了。
          * 和"放进格子"同一个默认口径：撑满格宽、高度由内容决定。
          */
-        const commit = (dataUrl: string, note?: string): void => {
+        /*
+         * ⚠️ **优先把图传到飞书附件**（2026-10-19）：
+         * 模板 JSON 要塞进**一个文本单元格**（上限 10 万字、超出静默截断），
+         * 图片以 base64 内联时一张 300KB 的图就有 41 万字。走 token 之后模板只剩几十字节，
+         * 而且**打印用的是原图**（不再压到 50KB）。
+         * ⚠️ 上传不可用/失败 ⇒ **自动降级**为内联 base64（宁可占体积，也不能让用户的图丢）。
+         */
+        const commit = (
+          patch: { dataUrl?: string; fileToken?: string; fileMeta?: { name: string; size: number; type: string } },
+          note?: string,
+        ): void => {
           props.onMerge(
             element.id,
             props.selectedInCell
-              ? { dataUrl, w: 100, h: 'auto' }
-              : { dataUrl, w: round1(w), h: round1(h) },
+              ? { ...patch, w: 100, h: 'auto' }
+              : { ...patch, w: round1(w), h: round1(h) },
           )
           if (note) props.onNotice(note)
         }
-        if (!needShrink) {
-          commit(url)
-          return
-        }
         const kb = Math.round(file.size / 1024)
-        void shrinkToLimit(img, IMAGE_MAX_BYTES).then((shrunk) => {
-          if (!shrunk) {
-            props.onNotice(`图片 ${kb}KB，自动压缩失败（原图太大或格式特殊）；请先手动压缩到 300KB 以内`)
+        void uploadTemplateImageFiles([file]).then(async (uploaded) => {
+          const info = uploaded[0]
+          const token = info?.token
+          if (token) {
+            /*
+             * ⚠️⚠️ **必须同时写一份 dataUrl**（2026-10-19 用户实测：
+             *   「提示已存到飞书附件，但画布中提示还没有选择图片」）。
+             *
+             * 根因：`batchUploadFile` 只是把文件传到云空间，**还没写进任何记录的附件字段**，
+             * 所以在"保存 → 重新打开"之前 `getAttachmentUrls` 拿不到 URL。
+             * 只写 token 的话，画布和打印都**没有任何可显示的东西**。
+             * ⇒ 压缩一份留在元素里当"编辑期显示副本"；保存时
+             *   `stripInlineImagesForSave` 会把它剥掉（有 token 的才剥），模板不会变大。
+             */
+            const preview = needShrink ? await shrinkDataUrl(url, EMBED_IMAGE_MAX_BYTES) : null
+            commit(
+              {
+                fileToken: token,
+                /* 写附件字段要完整对象 ⇒ 元信息一起存进元素（见 ImageElement.fileMeta） */
+                /*
+                 * ⚠️ 附件名必须**唯一**：它是"重新打开时把图对回元素"的兜底键
+                 * （token 可能被飞书重写，见 `imgSrcOf` 的注释）。用元素 id 保证唯一。
+                 */
+                fileMeta: {
+                  /* 带扩展名：飞书靠后缀判断附件类型，裸名会"无法查看" */
+                  name: templateImageFileName(element.id, info?.type || file.type),
+                  size: info?.size ?? file.size,
+                  type: info?.type || file.type || 'image/jpeg',
+                },
+                dataUrl: preview?.dataUrl ?? url,
+              },
+              `图片 ${kb}KB 已存到飞书附件（模板里只留引用，保存后打印用原图）`,
+            )
             return
           }
-          commit(shrunk.dataUrl, `图片 ${kb}KB 超过 300KB 上限，已自动压缩到 ${Math.round(shrunk.bytes / 1024)}KB`)
+          /* ---- 降级：内联 base64（老路径） ---- */
+          if (!needShrink) {
+            commit({ dataUrl: url })
+            return
+          }
+          const shrunk = await shrinkDataUrl(url, EMBED_IMAGE_MAX_BYTES)
+          if (!shrunk) {
+            props.onNotice(
+              `图片 ${kb}KB，上传到附件失败、压缩也失败；请先手动压到 ${Math.round(EMBED_IMAGE_MAX_BYTES / 1024)}KB 以内再试`,
+            )
+            return
+          }
+          commit(
+            { dataUrl: shrunk.dataUrl },
+            `图片 ${kb}KB（上传附件失败，已内联压缩到 ${Math.round(shrunk.bytes / 1024)}KB）`,
+          )
         })
       }
       img.onerror = () => props.onMerge(element.id, { dataUrl: url })

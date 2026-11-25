@@ -1056,6 +1056,14 @@
    画布元素
    ============================================================ */
 
+/*
+ * ⚠️ `.bp-el--table` 的 `cursor: default` 已撤销（2026-10-19 第二轮）。
+ *
+ * 早上为了"不和直接拖行高列宽打架"把表格的移动光标去掉了；用户用了一轮反馈
+ * 还是想按住表格就能拖 ⇒ 恢复 `.bp-el` 的 `cursor: move`。
+ * 冲突由**尺寸手柄 `stopPropagation`** 兜住：落在 7px 边框手柄上的按下不会触发拖动。
+ */
+
 .bp-el {
   position: absolute;
   min-width: 0;
@@ -2439,6 +2447,35 @@
   min-width: 0;
 }
 
+/*
+ * 表格属性面板里的**分组小标题**（"列宽" / "行高"）——
+ * 比 `bp-hint` 重、比 `Section` 标题轻，用来把"增删行列"和"具体尺寸"隔开。
+ * 原来这两组挤在两个相距很远的 Section 里，用户的原话是"不直观且混乱"。
+ */
+.bp-subhead {
+  margin: var(--sp-2) 0 var(--sp-1);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* 折叠说明（`<details>`）：长解释收起来，别把面板顶高 */
+.bp-detail {
+  margin: var(--sp-1) 0 0;
+}
+.bp-detail > summary {
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  user-select: none;
+}
+.bp-detail > summary:hover {
+  color: var(--text-1);
+}
+.bp-detail > p {
+  margin: var(--sp-1) 0 0;
+}
+
 .bp-grid2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -3481,6 +3518,13 @@
 
 /* ---- 控件分组 ---- */
 
+/* 顶栏表格工具里的"内边距"小标签（比按钮文字轻一档，不抢视觉） */
+.bp-tools__pad-lbl {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
 .bp-tools__group {
   flex: none;
   /*
@@ -3551,6 +3595,19 @@
 .bp-tools__group--font .bp-num {
   flex: none;
   width: 68px;
+}
+
+/*
+ * 顶栏「表格」弹层里的**内边距**输入框。
+ *
+ * ⚠️ 必须给死宽度（2026-10-19）：`.bp-num` 是 `display:flex` 且 `min-width:0`，
+ * 放在 `.bp-tools__group`（inline-flex，不设宽度）里会**按内容收缩**，
+ * 输入框被挤成一条细线 —— 用户看到的就是"菜单里没有内边距"（其实有，只是看不见）。
+ * 与「字号」那一组同一处理（见上面 `.bp-tools__group--font .bp-num`）。
+ */
+.bp-tools__group--pad .bp-num {
+  flex: none;
+  width: 74px;
 }
 
 .bp-tools__group--align .bp-seg {

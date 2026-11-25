@@ -12,6 +12,14 @@ import {
 } from '../../import'
 import type { IRDoc, IRLoopRange, MatchResult } from '../../import'
 import { LoopRangeEditor } from './LoopRangeEditor'
+import { cloneDoc, serializeDoc, TEMPLATE_CHAR_BUDGET } from '../../lib/template-store'
+import {
+  docSizeBreakdown,
+  formatChars,
+  shrinkDocImages,
+  uploadInlineImages,
+} from '../../lib/template-images'
+import { EMBED_IMAGE_MAX_BYTES } from '../../lib/image-shrink'
 
 /**
  * Word(.docx) 模板导入向导（PRD P4 / F3）。
@@ -180,6 +188,57 @@ export function WordImportPanel({ fields, kind, onDone, onCancel }: Props) {
       const template = rebuildWithMatches(ir, match, fields, {
         ...(manualRange ? { loopRanges: [manualRange] } : {}),
       })
+      /*
+       * ⚠️⚠️ **在导入这一步就量体积**（2026-10-19）。
+       *
+       * 用户实测：「Word 导入进来后，模板记录只保留了标题，下次打开是空白」。
+       * 根因是飞书文本单元格 **上限 10 万字、超出静默截断**（见 `TEMPLATE_CHAR_BUDGET`）——
+       * 而 Word 里的图片会以 base64 塞进模板，一张 300KB 的图就有 40 万字。
+       *
+       * ⚠️ 等到编辑器里点「完成」才被 `assertTemplateSize` 拦下，用户已经白排了一遍版式；
+       *    而且那条错误是在浮层关闭时才出现的，很容易被当成"保存失败"而不知道该怎么办。
+       * ⇒ 在这里量：**导入产物超限就当场说清楚，并且告诉他是哪一段超的**。
+       */
+      /*
+       * ⚠️ **先把图片压到 50KB 以内**（2026-10-19）。
+       * Word 里的图是**原图**（手机照片几 MB），base64 后一张就上百万字符，
+       * 而整个模板要塞进飞书一个 10 万字的文本单元格 ⇒ 不压必然存不进去。
+       */
+      /*
+       * ⚠️ **顺序很重要：先上传（原图），再压缩**（2026-10-19）。
+       * 上传的是 Word 里的原图 ⇒ 附件里是高清的；压缩只作用在"没上传成功的那些"上
+       * （它们要内联进模板，不压就会撑爆 10 万字单元格）。
+       */
+      setStage({ label: '上传图片', progress: 0.9 })
+      const up = await uploadInlineImages(template)
+      setStage({ label: '压缩图片', progress: 0.94 })
+      const shrink = await shrinkDocImages(template, EMBED_IMAGE_MAX_BYTES)
+
+      /*
+       * ⚠️ 量体积前先**剥掉"已上传到附件"的图片的内联副本**（2026-10-19）：
+       * 那些 `dataUrl` 只在编辑期显示用，保存时会被 `stripInlineImagesForSave` 剥掉、
+       * 不会进模板。不剥就量的话，一个 5 张图的模板会被误判成超限。
+       */
+      /*
+       * ⚠️ **量的是"实际会存进去的样子"**（2026-10-19 第三次调整）：
+       * `template-store` 目前**保留**内联副本（附件链路的兜底），所以这里也**不剥** ——
+       * 两处口径必须一致，否则会出现"导入时说不超、保存时被拦"。
+       */
+      const importedJson = serializeDoc(template)
+      if (importedJson.length > TEMPLATE_CHAR_BUDGET) {
+        /* 体积明细：用户要知道"该砍文还是砍图" */
+        const size = docSizeBreakdown(template)
+        setError(
+          `这份 Word 导入后 ${formatChars(size.chars)}，超过飞书单元格上限（10 万字，超出会被截断），存不进去。` +
+            (size.imageCount > 0
+              ? `其中图片 ${size.imageCount} 张共 ${formatChars(size.imageChars)}，正文与结构 ${formatChars(size.textChars)}。`
+              : `（没有图片，是正文太长）`) +
+            (up.failed > 0 ? `另有 ${up.failed} 张图片未能上传到附件（已改为内联）。` : '') +
+            (shrink.failed > 0 ? `另有 ${shrink.failed} 张图片压缩失败。` : '') +
+            `建议：把文档拆成几份分别导入，或删掉部分内容后重试。`,
+        )
+        return
+      }
       await onDone(template, name.trim() || 'Word 模板')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

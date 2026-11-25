@@ -11,7 +11,7 @@
  * 3) 中文必须指定完整字体栈：只写 `sans-serif` 会让 Windows 打印出宋体，中英混排非常难看。
  */
 
-import { resolveCellEdges } from '../components/editor/table-actions'
+import { resolveCellEdges, rowChildScale } from '../components/editor/table-actions'
 /*
  * ⚠️ 格内子元素的尺寸口径（`w` = 占格宽百分比、`h` = 固定盒高）**不再从
  *    `components/editor/cell-child` 引** —— 那条"渲染层 → 编辑器层"的跨层引用已于
@@ -56,6 +56,7 @@ import {
   isImageAttachment,
   isVectorImage,
   renderCellValue,
+  dateFormatOf,
 } from '../lib/field-types'
 /*
  * 格内子元素的尺寸口径 —— 与画布（`components/editor/cell-child.ts`）**共用同一份实现**。
@@ -316,7 +317,17 @@ function resolveField(fieldId: string | null, fieldName: string, scope: RenderSc
    */
   const shown = scope.record.cellStrings?.[fieldId]
   if (typeof shown === 'string' && shown !== '') return clippedText(shown, scope, warnings)
-  return clippedText(renderCellValue(scope.record.fields[fieldId], meta.type), scope, warnings)
+  /*
+   * ⚠️ **必须把字段的 `dateFormat` 传下去**（2026-11-25 用户实测：
+   *   「报修时间/完成时间在表里有到时分，打印出来只有年月日」）。
+   * `renderCellValue` 早就支持 `meta.dateFormat`，但**全项目没有一处传它** ⇒
+   * 一律走默认的 `YYYY-MM-DD`，日期列的时间部分被抹掉。
+   */
+  return clippedText(
+    renderCellValue(scope.record.fields[fieldId], meta.type, { dateFormat: dateFormatOf(meta) }),
+    scope,
+    warnings,
+  )
 }
 
 /**
@@ -884,7 +895,18 @@ function stripExt(name: string): string {
  * `contain` 会把小于框的图**放大**到贴近框（object-fit 的固有语义，画布同理），
  * 这是"框内等比缩放"的自然读法：框是权威，图去适配框。
  */
-function renderImage(el: Extract<AnyElement, { kind: 'image' }>, scope: RenderScope): string {
+function renderImage(
+  el: Extract<AnyElement, { kind: 'image' }>,
+  scope: RenderScope,
+  /**
+   * 渲染上下文（只为拿 `imageUrls`）。
+   *
+   * ⚠️ **两种存法并存**（2026-10-19）：新模板把固定图片传到飞书附件、元素只存 `fileToken`；
+   * 老模板仍是内联的 `dataUrl`。优先级：**token 解析出的临时链接 > dataUrl**
+   * （token 是原图，dataUrl 是被压到 50KB 的降级版）。
+   */
+  ctx?: RenderContext,
+): string {
   /*
    * ⚠️ **还没选图时必须给占位框**（2026-09-24 第四批第 1 / 5 条）。
    *
@@ -893,8 +915,12 @@ function renderImage(el: Extract<AnyElement, { kind: 'image' }>, scope: RenderSc
    * （`codePlaceholderHtml`）⇒ 同一行两种长相。
    * ⇒ 现在与码、附件共用 `placeholderHtml`。
    */
-  if (!el.dataUrl) return placeholderHtml('图片', '还没选择图片')
-  const src = attr(el.dataUrl)
+  /* token → 附件名 → 内联 dataUrl（token 可能被飞书重写，见 Canvas 的 imgSrcOf 注释） */
+  const byToken = el.fileToken ? ctx?.imageUrls?.get(el.fileToken) : undefined
+  const byName = el.fileMeta?.name ? ctx?.imageUrls?.get(el.fileMeta.name) : undefined
+  const raw = byToken || byName || el.dataUrl
+  if (!raw) return placeholderHtml('图片', el.fileToken ? '图片链接已过期，请重新打开模板' : '还没选择图片')
+  const src = attr(raw)
   const boxH = explicitHeightMm(scope)
   // 没有确定的框高（h:'auto'）时"框内"无从谈起 —— 退回缺省形态，不猜一个高度。
   // 非 contain/cover 的取值（含老模板的 undefined）同样走这条路径，保证产物不变。
@@ -1025,7 +1051,7 @@ function resolveCodeValue(
   }
   // 循环区外的码取首行值；一条记录都没有属于正常状态（不是模板毛病），不刷警告
   if (!scope.record) return { value: '', reason: '暂无数据' }
-  const v = renderCellValue(scope.record.fields[source.fieldId], meta.type)
+  const v = renderCellValue(scope.record.fields[source.fieldId], meta.type, { dateFormat: dateFormatOf(meta) })
   if (v.trim() === '') {
     // 字段绑定没问题、模板也没毛病，只是**这一条记录恰好没填** —— 属于数据级问题，
     // 因此用记录级的 code-invalid 而不是模板级的 field-missing：
@@ -1250,6 +1276,15 @@ function renderCellContent(
    * ⚠️ 自适应行高（`heightMm` 缺席）时传 `undefined` ⇒ **不夹**（没有分母）。
    */
   rowHeightMm: number | undefined,
+  /**
+   * **行高装不下时格内元素的缩放系数**（`1` = 不缩）。
+   *
+   * 与画布端 `rowChildScale()` **同一份实现**（`components/editor/table-actions`）。
+   * ⚠️ 这是"画布看得见、打印却是空的"那个 bug 的收口（2026-10-19 用户实测）：
+   *    `<tr height>` 只是**最小高度**，元素不缩就会把行撑住 —— 画布上永远"装得下"，
+   *    而打印按真实行高裁切。两端必须同时缩，所见即所得才成立。
+   */
+  childScale = 1,
 ): string {
   /*
    * ⚠️ 单元格里的**块级子元素**（`TableCell.children`，规格 六）必须在这里渲染 ——
@@ -1259,6 +1294,24 @@ function renderCellContent(
    *    顺序与画布一致：**先子元素、后 nodes**（图片在上、说明文字在下）。
    */
   /* ⚠️ **2026-10-17 回退**：打印端的子表渲染已移除（用户选 ② 真拆）。 */
+
+  /*
+   * ⚠️⚠️ **文字自己裁**（2026-10-19 用户实测：「只要格内有手动输入的文本或普通字段，
+   *   单元格在视觉上就不会缩小了，怎么拖都不会小，但实际行高列宽是缩小了的」）。
+   *
+   * 根因：`<tr height>` 只是**最小高度**，而 `td` 上的 `max-height` / `overflow:hidden`
+   * 在 `table-cell` 上**不生效** ⇒ 文字把行撑住。
+   * ⇒ 给**文字那一部分**单独套一层定高裁切框；**不能包住 `childHtml`** ——
+   *   格内子元素是 `position:absolute`（相对 td 的内容区定位），多一层定位祖先会让落点全偏。
+   *
+   * 条件与画布端 `Canvas.tsx` 完全一致：有显式行高 + 没开自适应才裁。
+   */
+  const clipText = (html: string): string => {
+    if (cell.autoSize === true) return html
+    if (!(typeof rowHeightMm === 'number' && rowHeightMm > 0)) return html
+    const h = Math.max(0, rowHeightMm - padMm * 2)
+    return `<div style="max-height:${px(h)};overflow:hidden;">${html}</div>`
+  }
 
   const childRaw = (cell.children ?? [])
     .map((child) => {
@@ -1279,7 +1332,7 @@ function renderCellContent(
          * 它把 `h: 'auto'` 也当成默认高（18mm）—— 格内"由内容决定"等于"把行撑破"，
          * 于是**老模板**（拖入时存下的 `'auto'`）不必让用户重拖，渲染时就自动变好。
          */
-        heightMm: childBoxHeightMm(child),
+        heightMm: childBoxHeightMm(child) * childScale,
       }
       const r = renderElement(child, childScope, ctx)
       warnings.push(...r.warnings)
@@ -1414,11 +1467,11 @@ function renderCellContent(
        * ⚠️ **元素框 = 选区**（2026-10-15 重构后）—— 回退成固定宽高。
        *   三模式已废弃 ⇒ 不再需要"让内容决定框的大小"。
        */
-      const boxSize = `width:${px(wMm)};height:${px(childBoxHeightMm(child))};`
+      const boxSize = `width:${px(wMm)};height:${px(childBoxHeightMm(child) * childScale)};`
       const abs = geom
       return (
         `<div style="position:absolute;left:${px(xMm)};` +
-        `top:${px(Math.max(0, effectiveChildYMm(child, rowHeightMm, padMm)))};` +
+        `top:${px(Math.max(0, effectiveChildYMm(child, rowHeightMm, padMm, childScale)))};` +
         boxSize +
         `">` +
         `<div style="${abs}">${r.html}</div></div>`
@@ -1451,7 +1504,7 @@ function renderCellContent(
       // 但单元格里可能有其它内容（如"照片："这种前缀文字），只摘掉附件字段本身，不动其余节点。
       const fid = resolveCellAttachmentFieldId(cell, ctx)
       const kept = (cell.nodes ?? []).filter((n) => !(n.type === 'field' && n.fieldId === fid))
-      return childHtml + renderInline(kept, scope, ctx, warnings, cell.style)
+      return childHtml + clipText(renderInline(kept, scope, ctx, warnings, cell.style))
     }
     const fieldId = resolveCellAttachmentFieldId(cell, ctx)
     const items = attachmentItemsFor(fieldId, scope, ctx)
@@ -1496,9 +1549,9 @@ const res = layoutAttachmentGroup(
      *   其余节点照常渲染。顺序与画布一致：**子元素（附件）在上、nodes 在下**。
      */
     const keptNodes = (cell.nodes ?? []).filter((n) => !(n.type === 'field' && n.fieldId === fieldId))
-    return childHtml + res.html + renderInline(keptNodes, scope, ctx, warnings, cell.style)
+    return childHtml + res.html + clipText(renderInline(keptNodes, scope, ctx, warnings, cell.style))
   }
-  return childHtml + renderInline(cell.nodes, scope, ctx, warnings, cell.style)
+  return childHtml + clipText(renderInline(cell.nodes, scope, ctx, warnings, cell.style))
 }
 
 /**
@@ -1675,6 +1728,8 @@ function buildTableHtml(
         const inner = renderCellContent(
           cell, rowScope, ctx, warnings, Math.max(1, cellW - padMm * 2), padMm,
           typeof row.heightMm === 'number' ? row.heightMm : undefined,
+          /* 行高装不下时元素等比缩小（与画布同一个函数，见 `rowChildScale`） */
+          rowChildScale(el, ref.rowIndex),
         )
         const bg = cell.style?.background ? `background:${cell.style.background};` : ''
         const cw = (cell.borders?.widthPt ?? borderW)
@@ -1783,23 +1838,15 @@ function buildTableHtml(
             (cell.wrap === false ? 'white-space:nowrap;' : TEXT_FLOW),
         )}">${
           /*
-           * ⚠️⚠️ **关"自适应"时，在 `td` 里包一层裁切框**（2026-10-17 用户实测：
-           *   「自动换行**开**、自适应**关** ⇒ 文字换行显示，**单元格被撑高**，不被裁切」）。
+           * ⚠️ **裁切已经下沉到 `renderCellContent` 的 `clipText()`**（2026-10-19）。
            *
-           * 根因：**`td` 上的 `max-height` / `overflow:hidden` 在多数浏览器里不生效** ——
-           *   行高是 `tr` 说了算，`td` 拦不住内容把行撑高 ✅
-           * ⇒ 只有"里面再套一个定高 + `overflow:hidden` 的 `div`"才真的裁得住。
-           *
-           * ⚠️ **但有子元素（图片/附件/码）的格子不能包** —— 那层 `div` 会成为
-           *   子元素 `position:absolute` 的**新定位祖先**，打穿"格内绝对定位"那套口径。
-           *   好在那些格子本来就是"块级内容"，不靠文字换行，不包也不影响。
-           * ⚠️ 没有显式行高（自适应行）时**不包**：没有分母可裁，包了反而把内容压没。
+           * 原来是在这里给**整格内容**包一层 `max-height + overflow:hidden`，但它
+           * **遇到有子元素的格子就不敢包**（那层 div 会成为子元素 `position:absolute`
+           * 的新定位祖先）⇒ 图文混排的格子，文字照样把行撑高，行高怎么拖都不缩。
+           * ⇒ 现在只包**文字那一部分**（`clipText`），子元素完全不受影响，
+           *   而且画布与打印走同一条判断（有显式行高 + 没开自适应）。
            */
-          cell.autoSize === true ||
-          !(typeof row.heightMm === 'number' && row.heightMm > 0) ||
-          (cell.children && cell.children.length > 0)
-            ? inner
-            : `<div style="max-height:${px(row.heightMm)};overflow:hidden;">${inner}</div>`
+          inner
         }</td>`
       })
       .join('')
@@ -2052,7 +2099,7 @@ export function renderElement(el: AnyElement, scope: RenderScope, ctx: RenderCon
       return { html: res.html, warnings: res.warnings }
     }
     case 'image':
-      return { html: renderImage(el, sc), warnings }
+      return { html: renderImage(el, sc, ctx), warnings }
     case 'hline': {
       const w = Math.max(0.05, finite(el.thicknessPt, 0.75))
       const html = `<div style="height:0;border-top:${round3((w * 96) / 72)}px solid ${el.color ?? '#1f2329'};"></div>`

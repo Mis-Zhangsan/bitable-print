@@ -277,6 +277,27 @@ export class MockDataSource implements DataSource {
     return tokens.map((t) => mockImageDataUrl(t, `${recordId}\n${t}`))
   }
 
+  /** mock：给每个文件造一个稳定的假 token（不真的存内容），但**元信息是真的** */
+  async uploadTemplateImages(files: File[]): Promise<any[]> {
+    return files.map((f, i) => ({
+      token: `mock-tpl-${i}-${(f?.name ?? 'img').replace(/[^\w.-]/g, '_')}`,
+      name: f?.name ?? `image-${i + 1}`,
+      size: typeof f?.size === 'number' ? f.size : 0,
+      type: f?.type || 'image/jpeg',
+    }))
+  }
+
+  async getTemplateImageUrlMap(recordId: string): Promise<Map<string, string>> {
+    const out = new Map<string, string>()
+    const row = this.tplRows.find((r) => r.recordId === recordId)
+    for (const a of row?.imageAttachments ?? []) {
+      const url = mockImageDataUrl(a.token, `${recordId}\n${a.token}`)
+      out.set(a.token, url)
+      if (a.name) out.set(a.name, url)
+    }
+    return out
+  }
+
   // ---- 模板表 ----
 
   async ensureTemplateTable(): Promise<string> {

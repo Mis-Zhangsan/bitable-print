@@ -37,7 +37,7 @@ import type {
   TemplateWritePayload,
   ViewMeta,
 } from './data-source'
-import { TEMPLATE_TABLE_NAME, TPL_FIELD, drainPages } from './data-source'
+import { TEMPLATE_TABLE_NAME, TPL_FIELD, drainPages, type UploadedImageInfo } from './data-source'
 import { FT, renderCellValue } from './field-types'
 import type { TemplateKind } from './types'
 
@@ -113,6 +113,8 @@ const TPL_FIELDS: TplFieldSpec[] = [
   { name: TPL_FIELD.targetTableName, type: FT.SingleSelect, options: [] },
   { name: TPL_FIELD.targetTableId, type: FT.SingleSelect, options: [] },
   { name: TPL_FIELD.doc, type: FT.Text },
+  /* 固定图片的载体（2026-10-19）：元素只存 token，图片本体在这里，不占文本单元格 */
+  { name: TPL_FIELD.images, type: FT.Attachment },
   { name: TPL_FIELD.paper, type: FT.SingleSelect, options: [] },
   { name: TPL_FIELD.createdBy, type: FT.CreatedUser },
   { name: TPL_FIELD.updatedAt, type: FT.DateTime, property: { dateFormat: UPDATED_AT_FORMAT } },
@@ -669,6 +671,93 @@ export class SdkDataSource implements DataSource {
    * ⚠️ 返回的链接 **10 分钟过期**。上层必须在进入预览/打印前重新调用本方法，
    * 绝不能复用编辑阶段的链接。
    */
+  /**
+   * 上传模板用的固定图片（2026-10-19）。返回 `fileToken[]`，顺序与入参一致。
+   *
+   * ⚠️ 用 `batchUploadFile` 而不是 `uploadFile`：后者返回的是**任务 id**、还要再查一次，
+   *    而且 SDK 标注为 deprecated。批量版直接给 token。
+   */
+  async uploadTemplateImages(files: File[]): Promise<UploadedImageInfo[]> {
+    if (files.length === 0) return []
+    try {
+      const base = this.base as any
+      if (typeof base?.batchUploadFile !== 'function') {
+        throw new Error('当前环境不支持上传文件（SDK 缺 batchUploadFile）')
+      }
+      const tokens = await base.batchUploadFile(files)
+      if (!Array.isArray(tokens)) return []
+      /*
+       * ⚠️ **必须把 name / size / type 一起带回去**：飞书写附件字段要的是完整对象
+       * `{ name, size, type, token, timeStamp }`（`IOpenAttachment`），只给 token 会被**静默丢弃**。
+       * `batchUploadFile` 只回 token 字符串，所以元信息从入参 `File` 上取。
+       */
+      return tokens.map((t: unknown, i: number) => {
+        const f = files[i]
+        return {
+          token: String(t),
+          name: f?.name ?? `image-${i + 1}`,
+          size: typeof f?.size === 'number' ? f.size : 0,
+          type: f?.type || 'image/jpeg',
+        }
+      })
+    } catch (e) {
+      throw new SdkCallError('上传模板图片', e)
+    }
+  }
+
+  /**
+   * 取模板图片的临时链接。**返回的 Map 里同时按 token 和按附件名建键**。
+   *
+   * ⚠️⚠️ **为什么不只按 token**（2026-10-19 第二次修）：
+   * 用户实测"附件列里已经有图了，但重新打开模板图还是消失" ——
+   * `batchUploadFile` 返回的 token 与**附件字段里最终存下的 token 未必是同一个值**
+   * （飞书可能在入库时重写），于是"按元素里的 token 去查"永远命中不了。
+   *
+   * ⇒ 改成**双键**：读附件字段的原始值（`[{ token, name }]`），用真实 token 换 URL，
+   * 把 `token → url` 和 `name → url` 都放进 Map。
+   * 元素侧优先用 token 取，取不到再用**自己保存时写进去的附件名**（`fileMeta.name`，
+   * 形如 `tplimg-<elementId>`，唯一）—— 这条路与 token 是否被重写无关。
+   */
+  async getTemplateImageUrlMap(recordId: string): Promise<Map<string, string>> {
+    const out = new Map<string, string>()
+    try {
+      const tableId = await this.ensureTemplateTable()
+      const rows = await this.listTemplateRows(tableId)
+      const row = rows.find((r) => r.recordId === recordId)
+      const atts = row?.imageAttachments ?? []
+      const fieldId = (await this.tplFields(tableId)).get(TPL_FIELD.images)?.id ?? ''
+      if (atts.length === 0) {
+        /* ⚠️ 诊断日志（2026-10-19）：模板里没有附件 → 检查"模板图片"列是否真的写了值 */
+        console.debug('[BP 模板图片] 附件列里没有图片', { recordId, tableId, fieldId, rowFound: !!row })
+        return out
+      }
+      const tokens = atts.map((a) => a.token)
+      const urls = await this.getAttachmentUrls(tableId, recordId, fieldId, tokens)
+      atts.forEach((a, i) => {
+        const url = urls[i]
+        if (!url) return
+        out.set(a.token, url)
+        if (a.name) out.set(a.name, url)
+      })
+      /*
+       * ⚠️ 诊断日志（2026-10-19）：用户报"重开模板画布也糊"时，一眼看出是哪一环断了 ——
+       *   · `attachments` 为空 ⇒ 附件列没写进去（或字段 id 取错）
+       *   · `attachments` 有值但 `urls` 全空 ⇒ token 不被认可
+       *   · `mapKeys` 里有值但渲染没用上 ⇒ 匹配键（token/name）对不上
+       */
+      console.debug('[BP 模板图片]', {
+        recordId,
+        fieldId,
+        attachments: atts,
+        urls,
+        mapKeys: [...out.keys()],
+      })
+    } catch (e) {
+      console.debug('[BP 模板图片] 解析失败', e)
+    }
+    return out
+  }
+
   async getAttachmentUrls(
     tableId: string,
     recordId: string,
@@ -866,6 +955,19 @@ export class SdkDataSource implements DataSource {
             targetTableId: get(TPL_FIELD.targetTableId),
             docJson: get(TPL_FIELD.doc),
             paper: get(TPL_FIELD.paper),
+            /* 附件列的原始值：`[{ token, name, size, type }]`；这一列不存在时是 undefined */
+            imageAttachments: (() => {
+              const fd = find(TPL_FIELD.images)
+              const raw = fd ? f[fd.id] : null
+              if (!Array.isArray(raw)) return undefined
+              const list = raw
+                .map((x: any) => ({
+                  token: String(x?.token ?? x?.file_token ?? ''),
+                  name: String(x?.name ?? ''),
+                }))
+                .filter((x) => x.token !== '')
+              return list.length > 0 ? list : undefined
+            })(),
             createdBy: get(TPL_FIELD.createdBy) || undefined,
             updatedAt: parseMaybeDate(updatedField ? asPlainText(f[updatedField.id]) : ''),
           })
@@ -1005,6 +1107,34 @@ export class SdkDataSource implements DataSource {
 
     put(TPL_FIELD.name, payload.name)
     put(TPL_FIELD.doc, payload.docJson)
+
+    /*
+     * 固定图片：写进**附件字段**（2026-10-19）。
+     * ⚠️ `undefined` = **不动这一列**（老调用方没传，不能把已有图片清空）；
+     *    `[]` = 明确清空（用户把模板里的图全删了）。
+     * ⚠️ 值形状是 `[{ file_token }]`：附件列只认这个，写裸字符串会**静默丢弃**
+     *    （和单选列那条坑同源，见 `selectCell` 的注释）。
+     */
+    if (payload.imageTokens !== undefined) {
+      const f = fids.get(TPL_FIELD.images)
+      if (f && f.type === FT.Attachment) {
+        /*
+         * ⚠️⚠️ **必须是完整对象**（2026-10-19 用户实测："模板图片字段里没有图片插入"）。
+         *
+         * SDK 的 `IOpenAttachment` 是 `{ name, size, type, token, timeStamp }` ——
+         * **不是** 开放平台 API 那套 snake_case 的 `{ file_token }`。
+         * 只给 `{ file_token }` 字段名对不上 ⇒ 飞书**静默丢弃**，单元格一片空白（不报错）。
+         * 这和当初"单选列写裸字符串被丢弃"是同一类坑。
+         */
+        out[f.id] = payload.imageTokens.map((t) => ({
+          name: t.name,
+          size: t.size,
+          type: t.type,
+          token: t.token,
+          timeStamp: Date.now(),
+        }))
+      }
+    }
 
     // 模板类型 / 纸张 / 目标数据表(名+ID)：都是单选题，写的是"选项名"
     // （写 KIND_TEXT 里的文案，读回来的判据也是它 —— 同一个真相，见 KIND_TEXT 的注释）

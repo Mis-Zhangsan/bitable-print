@@ -387,6 +387,35 @@ const WEEKDAY_CN = ['日', '一', '二', '三', '四', '五', '六'] as const
  * `'YYYY-MM-DD dddd'` 会输出成「2026-09-16 周三三」而不是「星期三」。
  * 加新记号时同样遵守"长的写在短的之前"。
  */
+/**
+ * 把**飞书字段属性里的 `dateFormat`** 翻译成本项目 `formatDateTime` 的记号。
+ *
+ * 飞书用的是 `yyyy/MM/dd HH:mm`（`dateFormat` 属性），而本项目是 `YYYY-MM-DD HH:mm`：
+ * 差别只在 **`yyyy`（小写）** 和 **`dd`（小写）** —— 直接把它塞进 `formatDateTime` 会原样输出
+ * `yyyy/MM/dd HH:mm` 这几个字母。
+ *
+ * ⚠️ **这是"打印只显示年月日"的真凶**（2026-11-25 用户实测：报修时间/完成时间在表里有时分，
+ *   打印出来只有日期）：`renderCellValue` 明明支持 `meta.dateFormat`，但**没有一个调用点传它** ⇒
+ *   一律走默认的 `YYYY-MM-DD`。
+ * ⚠️ `MM`（月）/`mm`（分）/`HH`/`ss` 两套记号一致，不用动；
+ *   飞书不用 `dddd`，所以 `dd → DD` 不会误伤星期记号。
+ */
+export function dateFormatOf(meta?: { property?: unknown }): string | undefined {
+  const p = meta?.property as { dateFormat?: unknown } | undefined
+  const df = p?.dateFormat
+  if (typeof df !== 'string' || df === '') return undefined
+  const mapped = df.replace(/yyyy/g, 'YYYY').replace(/dd/g, 'DD')
+  /*
+   * ⚠️ **兜底：出现不认识的记号就退回默认格式**（2026-11-25）。
+   * 飞书多维表格目前只有 7 种日期格式（SDK 的 `DateFormatter` 枚举），本项目全认识；
+   * 但万一下一版加了 `hh`（12 小时制）/ `A`（AM-PM）这类，`formatDateTime` 不认识它们，
+   * 会把字母**原样打出来**（`2026/11/16 hh:mm A`）—— 那比"少显示时分"糟得多。
+   * ⇒ 把已知记号剔掉后还残留 y/m/d/h/s 字母，就当作不认识，走默认。
+   */
+  if (/[yYmMdDhHsS]/.test(mapped.replace(/YYYY|MM|DD|HH|mm|ss/g, ''))) return undefined
+  return mapped
+}
+
 export function formatDateTime(ms: number, fmt = 'YYYY-MM-DD'): string {
   const d = new Date(ms)
   if (Number.isNaN(d.getTime())) return ''

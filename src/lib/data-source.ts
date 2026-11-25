@@ -126,6 +126,8 @@ export const TPL_FIELD = {
   targetTableName: '目标数据表',
   targetTableId: '目标数据表ID',
   doc: '模板配置',
+  /** 模板里所有固定图片的**附件**（2026-10-19：把 base64 挪出文本单元格，见 ImageElement.fileToken 的注释） */
+  images: '模板图片',
   paper: '纸张',
   createdBy: '创建人',
   updatedAt: '更新时间',
@@ -141,6 +143,8 @@ export interface TemplateRow {
   targetTableId: string
   docJson: string
   paper: string
+  /** 这条记录附件字段里的图片（token + 文件名；打开模板时用来换 URL） */
+  imageAttachments?: { token: string; name: string }[]
   createdBy?: string
   updatedAt?: number
 }
@@ -152,11 +156,25 @@ export interface TemplateWritePayload {
   targetTableId: string
   docJson: string
   paper: string
+  /**
+   * 要一并写进「模板图片」附件字段的**完整信息**（2026-10-19）。
+   * ⚠️ `undefined` = **不动这个字段**（老调用方/老表没有这一列时不能清空它）。
+   * ⚠️ 必须是完整对象：飞书只认 `{ name, size, type, token, timeStamp }`。
+   */
+  imageTokens?: UploadedImageInfo[]
 }
 
 // ============================================================
 // 数据源接口
 // ============================================================
+
+/** 上传成功后要拿到的信息（飞书写附件字段需要完整对象，见 ImageElement.fileMeta 的注释） */
+export interface UploadedImageInfo {
+  token: string
+  name: string
+  size: number
+  type: string
+}
 
 export interface AttachmentTokenRef {
   recordId: string
@@ -229,6 +247,25 @@ export interface DataSource {
    * ⚠️ 有效期仅 10 分钟；SDK 内部按 5 个 token 一组自动切片。
    */
   getAttachmentUrls(tableId: string, recordId: string, fieldId: string, tokens: string[]): Promise<string[]>
+
+  /**
+   * 把图片上传到飞书，返回 `fileToken`（2026-10-19，模板里的**固定图片**走这条路）。
+   *
+   * 为什么要它：模板 JSON 要塞进**一个文本单元格**，上限 10 万字、超出静默截断；
+   * 图片以 base64 内联时一张 300KB 的图就是 41 万字。传到附件里之后，
+   * 元素只剩一个 token，模板体积跟图片大小完全解耦。
+   */
+  uploadTemplateImages(files: File[]): Promise<UploadedImageInfo[]>
+
+  /**
+   * 取一条模板记录里**所有固定图片**的临时链接。
+   *
+   * ⚠️ 返回的 Map **同时按 token 和按附件名建键**（见 `getTemplateImageUrlMap` 的实现注释）：
+   *    `batchUploadFile` 返回的 token 与附件字段里最终存下的 token 未必相同，
+   *    只按 token 查会永远命中不了（用户实测"附件列里有图、模板里还是空的"）。
+   * ⚠️ 链接约 10 分钟失效 ⇒ **每次打开模板/预览都要重新取**，不能存进模板。
+   */
+  getTemplateImageUrlMap(recordId: string): Promise<Map<string, string>>
 
   /**
    * ⚠️ **飞书自己格式化的「显示文本」** —— 2026-09-24 第四批第 3 条的根本解。

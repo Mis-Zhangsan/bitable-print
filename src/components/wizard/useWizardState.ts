@@ -26,6 +26,14 @@ import type { AttachmentPrintConfig, TemplateDoc, TemplateKind } from '../../lib
 import { DEFAULT_ATTACH_CONFIG, emptyTemplate } from '../../lib/types'
 import type { AttachElement, TableElement } from '../../lib/types'
 import { createTemplateStore, exportTemplatePackage } from '../../lib/template-store'
+import { docImageElements, registerTemplateImageUploader, slimDocImagesForSave } from '../../lib/template-images'
+import { toDataUrlMap } from '../editor/preview'
+import {
+  loadTemplateImageUrls,
+  registerTemplateImageResolver,
+  resetTemplateImageUrls,
+  resolveTemplateImageUrls,
+} from '../editor/template-image-store'
 import type { CreateTemplateInput, TemplateListItem } from '../../lib/template-store'
 // ⛔ 这里原来有 `lib/filter` 的三条导入（FilterSet / applyFilter+validateFilterSet / FilterIssue）。
 //    2026-09-21 用户要求**直接移除「筛选条件」功能**（他原话："用户完全可以在新视图里，
@@ -133,6 +141,17 @@ export function useWizardState({
   templateTableId,
 }: UseWizardArgs) {
   const store = useMemo(() => createTemplateStore(ds), [ds])
+
+  /*
+   * 把"上传固定图片"注册给 `lib/template-images`（2026-10-19）。
+   * 为什么走注册而不是传 props：选图在 `Inspector`（叶子），`store` 在这一层，
+   * 中间六层都不关心图片。见 `registerTemplateImageUploader` 的注释。
+   */
+  useEffect(() => {
+    registerTemplateImageUploader((files) => store.uploadImages(files))
+    return () => registerTemplateImageUploader(null)
+  }, [store])
+
   const targetTableId = ctx?.tableId ?? ''
   const targetTableName = ctx?.tableName ?? ''
 
@@ -277,6 +296,16 @@ export function useWizardState({
   const renderedForRef = useRef('')
 
   const active = useMemo(() => templates.find((t) => t.recordId === activeId) ?? null, [templates, activeId])
+
+  /*
+   * 把"重新解析模板图片链接"注册给预览/打印（2026-10-19）。
+   * 附件链接 10 分钟失效，而编辑器可能开着很久 ⇒ 每次打印前都要拿新鲜的。
+   */
+  useEffect(() => {
+    const recId = active?.recordId
+    registerTemplateImageResolver(recId ? () => store.imageUrlMap(recId) : null)
+    return () => registerTemplateImageResolver(null)
+  }, [store, active])
   /** 当前实际生效的模板文档：编辑器里改过就用改过的 */
   const doc = editorDoc ?? active?.doc ?? null
 
@@ -710,13 +739,47 @@ export function useWizardState({
   // 编辑器
   // ============================================================
 
+  /**
+   * 解析一份模板里的**固定图片链接**（2026-10-19）。
+   *
+   * 图片现在存在飞书附件里、元素只留 `fileToken` ⇒ 渲染前必须换一次 URL。
+   * ⚠️ 链接约 10 分钟失效 ⇒ **每次打开模板都要重新解析**，不能缓存进模板；
+   * ⚠️ 解析失败不抛 —— 画布会退回元素自己的 `dataUrl` / 占位框。
+   */
+  const loadImageUrls = useCallback(
+    (doc: TemplateDoc, recordId: string | undefined) => {
+      const imgs = docImageElements(doc)
+      const tokens = imgs.map((i) => i.fileToken).filter((t): t is string => typeof t === 'string' && t !== '')
+      /*
+       * ⚠️ 诊断日志（2026-10-19）：**先看这里** —— 模板里到底有没有 `fileToken`。
+       *   · `images` = 0        ⇒ 模板里没有图片元素
+       *   · 有 images 但 tokens 空 ⇒ **元素里没有 fileToken**（保存时就没写进去）
+       *   · tokens 有值但后面没出现 `[BP 模板图片]` 那行 ⇒ 解析没执行
+       */
+      console.debug('[BP 模板图片] 打开模板', {
+        recordId,
+        images: imgs.length,
+        tokens,
+        hasMeta: imgs.map((i) => ({ id: i.id, token: i.fileToken, name: i.fileMeta?.name, hasDataUrl: !!i.dataUrl })),
+      })
+      if (!recordId || tokens.length === 0) {
+        resetTemplateImageUrls()
+        return
+      }
+      void loadTemplateImageUrls(tokens, () => store.imageUrlMap(recordId))
+    },
+    [store],
+  )
+
   const openEditor = useCallback(() => {
     if (!active) return
     // 编辑已有模板 ⇒ 不存在"待新建"这回事（不清掉的话保存时会误建一份新的）
     setPendingNew(null)
     setEditorDoc(cloneDoc(active.doc))
     setEditorDirty(false)
-  }, [active])
+    /* ⚠️ 同上：打开模板即解析图片链接 */
+    loadImageUrls(active.doc, active.recordId)
+  }, [active, loadImageUrls])
 
   /**
    * 打开指定模板的编辑器。
@@ -731,8 +794,11 @@ export function useWizardState({
       setPendingNew(null)
       setEditorDoc(cloneDoc(target.doc))
       setEditorDirty(false)
+      /* ⚠️ **打开即解析图片链接**（2026-10-19）：模板里的固定图片只存了 `fileToken`，
+       *   不解析这一下，画布/打印都只能退回 96px 缩略图（用户报的"糊"）。 */
+      loadImageUrls(target.doc, recordId)
     },
-    [templates],
+    [templates, loadImageUrls],
   )
 
   const openBlankEditor = useCallback(
@@ -793,6 +859,16 @@ export function useWizardState({
      * ⇒ 判据改成**按意图**：`pendingNew` 存在就是"新建"（`createAndEdit` 才会设它，
      *   而 `openEditor` / `openEditorFor` 会清掉它）⇒ 与 `active` 是否恰好有值无关。
      */
+    /*
+     * ⚠️ **保存前把图片瘦成缩略图**（2026-10-19）。
+     * 图片本体已经在飞书附件里（`fileToken`），模板里那份 `dataUrl` 只是**兜底**：
+     * 附件 URL 取不到时至少还能看见一张糊图。缩略图每张约 3-5 千字符，
+     * 而完整压缩版是 6.8 万 —— 20 张图也能塞进 10 万字。
+     * ⚠️ 只瘦**有 token 的**：上传失败降级的必须保留完整图，否则真丢了。
+     * ⚠️ 操作的是**克隆**：编辑器里那份要保持原图显示，不能被存盘动作弄糊。
+     */
+    const saveDoc = cloneDoc(editorDoc)
+    await slimDocImagesForSave(saveDoc)
     if (pendingNew) {
       let newId: string
       try {
@@ -801,7 +877,7 @@ export function useWizardState({
           kind: pendingNew.kind,
           targetTableId,
           targetTableName,
-          doc: editorDoc,
+          doc: saveDoc,
         })
       } catch (e) {
         const message = `模板没能存下来：${e instanceof Error ? e.message : String(e)}`
@@ -809,6 +885,13 @@ export function useWizardState({
         setTplHint({ ok: false, text: message })
         return { ok: false, message }
       }
+      /*
+       * ⚠️ **保存成功后重新解析一次图片链接**（2026-10-19）。
+       * 上传那一刻 `batchUploadFile` 只把文件传到云空间，token 还不在任何记录的附件字段里 ⇒
+       * 拿不到访问 URL。**保存之后**它才真正落进「模板图片」列，
+       * 这时再解析一次，预览/打印才能用上**原图**（否则只有压到 50KB 的显示副本）。
+       */
+      loadImageUrls(editorDoc, newId)
       setPendingNew(null)
       setEditorDoc(null)
       setEditorDirty(false)
@@ -842,7 +925,7 @@ export function useWizardState({
         kind: savedKind,
         targetTableId,
         targetTableName,
-        doc: editorDoc,
+        doc: saveDoc,
       })
     } catch (e) {
       const message = `模板没能更新：${e instanceof Error ? e.message : String(e)}`
@@ -857,7 +940,7 @@ export function useWizardState({
      */
     await loadTemplates(savedId)
     return { ok: true }
-  }, [editorDoc, active, pendingNew, store, targetTableId, targetTableName, loadTemplates])
+  }, [editorDoc, active, pendingNew, store, targetTableId, targetTableName, loadTemplates, loadImageUrls])
 
   const cancelEditor = useCallback(() => {
     // 取消 = 什么都没建（这正是"惰性落库"要保住的性质）
@@ -1039,6 +1122,13 @@ export function useWizardState({
 
         // ② 渲染 + 分页
         setRender((s) => ({ ...s, phase: 'layout', done: 0, total: 0 }))
+        /*
+         * ⚠️⚠️ **实际打印/导出也走这条 ctx**（2026-10-19 用户实测："画布和画布内预览都清晰，
+         *   实际打印不清晰"）。这里原来是**手写的对象字面量**，没有 `imageUrls` ⇒
+         *   模板里的固定图片只能退回 96px 缩略图。
+         * ⚠️ 和 `emptyRenderContext` 那个白名单构造是同一类坑：**新增字段要把每个构造点都找出来**。
+         */
+        const tplImageUrls = await toDataUrlMap(await resolveTemplateImageUrls(), ac.signal)
         const rendered = await renderDocument({
           doc,
           records: scopedRecords,
@@ -1050,6 +1140,7 @@ export function useWizardState({
             totalRows: scopedRecords.length,
             batchLayout: kind === 'record' ? batchLayout : undefined,
             perPageN: layoutPerPageN,
+            imageUrls: tplImageUrls,
           },
           forPreview: !opts.forOutput,
           title: active?.name ? `${active.name} · 打印预览` : '打印预览',

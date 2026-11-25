@@ -1,7 +1,7 @@
 {
   "name": "bitable-print",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "output": "dist",
   "description": "飞书多维表格打印插件（BitablePrint）— 侧边栏插件，模板化打印与导出 PDF",

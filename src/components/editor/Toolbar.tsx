@@ -42,6 +42,7 @@ import { Popover } from './Popover'
 import { FONT_OPTIONS, PAPER_OPTIONS, TEXT_SWATCHES } from './Inspector'
 import { IconCaret, IconEye, IconMerge, IconMinus, IconPlus, IconRedo, IconSliders, IconSplit, IconTable, IconUndo } from './Icons'
 import { cellLabel, findCell, nodeKindLabel, nodeStyleOf, updateCell, type NodeRef } from './useEditorState'
+import { setTablePaddingPatch } from './table-actions'
 // 表格结构动作：与右侧面板**同一份**实现（`./table-actions` 的纯函数）。
 // 两条入口各写一套是这个项目栽过三次的坑；确认层同理，合并一律经 `onAskMerge` 走 shell。
 import {
@@ -362,8 +363,49 @@ export function Toolbar(props: ToolbarProps) {
     if (r) props.onMerge(table.id, r.patch)
   }
 
+  /*
+   * ---- 内边距（2026-10-19 用户要求："页面顶部的属性栏中也增加内边距的设置入口"）----
+   *
+   * ⚠️ **作用域跟着"改：…"那行走**（`scope`）：
+   *   · 选中整表 ⇒ 改表格默认内边距，并**清掉所有单元格的覆写**（谁后设谁赢）；
+   *   · 选中某一格 ⇒ **只改这一格**（`cell.paddingMm`），别的格一个字不动。
+   * ⚠️ 三个入口（这里 / Inspector 表格页 / Inspector 单元格页）**必须共用同一套动作**，
+   *    这是项目里反复强调的"别重复造轮子"。
+   */
+  const padOnCell = scope === 'cell' && !!cell
+  const padValue = finite(
+    padOnCell ? cell?.cell.paddingMm : undefined,
+    finite(table?.cellPaddingMm, 1.5),
+  )
+  const setPadding = (v: number): void => {
+    if (!table) return
+    if (padOnCell && cell) {
+      props.onMerge(table.id, { rows: updateCell(table.rows, cell.cell.id, { paddingMm: v }) }, `pad:${cell.cell.id}`)
+      return
+    }
+    props.onMerge(table.id, setTablePaddingPatch(table, v), `cpad:${table.id}`)
+  }
+
   const tableTools = table ? (
     <>
+      {/*
+        ⚠️ **内边距放在弹层最前面**（2026-10-19）：它原来排在"框线"之后，
+        用户点开菜单第一眼看不到，反馈"没有内边距的设置"。
+        最常改的两件事（加行、内边距）应该在第一屏。
+      */}
+      <div className="bp-tools__group bp-tools__group--pad" role="group" aria-label="内边距">
+        <span className="bp-tools__pad-lbl">{padOnCell ? '本格内边距' : '内边距'}</span>
+        <Num
+          value={padValue}
+          min={0}
+          max={12}
+          step={0.5}
+          suffix="mm"
+          ariaLabel={padOnCell ? '这一格的内边距' : '表格默认内边距'}
+          onChange={setPadding}
+        />
+      </div>
+
       <div className="bp-tools__group" role="group" aria-label="行列增删">
         <button type="button" className="bp-minibtn" aria-label="增加一行" title="在末尾加一行" onClick={addRow}>
           <IconPlus size={13} /> 行

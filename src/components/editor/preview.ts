@@ -34,6 +34,7 @@ import { resolveAttachmentImages } from '../../lib/attachment'
 /* ⚠️ 与向导的打印/预览**共用同一份预取实现** —— 两条链各写一套就会"这边好了那边没变" */
 import { fillCellStrings } from '../../lib/cell-strings'
 import { publishRenderStats } from './render-stats'
+import { resolveTemplateImageUrls } from './template-image-store'
 import type { ResolvedImage } from '../../render/context'
 import { DEFAULT_ATTACH_CONFIG } from '../../lib/types'
 import { emptyRenderContext } from '../../render/context'
@@ -183,6 +184,52 @@ function sampleRecords(fields: FieldMeta[]): RecordItem[] {
   }))
 }
 
+/**
+ * 把"附件临时链接"**下载成 dataURL**。
+ *
+ * ## 为什么打印前必须做这一步（2026-10-19 用户实测）
+ *
+ * 用户原话：「实际打印的时候，打印出来特别糊，基本不能使用……你保存的时候只保存了缩略图，
+ * 那打印的时候原图从哪里拿呢」。
+ *
+ * 根因两层：
+ *   ① 附件临时链接**约 10 分钟失效** —— 编辑器开着久了，打印时拿到的就是死链；
+ *   ② 死链取不到时，渲染层退回元素里的 **96px 缩略图**（兜底设计）⇒ 打出来一片糊。
+ *
+ * ⇒ 打印前把图**抓成 base64 嵌进 HTML**：一次抓取、此后与链接时效无关，
+ *   而且和附件字段那边的 `resolveAttachmentImages` 是同一套思路（它早就这么干了）。
+ * ⚠️ 抓取失败时**保留原链接**（`<img>` 也许还能加载），不阻断整份渲染。
+ */
+export async function toDataUrlMap(
+  urls: Map<string, string>,
+  signal?: AbortSignal,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  await Promise.all(
+    [...urls.entries()].map(async ([key, url]) => {
+      if (url.startsWith('data:')) {
+        out.set(key, url)
+        return
+      }
+      try {
+        const res = await fetch(url, { signal })
+        const blob = await res.blob()
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '')
+          reader.onerror = () => reject(reader.error ?? new Error('读图失败'))
+          reader.readAsDataURL(blob)
+        })
+        out.set(key, dataUrl || url)
+      } catch {
+        /* 抓不到就留原链接 —— 至少还有机会显示 */
+        out.set(key, url)
+      }
+    }),
+  )
+  return out
+}
+
 export async function renderEditorPreview(input: EditorPreviewInput): Promise<EditorPreviewResult> {
   const { doc, kind } = input
   let fields = input.fields
@@ -272,12 +319,25 @@ export async function renderEditorPreview(input: EditorPreviewInput): Promise<Ed
 
   const images = await resolvePreviewImages(records, fields, input.signal)
 
+  /*
+   * ⚠️ 打印前**重新解析**一次图片链接并**下载成 base64**（见 `toDataUrlMap` 的注释）：
+   * 附件链接 10 分钟就失效，而打印是从头生成 HTML —— 用旧链接会退回缩略图（糊）。
+   */
+  const tplImageDataUrls = await toDataUrlMap(await resolveTemplateImageUrls(), input.signal)
+
   const ctx = emptyRenderContext({
     fields,
     images,
     totalRows: records.length,
     batchLayout: kind === 'record' ? 'default' : undefined,
     perPageN: null,
+    /*
+     * ⚠️ **模板里的固定图片**（2026-10-19）：它们存在飞书附件里、元素只留 `fileToken`，
+     * 渲染前必须换成临时 URL。这张表在打开模板时由 `template-image-store` 解析好，
+     * 这里直接取用（链接 10 分钟有效，而预览总是紧接着打开动作发生的）。
+     * ⚠️ 取不到时 `renderImage` 会退回元素自己的 `dataUrl` / 占位框，不会崩。
+     */
+    imageUrls: tplImageDataUrls,
   })
 
   /*

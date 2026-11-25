@@ -52,6 +52,14 @@ export interface RenderContext {
    * 渲染器只读这个 Map，**不发任何网络请求**。
    */
   images: Map<string, ResolvedImage[]>
+  /**
+   * **模板图片**的临时下载链接：`fileToken → url`（2026-10-19）。
+   *
+   * 用来支持"固定图片存附件"：元素里只有 token，图片本体在飞书附件里。
+   * ⚠️ 链接约 10 分钟过期 ⇒ 由调用方**每次渲染前重新取**，渲染器自己不发请求。
+   * ⚠️ 缺省/取不到时 `renderImage` 会退回元素自己的 `dataUrl`（老模板那条路）。
+   */
+  imageUrls?: Map<string, string>
   /** 系统变量 ${当前日期} 的值，形如 2026-09-14 */
   today: string
   /**
@@ -74,6 +82,17 @@ export function emptyRenderContext(over: Partial<RenderContext> = {}): RenderCon
     fields,
     fieldMap: over.fieldMap ?? new Map(fields.map((f) => [f.id, f])),
     images: over.images ?? new Map(),
+    /*
+     * ⚠️⚠️ **`imageUrls` 必须显式带上**（2026-10-19 用户实测：画布清晰但预览糊）。
+     *
+     * 这个构造函数是**白名单**：只挑下面列出的字段，没列的全被丢弃。
+     * 我加 `RenderContext.imageUrls` 时忘了在这里补一行 ⇒ 调用方传进来也被扔掉 ⇒
+     * `renderImage` 永远拿不到附件 URL，退回元素里的 96px 缩略图 ⇒ **打印一片糊**。
+     *
+     * ⚠️ 和 `coerceDoc` 当年丢掉 `gridMm` 是同一类坑：**"可选字段 + 白名单构造"**，
+     *    加字段时一定要把"构造器"也当改点。
+     */
+    imageUrls: over.imageUrls,
     today: over.today ?? formatDateTime(Date.now()),
     // 与 today 同样在上下文构造时定值（本地时区，和 formatDateTime 的既有约定一致）
     printTime: over.printTime ?? formatDateTime(Date.now(), 'YYYY-MM-DD HH:mm'),

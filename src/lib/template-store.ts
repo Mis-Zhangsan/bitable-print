@@ -18,8 +18,11 @@
  */
 
 import { DEFAULT_PAGE_SETUP, PAPER_MM, PAPER_PRESETS, SCHEMA_VERSION, emptyTemplate } from './types'
+import { docImageElements, stripInlineImagesForSave } from './template-images'
 import type { AnyElement, InlineNode, MarginMm, PageSetup, PaperKey, TemplateDoc, TemplateKind } from './types'
-import type { DataSource, FieldMeta, TemplateRow, TemplateWritePayload } from './data-source'
+import type { DataSource, FieldMeta, TemplateRow, TemplateWritePayload,
+  UploadedImageInfo,
+} from './data-source'
 // `round1` 的规范实现在 `components/editor/round.ts`（B 批收口：此前全项目 5 份副本、
 // 且不是同一种行为，详见那个文件的文件头）。这里只是引用它，不再自带一份。
 import { round1 } from '../components/editor/round'
@@ -54,7 +57,7 @@ function normFieldName(name: string): string {
 }
 
 /** 深拷贝模板文档。doc 是纯 JSON 结构，走 JSON 往返最省事，也顺带验证"可序列化"这一前提 */
-function cloneDoc(doc: TemplateDoc): TemplateDoc {
+export function cloneDoc(doc: TemplateDoc): TemplateDoc {
   return JSON.parse(JSON.stringify(doc)) as TemplateDoc
 }
 
@@ -145,6 +148,28 @@ export function serializeDoc(doc: TemplateDoc): string {
  */
 export const TEMPLATE_SIZE_WARN_BYTES = 500 * 1024
 
+/**
+ * ⚠️⚠️ **飞书单元格的字符硬上限 = 100,000 字，超出会被"截断"（不是拒绝）**。
+ *
+ * 官方文档（多维表格「文本」字段，2026-10-19 核实）：
+ *   「单个单元格内的上限：文本 · 字数不超过 100,000 字」，
+ *   且另一个页脚写得更直白：「一旦超过，**超过的内容会被截断**」。
+ *
+ * ## 为什么这条比 500KB 更致命
+ *
+ * `TEMPLATE_SIZE_WARN_BYTES` 量的是**字节**（UTF-8，中文 3 字节/字）——
+ * 500KB ≈ **16 万中文字符**，而飞书只收 **10 万**。
+ * 于是存在一个"**过了本地检查、被飞书截断**"的区间：
+ *   · 模板 12 万字（约 360KB）⇒ 本地检查通过 ⇒ 写入时被飞书砍到 10 万字 ⇒
+ *     **JSON 半截** ⇒ 下次打开解析失败 ⇒ **只看见一个标题、内容全空**；
+ *   · 固定图片更典型：一张 100KB 的图 base64 后 ≈ 13 万字符 ⇒ **光一张图就超了** ⇒
+ *     图片元素恰好排在 JSON 末尾 ⇒ 被砍掉 ⇒ 用户看到"上传完保存，图片凭空消失"。
+ *
+ * ⇒ **判据必须以字符数为主**，字节数只作辅助（防止纯 ASCII 的超大模板把浏览器拖死）。
+ * 留 5% 余量：截断是静默发生的，宁可提前拦下来并说清楚。
+ */
+export const TEMPLATE_CHAR_BUDGET = 95_000
+
 /** 估算 JSON 字节数（UTF-8）——用于 F6-05 的"写入前大小检查" */
 export function docJsonBytes(json: string): number {
   // eslint-disable-next-line no-restricted-globals
@@ -171,6 +196,21 @@ export function docJsonBytes(json: string): number {
  *    只拦新建的话，用户可以把一个正常模板逐步编辑到超限再保存，照样能写进去。
  */
 export function assertTemplateSize(docJson: string): void {
+  /*
+   * ① **字符数**（与飞书单元格上限同一口径，见 `TEMPLATE_CHAR_BUDGET`）
+   *    —— 这条必须在最前面：它是"会被静默截断"的那条线。
+   */
+  const chars = docJson.length
+  if (chars > TEMPLATE_CHAR_BUDGET) {
+    throw new Error(
+      `模板数据 ${chars.toLocaleString('zh-CN')} 字，超过飞书单元格上限（10 万字，超出会被截断），无法保存。` +
+        `最常见的原因是模板里"固定"了图片 —— 图片以 base64 存在模板里，一张图就有十几万字。` +
+        `请删掉固定图片、改用附件字段取图（从左侧字段面板把附件字段拖进版式），或把模板拆成两个。`,
+    )
+  }
+  /*
+   * ② 字节数（辅助）：纯 ASCII 的超大模板字符数没超，但写入/读取会明显卡顿。
+   */
   const bytes = docJsonBytes(docJson)
   if (bytes <= TEMPLATE_SIZE_WARN_BYTES) return
   const mb = (bytes / 1024 / 1024).toFixed(2)
@@ -559,6 +599,8 @@ export interface CreateTemplateInput {
   targetTableName: string
   /** 不传则按 kind 生成空白模板（F2-36 / BP-2 第 5 步） */
   doc?: TemplateDoc
+  /** 模板里固定图片的附件信息（2026-10-19，见 ImageElement.fileToken / fileMeta） */
+  imageTokens?: UploadedImageInfo[]
 }
 
 export interface CopyToTableResult {
@@ -661,10 +703,43 @@ export class TemplateStore {
     return `${wanted} (${Date.now()})`
   }
 
+  /**
+   * 从文档里扫出所有 `fileToken`。
+   *
+   * ⚠️ 由 store **自己算**而不是让每个调用方传：写模板的入口有三处
+   *    （新建 / 保存 / 复制），让它们各传一次必然会漏一处（本项目的老毛病）。
+   */
+  private tokensOf(doc: TemplateDoc): UploadedImageInfo[] {
+    return docImageElements(doc)
+      .filter((i) => typeof i.fileToken === 'string' && i.fileToken !== '')
+      .map((i) => ({
+        token: i.fileToken as string,
+        name: i.fileMeta?.name ?? 'image',
+        size: i.fileMeta?.size ?? 0,
+        type: i.fileMeta?.type ?? 'image/jpeg',
+      }))
+  }
+
   async createTemplate(input: CreateTemplateInput): Promise<string> {
     const doc = input.doc ?? emptyTemplate(input.kind)
+    /*
+     * ⚠️ 存盘前把"已有附件 token"的图片的 dataUrl 剥掉（2026-10-19）：
+     * 那是**编辑期用来显示**的压缩副本，存进模板只会白占 10 万字的单元格额度。
+     * 重新打开时由 `template-image-store` 用 token 换回原图 URL。
+     */
+    const saveDoc = cloneDoc(doc)
+    /*
+     * ⚠️ **暂时保留内联副本**（2026-10-19 第三次调整）。
+     *
+     * 附件链路（上传 → 写字段 → 读回 URL）还在验证中，剥掉 `dataUrl` 意味着
+     * "链路任何一环断掉，图片就彻底看不见" —— 用户已经连续踩了两轮"图片消失"。
+     * ⇒ 先把**能用**放在第一位：模板里同时留一份压缩副本当兜底，
+     *   等确认读回稳定后再打开 `stripInlineImagesForSave`（这一行就是开关）。
+     * 代价：每张图仍占约 6.8 万字符，多图模板还是会撞 10 万字上限（有明确报错）。
+     */
+    // stripInlineImagesForSave(saveDoc)
     /* ⚠️ F6-05 / E-16：**先量再写**（见 assertTemplateSize 的注释） */
-    const docJson = serializeDoc(doc)
+    const docJson = serializeDoc(saveDoc)
     assertTemplateSize(docJson)
     return this.ds.createTemplateRow(await this.tableId(), {
       name: await this.uniqueName(input.targetTableId, input.name),
@@ -673,6 +748,7 @@ export class TemplateStore {
       targetTableId: input.targetTableId,
       docJson,
       paper: buildPaperLabel(doc.pageSetup),
+      imageTokens: input.imageTokens ?? this.tokensOf(doc),
     })
   }
 
@@ -687,10 +763,15 @@ export class TemplateStore {
     targetTableId: string
     targetTableName: string
     doc: TemplateDoc
+    /** 固定图片的附件信息；`undefined` = 不动附件列 */
+    imageTokens?: UploadedImageInfo[]
   }): Promise<string> {
     if (rec.recordId) {
       /* ⚠️ F6-05 / E-16：更新这条路**也要拦** —— 否则用户能把模板逐步编辑到超限再保存 */
-      const docJson = serializeDoc(rec.doc)
+      const saveDoc = cloneDoc(rec.doc)
+      /* ⚠️ 同上：暂时不剥内联副本（见 createTemplate 里的长注释） */
+      // stripInlineImagesForSave(saveDoc)
+      const docJson = serializeDoc(saveDoc)
       assertTemplateSize(docJson)
       await this.ds.updateTemplateRow(await this.tableId(), rec.recordId, {
         // 独立窗口保存回传的 `res.name` 也走这里 ⇒ 必须查重（见 uniqueName 的注释）
@@ -700,10 +781,39 @@ export class TemplateStore {
         targetTableId: rec.targetTableId,
         docJson,
         paper: buildPaperLabel(rec.doc.pageSetup),
+        imageTokens: rec.imageTokens ?? this.tokensOf(rec.doc),
       })
       return rec.recordId
     }
     return this.createTemplate(rec)
+  }
+
+  /**
+   * 把模板里的固定图片上传到飞书，返回 token（2026-10-19）。
+   *
+   * ⚠️ 调用方**必须容错**：上传失败时退回把图以 base64 存进模板 ——
+   *    宁可模板占体积，也不能让用户的图片凭空消失。
+   */
+  async uploadImages(files: File[]): Promise<UploadedImageInfo[]> {
+    if (files.length === 0) return []
+    return this.ds.uploadTemplateImages(files)
+  }
+
+  /**
+   * 取一条模板记录里所有固定图片的**临时链接**。
+   *
+   * 返回的 Map **同时按 token 和按附件名建键** —— 见 `DataSource.getTemplateImageUrlMap`
+   * 的注释（token 可能被飞书重写，只按 token 查会命中不了）。
+   *
+   * ⚠️ 链接约 10 分钟失效 ⇒ 每次打开模板 / 预览都要重新调，**不能缓存进模板**。
+   */
+  async imageUrlMap(recordId: string): Promise<Map<string, string>> {
+    try {
+      return await this.ds.getTemplateImageUrlMap(recordId)
+    } catch {
+      /* 取不到就返回空表 —— 渲染层会退回元素自己的 dataUrl / 占位框 */
+      return new Map<string, string>()
+    }
   }
 
   /** 重命名（F2-38）。存量字段一并带回，避免整条覆盖时把其他列清空 */
@@ -754,6 +864,14 @@ export class TemplateStore {
       targetTableId,
       docJson: serializeDoc(doc),
       paper: buildPaperLabel(doc.pageSetup),
+      /*
+       * ⚠️ **复制时要把附件 token 一起带过去**（2026-10-19）。
+       *
+       * 图片存在飞书附件里，元素只存 `fileToken` —— 不往新记录的附件字段里写一份，
+       * 新模板的图片将**一条都打不开**（token 在，但它不在"这条记录"的附件里）。
+       * `file_token` 是云空间里的文件引用，可以直接被多条记录写进各自的附件字段。
+       */
+      imageTokens: this.tokensOf(doc),
     })
     return { recordId: newId, name, bindings, targetTableMissing: resolved.missing }
   }

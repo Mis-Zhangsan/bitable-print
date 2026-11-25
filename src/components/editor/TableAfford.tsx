@@ -32,8 +32,6 @@ export interface TableAffordProps {
   rowAnchorIds: readonly (string | null)[]
   /** 每一列的**首行格 id** */
   colAnchorIds: readonly (string | null)[]
-  /** 整个表格可拖动（复用画布既有的拖动会话，不自造一套） */
-  onGripDown(ev: React.PointerEvent): void
   insertRow(where: 'above' | 'below', cellId: string): void
   insertCol(where: 'left' | 'right', cellId: string): void
 }
@@ -48,7 +46,6 @@ export function TableAfford({
   rowEdges,
   rowAnchorIds,
   colAnchorIds,
-  onGripDown,
   insertRow,
   insertCol,
 }: TableAffordProps): ReactNode {
@@ -59,20 +56,10 @@ export function TableAfford({
 
   return (
     <div className="bp-tbl-afford" onPointerDown={stop}>
-      {/* ---- 表格手柄：按住即拖动整表（复用画布的拖动会话）---- */}
-      <button
-        type="button"
-        className="bp-tbl-afford__grip"
-        title="按住拖动整个表格"
-        aria-label="按住拖动整个表格"
-        onPointerDown={(ev) => {
-          ev.stopPropagation()
-          onGripDown(ev)
-        }}
-      >
-        {/* 六个小点 = 通用的"抓手"图形。项目不用图标字体，这里用纯 CSS 点阵（见 editor.css） */}
-        <span className="bp-tbl-afford__dots" aria-hidden />
-      </button>
+      {/* ⚠️ 这里原来有一个"六点抓手"用来拖整表（2026-10-19 移除）：
+          移动表格改到**右上角悬浮栏的「移动」图标**（用户要求："改为在…悬浮栏中增加一个
+          移动的图标"），避免画布上出现两个功能相同的入口。
+          本组件从此只负责"行/列尺寸与插入"。 */}
 
       {/* ---- 列：顶边手柄点 + 右侧「+」---- */}
       {el.colWidthsMm.map((_, i) => {
